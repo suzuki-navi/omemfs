@@ -1,0 +1,78 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  # Guarantees the pushed tag (vX.Y.Z) matches Cargo.toml's version. If it
+  # doesn't, the whole workflow fails here before any build or release runs,
+  # so a mistagged push can never publish binaries under the wrong version.
+  check-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare tag with Cargo.toml version
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          cargo_version="$(cargo metadata --no-deps --format-version1 | jq -r '.packages[0].version')"
+          echo "tag=${GITHUB_REF_NAME} (expects version ${tag_version}), Cargo.toml version=${cargo_version}"
+          if [ "${tag_version}" != "${cargo_version}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${cargo_version}"
+            exit 1
+          fi
+
+  build:
+    needs: check-version
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            name: linux-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            name: macos-arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            name: macos-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          asset="omemfs-${{ matrix.name }}"
+          mkdir -p "dist/${asset}"
+          cp "target/${{ matrix.target }}/release/omemfs" "dist/${asset}/omemfs"
+          tar -C dist -czf "${asset}.tar.gz" "${asset}"
+          shasum -a 256 "${asset}.tar.gz" > "${asset}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: omemfs-${{ matrix.name }}
+          path: |
+            omemfs-${{ matrix.name }}.tar.gz
+            omemfs-${{ matrix.name }}.tar.gz.sha256
+
+  release:
+    needs: [check-version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
