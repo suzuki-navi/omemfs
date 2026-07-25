@@ -19,7 +19,7 @@ jobs:
       - name: Compare tag with Cargo.toml version
         run: |
           tag_version="${GITHUB_REF_NAME#v}"
-          cargo_version="$(cargo metadata --no-deps --format-version1 | jq -r '.packages[0].version')"
+          cargo_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
           echo "tag=${GITHUB_REF_NAME} (expects version ${tag_version}), Cargo.toml version=${cargo_version}"
           if [ "${tag_version}" != "${cargo_version}" ]; then
             echo "::error::Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${cargo_version}"
