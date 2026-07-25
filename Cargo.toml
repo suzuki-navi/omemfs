@@ -1,0 +1,103 @@
+[package]
+name = "omemfs"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# JSON
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Hash
+sha2 = "0.10"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Filesystem mtime
+filetime = "0.2"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Path utilities
+walkdir = "2"
+
+# Data-parallel directory walk + per-file hashing (persistent global pool).
+# See src/scan.rs and design/03 "Parallel walk and hash computation".
+rayon = "1"
+
+# Terminal
+atty = "0.2"
+anstyle = "1"
+libc = "0.2"
+
+# Hidden password input
+rpassword = "7"
+
+# Temp files (atomic writes)
+tempfile = "3"
+
+# Compression
+zstd = { version = "0.13", features = ["zdict_builder"] }
+
+# Content-defined chunking
+fastcdc = "3"
+
+# Encryption
+aes-gcm = "0.10"
+
+# Base64 encoding (for DEK in config)
+base64 = "0.22"
+
+# HMAC-SHA256 (for storage key derivation)
+hmac = "0.12"
+
+# Random number generation (for DEK generation)
+rand = "0.9"
+
+# --- Cloud backend SDKs (S3 / Azure / GCS) ---
+# The ObjectStore trait is synchronous; the cloud SDKs are async. Each cloud
+# backend holds a shared multi_thread tokio runtime and drives the SDK calls to
+# completion with block_on. multi_thread is required so concurrent block_on from
+# N transfer worker threads can run in parallel (see src/store/cloud/mod.rs).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
+# AWS S3
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1"
+# Azure Blob (Entra ID auth only)
+azure_storage_blob = "1"
+azure_core = "1"
+azure_identity = "1"
+# Google Cloud Storage
+google-cloud-storage = "1"
+google-cloud-auth = "1"
+# Paginator trait (ItemPaginator) used to drain list_objects().by_item()
+google-cloud-gax = "1"
+# Byte buffers shared by the async->sync collect bridge
+bytes = "1"
+# Stream combinators (StreamExt::next) for draining the Azure list_blobs Pager
+futures = "0.3"
+unicode-width = { version = "0.2", features = ["cjk"] }
+
+
+[build-dependencies]
+zstd = { version = "0.13", features = ["zdict_builder"] }
+
+[dev-dependencies]
+
+# Dev profile optimization: keep our own code at opt-level 1 for fast
+# compilation and good debuggability, but optimize dependencies (zstd, sha2,
+# aes-gcm, fastcdc) at opt-level 3. These crates dominate the CPU cost of the
+# push/expand paths, so optimizing them cuts debug test time dramatically
+# (e.g. a 64 MiB push: ~60s -> ~2.4s) while leaving src/ fast to rebuild.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
