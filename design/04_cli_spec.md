@@ -7,6 +7,12 @@
 - No commit messages. State capture is lightweight.
 - Path arguments are relative to the current working directory.
 
+## Global options
+
+`omemfs --version` prints the program name followed by its Cargo package
+version, then exits successfully. It does not require a repository or contact
+a remote.
+
 ## Repository discovery
 
 Every command except `clone` locates the repository by walking up from the current working directory: the first ancestor directory that contains a `.omemfs/` subdirectory is the **repository root**, and `.omemfs/` lives directly under it. The search continues to the filesystem root; if no `.omemfs/` is found in the current directory or any ancestor, the command fails with `not a omemfs repository (no .omemfs/ found in <cwd> or any parent)`. There is no environment-variable override.

@@ -32,7 +32,7 @@ use commands::{
 };
 
 #[derive(Parser)]
-#[command(name = "omemfs", about = "Object-memory filesystem sync tool")]
+#[command(name = "omemfs", about = "Object-memory filesystem sync tool", version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
