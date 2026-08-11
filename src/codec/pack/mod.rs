@@ -90,6 +90,42 @@ pub fn decrypt_index_root_bytes(raw: &[u8], key: Option<&EncryptKey>) -> Result<
     crate::codec::encrypt::decrypt(ciphertext.to_vec(), Some(key), &pseudo_hash)
 }
 
+/// Fetch a content-addressed L6 object (delta / hot / cold shard index file,
+/// or Bloom filter) as plaintext, consulting `objcache` first and falling
+/// back to fetching + decrypting from `remote` on a miss (caching the
+/// plaintext into `objcache` for next time).
+///
+/// Shared byte-level primitive underneath `load_index_file` (below) and the
+/// read path's Bloom filter loader (`PackReader::load_bloom_filter`) --
+/// both index files and the Bloom filter are immutable, content-addressed
+/// `ED E2`/`ED E4` objects cached the same way; only the final deserialise
+/// type differs.
+pub fn load_cached_plaintext(
+    remote: &dyn crate::store::ObjectStore,
+    objcache: &crate::store::local::LocalStore,
+    remote_key: Option<&EncryptKey>,
+    hash: &Hash,
+) -> Result<Vec<u8>, Error> {
+    use std::io::Read as _;
+    if objcache.exists(hash)? {
+        // Objcache hit: read plaintext directly, no remote fetch needed.
+        let mut r = objcache.open_read(hash)?;
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).map_err(Error::Io)?;
+        Ok(buf)
+    } else {
+        // Cache miss: fetch from remote, decrypt, and store as plaintext.
+        let mut r = remote.open_read(hash)?;
+        let mut stored = Vec::new();
+        r.read_to_end(&mut stored).map_err(Error::Io)?;
+        let plaintext = crate::codec::encrypt::decrypt(stored, remote_key, hash.as_bytes_array())?;
+        // Write plaintext to objcache so subsequent calls hit the cache.
+        let mut cursor = std::io::Cursor::new(&plaintext);
+        objcache.write_from(hash, &mut cursor)?;
+        Ok(plaintext)
+    }
+}
+
 /// Load index file `hash` (delta / hot / cold shard, remote magic `ED E2`) as
 /// plaintext, consulting `objcache` first and falling back to fetching +
 /// decrypting from `remote` on a miss (caching the plaintext into `objcache`
@@ -107,24 +143,7 @@ pub fn load_index_file(
     remote_key: Option<&EncryptKey>,
     hash: &Hash,
 ) -> Result<index::IndexFile, Error> {
-    use std::io::Read as _;
-    let raw = if objcache.exists(hash)? {
-        // Objcache hit: read plaintext directly, no remote fetch needed.
-        let mut r = objcache.open_read(hash)?;
-        let mut buf = Vec::new();
-        r.read_to_end(&mut buf).map_err(Error::Io)?;
-        buf
-    } else {
-        // Cache miss: fetch from remote, decrypt, and store as plaintext.
-        let mut r = remote.open_read(hash)?;
-        let mut stored = Vec::new();
-        r.read_to_end(&mut stored).map_err(Error::Io)?;
-        let plaintext = crate::codec::encrypt::decrypt(stored, remote_key, hash.as_bytes_array())?;
-        // Write plaintext to objcache so subsequent calls hit the cache.
-        let mut cursor = std::io::Cursor::new(&plaintext);
-        objcache.write_from(hash, &mut cursor)?;
-        plaintext
-    };
+    let raw = load_cached_plaintext(remote, objcache, remote_key, hash)?;
     index::IndexFile::deserialise(&raw)
 }
 

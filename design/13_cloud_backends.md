@@ -267,20 +267,29 @@ token, exactly like the ETag precondition).
 ## Parallel transfer (`OMEMFS_TRANSFER_CONCURRENCY`)
 
 The object-graph transfer loops run on a thread pool sharing the single
-`&dyn ObjectStore`. The engine (`src/commands/transfer.rs`) does a breadth-first
-walk of the objects reachable from a root hash, with N workers each claiming a
-hash (dedup via a shared visited set), doing the `exists`/`read`/`write` on the
-shared store, and enqueuing the children parsed from the fetched bytes. Because
-each worker both consumes and produces work, the queue is an unbounded
-`Mutex<VecDeque>` + `Condvar` with an atomic outstanding-work counter for
-termination (a bounded channel would deadlock); the first worker to error wins
-and all workers drain out.
+`&dyn ObjectStore`. The engine (`src/commands/transfer.rs`, function
+`parallel_bfs`) does a breadth-first walk of the objects reachable from **one
+or more** root hashes, with N workers each claiming a hash (dedup via a shared
+visited set), doing the `exists`/`read`/`write` on the shared store, and
+enqueuing the children parsed from the fetched bytes. Because each worker
+both consumes and produces work, the queue is an unbounded `Mutex<VecDeque>` +
+`Condvar` with an atomic outstanding-work counter for termination (a bounded
+channel would deadlock); the first worker to error wins and all workers drain
+out. Seeding the queue with multiple roots at once (instead of one call per
+root) is what lets a batch of independent, childless nodes — e.g. a set of
+small leaf blobs, each of which is a BFS of exactly one node on its own — be
+distributed across all N workers from the start, rather than being walked one
+at a time with no parallel work available; see `02_storage_format.md`,
+"Multi-root batching (Improvement B)".
 
-Two loops use it: `push`'s upload-of-missing and the shared `transfer_objects`
-copy (which also serves `clone`'s per-file fetch and `expand`). The working-tree
-materialisation phases of `clone`/`pull` stay serial (parent-before-child
-filesystem ordering), but their remote fetches go through `transfer_objects` and
-so are parallelised.
+Two entry points use the engine: `push`'s upload-of-missing (single root, the
+push's own tree) and the shared `transfer_objects` / `transfer_objects_many`
+copy, which also serves `clone`'s per-file fetch, `cat`'s single-object fetch,
+and `expand`'s/`pull`'s batched blob fetches (one `transfer_objects_many` call
+per run, seeded with every blob that needs fetching, rather than one
+`transfer_objects` call per blob). The working-tree materialisation phases of
+`clone`/`pull` stay serial (parent-before-child filesystem ordering), but
+their remote fetches go through this transfer path and so are parallelised.
 
 The knob `OMEMFS_TRANSFER_CONCURRENCY` sets the worker count: default **1**
 (serial) for the local backend, **8** for cloud backends (resolved via

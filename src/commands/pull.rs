@@ -851,6 +851,61 @@ fn apply_diff(
     remote_key: Option<&crate::codec::encrypt::EncryptKey>,
 ) -> Result<usize, Error> {
     let mut changed = 0;
+
+    // Phase 1 (Improvement B — design/02_storage_format.md, "Multi-root
+    // batching"; design/04_cli_spec.md pull step 4): collect every blob hash
+    // this diff will need from the remote and fetch the whole batch in one
+    // multi-root transfer, before any file is written. Fetching them one at a
+    // time gave the worker pool nothing to divide — a leaf blob's own BFS is a
+    // single childless node — so a diff of many small files ran effectively
+    // serially no matter how `OMEMFS_TRANSFER_CONCURRENCY` was set.
+    //
+    // Only `Added`/`Modified` entries that will actually be materialised are
+    // planned, and only when their branch condition is decidable without
+    // observing this run's own writes:
+    //
+    // - `Added`: an entry at or above `stub_threshold` may be stub-written
+    //   instead, but that depends on `stub::stub_would_be_visible_to_git` (a
+    //   `git check-ignore` subprocess). It is left unplanned so the check keeps
+    //   running exactly once, at exactly the point it runs today.
+    // - `Modified`: the stub-update branch is a pure filesystem check on this
+    //   path alone, so it is safe to evaluate up front.
+    // - `AddedTree` falls back to `materialise_tree`, which walks tree objects
+    //   to discover children; its blobs are not part of this batch (design/04
+    //   step 4: only leaf-blob fetches are batched).
+    //
+    // Anything not planned keeps its existing behaviour: `ensure_blob_local`
+    // below still fetches on demand when a blob is missing from the cache.
+    {
+        let mut pending: Vec<Hash> = Vec::new();
+        for (rel_path, change) in diff {
+            let abs_path = base_dir.join(rel_path);
+            match change {
+                DiffEntry::Added { hash, size, .. } => {
+                    let may_be_stubbed = stub_threshold > 0 && *size >= stub_threshold;
+                    if !may_be_stubbed && !store.exists(hash)? {
+                        pending.push(hash.clone());
+                    }
+                }
+                DiffEntry::Modified { hash, .. } => {
+                    let work_rel = abs_path
+                        .strip_prefix(work_dir)
+                        .map(|p| p.to_string_lossy().replace('\\', "/"))
+                        .unwrap_or_else(|_| rel_path.to_string());
+                    let updates_stub_only = stub::exists(work_dir, &work_rel) && !abs_path.exists();
+                    if !updates_stub_only && !store.exists(hash)? {
+                        pending.push(hash.clone());
+                    }
+                }
+                DiffEntry::Deleted
+                | DiffEntry::AddedEmptyDir
+                | DiffEntry::AddedTree { .. }
+                | DiffEntry::Symlink { .. } => {}
+            }
+        }
+        crate::commands::push::transfer_objects_many(remote, store, &pending, remote_key, true)?;
+    }
+
     // Directories touched by deletions, for dir-stub / empty-parent cleanup.
     let mut deleted_dirs: std::collections::HashSet<std::path::PathBuf> =
         std::collections::HashSet::new();
@@ -1834,5 +1889,175 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fs::read(&helper).unwrap(), b"new content");
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_diff blob-fetch batching (Improvement B) --
+    // design/02_storage_format.md "Multi-root batching (Improvement B)";
+    // design/04_cli_spec.md pull step 4: "Collect the blob hashes referenced
+    // by the remote diff that are missing from the local cache and download
+    // all of them in a single batched, concurrent transfer ... rather than
+    // one blob at a time."
+    //
+    // `apply_diff` already exists (no new API needs to be invented here,
+    // unlike expand's equivalent test), so these tests exercise it directly
+    // with a diff full of independent `Added` blob entries.
+    // -----------------------------------------------------------------------
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    /// Read-side `ObjectStore` wrapper that tracks concurrently-in-flight
+    /// `open_read` calls (with an artificial delay to make overlap
+    /// observable) and forces a fixed `default_transfer_concurrency()`.
+    /// Duplicated from the equivalent fixtures in `push.rs`'s and
+    /// `expand.rs`'s tests -- there is no shared test-utility module in this
+    /// crate today, and forcing the concurrency value directly avoids
+    /// mutating the process-wide `OMEMFS_TRANSFER_CONCURRENCY` env var across
+    /// Rust's parallel test runner.
+    struct ConcurrencyTrackingStore {
+        inner: LocalStore,
+        forced_concurrency: usize,
+        delay: Duration,
+        in_flight: AtomicUsize,
+        max_in_flight: AtomicUsize,
+    }
+
+    impl ConcurrencyTrackingStore {
+        fn new(inner: LocalStore, forced_concurrency: usize, delay: Duration) -> Self {
+            ConcurrencyTrackingStore {
+                inner,
+                forced_concurrency,
+                delay,
+                in_flight: AtomicUsize::new(0),
+                max_in_flight: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl ObjectStore for ConcurrencyTrackingStore {
+        fn exists(&self, hash: &Hash) -> Result<bool, Error> {
+            self.inner.exists(hash)
+        }
+        fn size(&self, hash: &Hash) -> Result<u64, Error> {
+            self.inner.size(hash)
+        }
+        fn list_with_sizes(&self) -> Result<Vec<(String, u64)>, Error> {
+            self.inner.list_with_sizes()
+        }
+        fn open_read(&self, hash: &Hash) -> Result<Box<dyn std::io::Read>, Error> {
+            let cur = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(cur, Ordering::SeqCst);
+            // Hold the "in-flight" window open long enough for concurrent
+            // workers (if any) to overlap with this call.
+            std::thread::sleep(self.delay);
+            let result = self.inner.open_read(hash);
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            result
+        }
+        fn write_from(&self, hash: &Hash, reader: &mut dyn std::io::Read) -> Result<(), Error> {
+            self.inner.write_from(hash, reader)
+        }
+        fn default_transfer_concurrency(&self) -> usize {
+            self.forced_concurrency
+        }
+    }
+
+    /// Build a diff of `n` independent `Added` blob entries at distinct
+    /// paths, each pointing at a unique single-chunk blob stored in `remote`.
+    fn build_added_blobs_diff(
+        remote: &dyn ObjectStore,
+        n: usize,
+    ) -> (HashMap<String, DiffEntry>, Vec<(String, Vec<u8>)>) {
+        let mut diff = HashMap::new();
+        let mut files = Vec::with_capacity(n);
+        for i in 0..n {
+            let rel = format!("file{i}.txt");
+            let content = format!("pull-test-content-{i}").into_bytes();
+            let serialised = crate::object::serialise_blob(&content);
+            let hash = crate::object::blob_hash(&content);
+            codec::chunk::store_chunked(remote, &hash, &serialised, None).unwrap();
+            diff.insert(
+                rel.clone(),
+                DiffEntry::Added {
+                    hash,
+                    size: content.len() as u64,
+                    mtime: None,
+                    mode: None,
+                },
+            );
+            files.push((rel, content));
+        }
+        (diff, files)
+    }
+
+    #[test]
+    fn apply_diff_materialises_correct_content_for_many_added_blobs() {
+        // Correctness only (design/04 pull step 5). This must already pass
+        // today, before the batched-fetch change: apply_diff's end result is
+        // unaffected by *how many* transfer calls it takes to get there.
+        let remote_dir = TempDir::new().unwrap();
+        let remote = LocalStore::for_remote(remote_dir.path());
+        let (diff, files) = build_added_blobs_diff(&remote, 6);
+
+        let store_dir = TempDir::new().unwrap();
+        let store = LocalStore::for_cache(store_dir.path());
+        let work_dir = TempDir::new().unwrap();
+
+        let changed =
+            apply_diff(&diff, work_dir.path(), &store, work_dir.path(), 0, &remote, None)
+                .unwrap();
+
+        assert_eq!(changed, files.len());
+        for (rel, content) in &files {
+            let path = work_dir.path().join(rel);
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                *content,
+                "materialised content mismatch for {rel}"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_diff_batches_blob_fetches_for_concurrency() {
+        // Improvement B applied to pull's diff-driven fetch path. A diff with
+        // N independent `Added` blob entries, each below the CDC min_size
+        // chunk threshold, is exactly the case the design doc calls out:
+        // each blob's own BFS (inside `ensure_blob_local` ->
+        // `transfer_objects`) is a single childless node with nothing to
+        // divide across workers, and `apply_diff`'s `for (rel_path, change)
+        // in diff` loop (see above) currently calls `materialise_blob` /
+        // `ensure_blob_local` once per entry sequentially -- so today's path
+        // can never observe concurrency > 1 no matter how
+        // `OMEMFS_TRANSFER_CONCURRENCY` is set. Expected to FAIL at runtime
+        // today (apply_diff already exists, so this compiles) until pull's
+        // fetch path is changed to collect all missing blob hashes and issue
+        // one batched `transfer_objects_many` call.
+        if std::env::var("OMEMFS_TRANSFER_CONCURRENCY").is_ok() {
+            return;
+        }
+
+        let remote_dir = TempDir::new().unwrap();
+        let inner_remote = LocalStore::for_remote(remote_dir.path());
+        let (diff, files) = build_added_blobs_diff(&inner_remote, 6);
+        let remote = ConcurrencyTrackingStore::new(inner_remote, 4, Duration::from_millis(20));
+
+        let store_dir = TempDir::new().unwrap();
+        let store = LocalStore::for_cache(store_dir.path());
+        let work_dir = TempDir::new().unwrap();
+
+        let changed =
+            apply_diff(&diff, work_dir.path(), &store, work_dir.path(), 0, &remote, None)
+                .unwrap();
+
+        assert_eq!(changed, files.len());
+        assert!(
+            remote.max_in_flight.load(Ordering::SeqCst) >= 2,
+            "pulling {} independent Added blobs should let the worker pool \
+             overlap their fetches (max observed: {})",
+            files.len(),
+            remote.max_in_flight.load(Ordering::SeqCst)
+        );
     }
 }

@@ -3,13 +3,24 @@
 /// PackReader wraps a raw remote ObjectStore and implements `open_read` using
 /// the three-tier index (delta / hot / cold) instead of direct object lookup.
 ///
-/// Search order for `open_read(target_hash)`:
+/// Search order for `open_read(target_hash)` (see design/02_storage_format.md
+/// "Read path" for the full rationale behind steps 3a/4a below, Improvements
+/// A and C):
 ///   1. Local objects/ cache — return immediately on hit.
 ///   2. Fetch INDEX_ROOT (local cache or remote file).
 ///   3. Search delta files newest-first (binary search within each).
 ///   4. Binary search the hot index.
-///   5. Check if objects/<hash> exists directly (standalone).
-///   6. Compute prefix → load cold shard → binary search.
+///   3a. [Improvement A] If the covering cold shard is already cached
+///       locally, search it now (a local disk read, no network call).
+///   5. Check if objects/<hash> exists directly (standalone). Unconditional —
+///      always runs, since a standalone object can be written to the remote
+///      at any time, after the Bloom filter's snapshot was taken.
+///   4a. [Improvement C] If a Bloom filter is recorded, consult it; a
+///       "definitely absent" answer short-circuits straight to NotFound,
+///       skipping ONLY the cold-shard fetch (step 6) — never step 5, which
+///       already ran above.
+///   6. Compute prefix → load cold shard → binary search (skipped if 3a
+///      already searched this exact shard, or if 4a ruled it out).
 ///   7. Not found → error.
 ///
 /// On index hit:
@@ -22,6 +33,7 @@
 use std::io::{self, Cursor, Read};
 
 use crate::codec::encrypt::EncryptKey;
+use crate::codec::pack::bloom::BloomFilter;
 use crate::codec::pack::index::{IndexEntry, IndexFile};
 use crate::codec::pack::index_root::IndexRoot;
 use crate::codec::pack::root_pointer::RootPointer;
@@ -260,23 +272,73 @@ impl PackReader {
             }
         }
 
+        // The cold shard covering `hash`, computed once and shared by step
+        // [A] below (cache-only warm search) and the unchanged step 6
+        // fallback (cold-start fetch), so the prefix-bit logic that used to
+        // live only in step 6 is not duplicated.
+        let shard_hash = cold_shard_hash_for(hash, &index_root);
+
+        // [A] If the covering shard is already present in the local objcache,
+        // search it now -- this is a local disk read, not a network round
+        // trip, because index files are content-addressed and immutable (see
+        // design/02 "Why the cold shard is checked before the remote probe
+        // when already cached"). A shard that has never been fetched is left
+        // alone here (no network call) and still defers to the probe below,
+        // exactly as before this change.
+        let mut shard_already_searched = false;
+        if let Some(sh) = &shard_hash {
+            if self.objcache.exists(sh)? {
+                shard_already_searched = true;
+                let idx = self.load_index_file(sh)?;
+                if let Some(entry) = idx.find(hash) {
+                    return Ok(Located::Entry(entry.clone()));
+                }
+                // Miss in the now-searched shard: remember this so step 6
+                // below does not redo the same search after the probe.
+            }
+        }
+
         // 5. Try standalone: check if objects/<hash> exists directly in remote
         // (a HEAD/stat only -- the body is fetched later, only if the caller
-        // actually wants bytes).
+        // actually wants bytes). This probe is UNCONDITIONAL -- it always
+        // runs, regardless of what the Bloom filter below would say -- because
+        // a standalone object can be written to the remote at any time,
+        // including after the last `omemfs pack` run that built the current
+        // Bloom filter snapshot. Only this probe can observe such an object;
+        // see design/02 "Why the Bloom filter is checked before the
+        // cold-shard fetch, but never before the remote probe".
         if self.remote.exists(hash)? {
             return Ok(Located::Standalone);
         }
 
-        // 6. Cold shard lookup.
-        let prefix_bits = index_root.cold_prefix_bits as usize;
-        let shard_hash = if prefix_bits > 0 {
-            index_root.cold_shard_hash(hash_prefix(hash, prefix_bits))
-        } else if !index_root.cold_shards.is_empty() {
-            // cold_prefix_bits == 0: single shared shard.
-            index_root.cold_shard_hash(0)
-        } else {
-            None
-        };
+        // [C] Consult the Bloom filter, if the index root has one recorded,
+        // to decide whether the cold-shard fetch (step 6) below is worth
+        // paying for. A "definitely absent" answer is exact (no false
+        // negatives are possible by construction) and is safe to substitute
+        // for "not present in any cold shard" -- the Bloom filter and the
+        // cold shards are built from the same `omemfs pack` snapshot with no
+        // staleness gap between them -- so it short-circuits straight to
+        // NotFound, skipping the cold-shard fetch. This does NOT extend to
+        // the remote probe above: that check already ran unconditionally,
+        // which is exactly why this check is positioned after it rather than
+        // before. "Maybe present", no Bloom filter recorded at all, or the
+        // shard already searched by step [A] above, falls through to step 6
+        // exactly as before this change.
+        if !shard_already_searched {
+            if let Some(bloom_hash) = index_root.bloom_hash_opt() {
+                let bloom = self.load_bloom_filter(&bloom_hash)?;
+                if !bloom.may_contain(hash) {
+                    return Ok(Located::NotFound);
+                }
+            }
+        }
+
+        // 6. Cold shard lookup, unless step [A] already searched this exact
+        // shard above (cache hit, not found there) -- in that case the shard
+        // is already known to miss and there is nothing left to fetch.
+        if shard_already_searched {
+            return Ok(Located::NotFound);
+        }
         if let Some(shard_hash) = shard_hash {
             let idx = self.load_index_file(&shard_hash)?;
             if let Some(entry) = idx.find(hash) {
@@ -285,6 +347,27 @@ impl PackReader {
         }
 
         Ok(Located::NotFound)
+    }
+
+    // -----------------------------------------------------------------------
+    // Bloom filter loading (read path, Improvement C)
+    // -----------------------------------------------------------------------
+
+    /// Load the Bloom filter at `hash`, consulting the local objcache first
+    /// and falling back to fetch + decrypt + cache on first use -- identical
+    /// caching pattern to `load_index_file` / `codec::pack::load_index_file`
+    /// (see design/02 "Index file local caching", Improvement C paragraph).
+    /// Reuses the shared fetch-decrypt-cache primitive
+    /// (`codec::pack::load_cached_plaintext`) so the decrypt logic is not
+    /// duplicated between index files and the Bloom filter.
+    fn load_bloom_filter(&self, hash: &Hash) -> Result<BloomFilter, Error> {
+        let plaintext = crate::codec::pack::load_cached_plaintext(
+            self.remote.as_ref(),
+            &self.objcache,
+            self.remote_key.as_ref(),
+            hash,
+        )?;
+        BloomFilter::deserialise(&plaintext)
     }
 
     /// Resolve `hash` to its encrypted bytes, searching the pack index.
@@ -325,6 +408,30 @@ impl PackReader {
         let mut buf = Vec::new();
         r.read_to_end(&mut buf).map_err(Error::Io)?;
         Ok(unescape_standalone(buf))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cold shard addressing
+// ---------------------------------------------------------------------------
+
+/// Compute the cold shard hash covering `hash` under `index_root`: a
+/// prefix-addressed shard when `cold_prefix_bits > 0`, or the single shared
+/// shard (slot 0) when `cold_prefix_bits == 0` and at least one shard slot
+/// exists. Returns `None` when no cold shard is recorded at all.
+///
+/// Shared by `locate`'s step [A] (cache-only warm search) and step 6 (the
+/// unchanged cold-start fetch), so the two steps always address the same
+/// shard for a given hash and the prefix-bit logic is not duplicated.
+fn cold_shard_hash_for(hash: &Hash, index_root: &IndexRoot) -> Option<Hash> {
+    let prefix_bits = index_root.cold_prefix_bits as usize;
+    if prefix_bits > 0 {
+        index_root.cold_shard_hash(hash_prefix(hash, prefix_bits))
+    } else if !index_root.cold_shards.is_empty() {
+        // cold_prefix_bits == 0: single shared shard.
+        index_root.cold_shard_hash(0)
+    } else {
+        None
     }
 }
 
@@ -553,6 +660,16 @@ mod tests {
         // the ED E0 escape prefix, step 5 must strip it just like resolve_entry
         // and fetch_from_remote_direct do, otherwise the returned bytes are
         // corrupted by the leading ED E0.
+        //
+        // This test also doubles as the regression guard for the Improvement C
+        // ordering bug: `hash` here is never pushed through PackWriter, so it is
+        // never inserted into the push-generated Bloom filter, yet it IS present
+        // on the remote as a standalone object. Before the fix, the Bloom check
+        // ran BEFORE this probe and short-circuited straight to NotFound on its
+        // "definitely absent" (but stale) answer. See
+        // `definite_absence_short_circuits_via_bloom_filter` and design/02
+        // "Why the Bloom filter is checked before the cold-shard fetch, but
+        // never before the remote probe".
         use crate::codec::pack::writer::{PackWriter, STANDALONE_ESCAPE_MAGIC};
 
         let tmp = TempDir::new().unwrap();
@@ -818,6 +935,470 @@ mod tests {
             reads_for_open > reads_for_exists,
             "open_read (which fetches the pack body) must cost strictly more \
              remote reads than exists() (index-only): exists={reads_for_exists}, open={reads_for_open}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Read-path performance tests (design/02_storage_format.md "Read path",
+    // Improvements A and C).
+    //
+    // These build INDEX_ROOT / index-file / Bloom-filter fixtures directly
+    // (bypassing PackWriter and `omemfs pack`) so cold-shard and Bloom-filter
+    // behaviour can be exercised in isolation, without a full push + pack
+    // cycle. `remote_key` is always `None` here, matching every other test in
+    // this file, so `IndexRoot::serialise()` / `IndexFile::serialise()` /
+    // `BloomFilter::serialise()` bytes can be written to the remote verbatim
+    // (see `codec::encrypt::{encrypt,decrypt}`'s documented `key = None`
+    // passthrough).
+    // -------------------------------------------------------------------------
+
+    /// Create a fresh remote-backend directory layout under `tmp` and return
+    /// its base path.
+    fn make_remote_base(tmp: &TempDir) -> std::path::PathBuf {
+        let base = tmp.path().join("remote");
+        std::fs::create_dir_all(base.join("objects")).unwrap();
+        std::fs::create_dir_all(base.join("tmp")).unwrap();
+        base
+    }
+
+    /// Write `entries` as a plaintext index file (delta / hot / cold shard --
+    /// they all share the same on-disk format) directly to the remote and
+    /// return its hash. Mirrors what `commands::pack::write_index_file` /
+    /// `PackWriter::finish` produce, without requiring a full `omemfs pack`
+    /// run to build a cold-shard or hot-index fixture.
+    fn write_raw_index(remote: &LocalStore, entries: Vec<IndexEntry>) -> Hash {
+        let mut idx = IndexFile::new();
+        for e in entries {
+            idx.push(e);
+        }
+        let bytes = idx.serialise().unwrap();
+        let hash = Hash::compute(&bytes);
+        remote
+            .write_from(&hash, &mut io::Cursor::new(&bytes))
+            .unwrap();
+        hash
+    }
+
+    /// Write a Bloom filter covering exactly `present` to the remote and
+    /// return its hash. Sized generously (1000 expected elements at a 1% false
+    /// positive rate) relative to the handful of hashes these tests insert, so
+    /// an unrelated "absent" hash used in the same test has a negligible
+    /// chance of colliding into a false positive.
+    fn write_raw_bloom(remote: &LocalStore, present: &[Hash]) -> Hash {
+        use crate::codec::pack::bloom::{BloomFilter, DEFAULT_NUM_HASH_FUNCTIONS};
+        let mut bf = BloomFilter::new(1000, 0.01, DEFAULT_NUM_HASH_FUNCTIONS);
+        for h in present {
+            bf.insert(h);
+        }
+        let bytes = bf.serialise();
+        let hash = Hash::compute(&bytes);
+        remote
+            .write_from(&hash, &mut io::Cursor::new(&bytes))
+            .unwrap();
+        hash
+    }
+
+    /// Write `root` as the (unencrypted) INDEX_ROOT at `base`, directly via
+    /// `LocalRootPointer`, bypassing `PackWriter::finish`'s CAS-from-snapshot
+    /// flow entirely. Lets a test control every INDEX_ROOT field (delta/hot/
+    /// cold/bloom) precisely, since `base` starts with no INDEX_ROOT at all.
+    fn write_raw_index_root(base: &std::path::Path, root: &IndexRoot) {
+        use crate::codec::pack::root_pointer::{LocalRootPointer, RootPointer, RootToken};
+        let bytes = root.serialise().unwrap();
+        let rp = LocalRootPointer::new(base.to_path_buf(), None);
+        rp.cas_write(&RootToken::Absent, &bytes).unwrap();
+    }
+
+    /// Build a `PackReader` over `base` whose remote is wrapped in a
+    /// `StatsStore`, so tests can assert exact `exists()` / `open_read()`
+    /// counts. Returns the reader, the shared `IoRecord`, and the reader's
+    /// `objcache` directory (so a test can independently probe, via a fresh
+    /// `LocalStore::for_cache`, whether a specific index file -- e.g. a cold
+    /// shard -- has been fetched and cached).
+    fn make_reader_with_stats(
+        base: &std::path::Path,
+        tmp: &TempDir,
+    ) -> (PackReader, std::sync::Arc<crate::store::stats::IoRecord>, std::path::PathBuf) {
+        use crate::store::stats::{IoRecord, StatsStore};
+        use std::sync::Arc;
+
+        let record = Arc::new(IoRecord::default());
+        let raw_remote = LocalStore::for_remote(base);
+        let stats_remote = StatsStore::new(Box::new(raw_remote), Arc::clone(&record));
+
+        let cache_dir = tmp.path().join("cache");
+        let packcache_dir = tmp.path().join("packcache");
+        let objcache_dir = tmp.path().join("objcache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::create_dir_all(&packcache_dir).unwrap();
+        std::fs::create_dir_all(&objcache_dir).unwrap();
+
+        let reader = PackReader::new(
+            Box::new(stats_remote),
+            LocalStore::for_cache(&cache_dir),
+            LocalStore::for_cache(&packcache_dir),
+            LocalStore::for_cache(&objcache_dir),
+            Box::new(LocalRootPointer::new(base.to_path_buf(), None)),
+            None,
+        );
+        (reader, record, objcache_dir)
+    }
+
+    /// Read a `Box<dyn Read>` to completion (test helper).
+    fn read_all(mut r: Box<dyn io::Read>) -> Vec<u8> {
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).unwrap();
+        buf
+    }
+
+    /// [Improvement A] Once a cold shard has been fetched into the local
+    /// objcache -- by resolving any hash that lives in it -- resolving a
+    /// DIFFERENT hash from the SAME shard must be a pure local operation: no
+    /// further remote `exists()` probe. The current implementation always
+    /// issues one `exists()` HEAD per lookup regardless of shard warmth (see
+    /// `locate`'s step 5, which runs unconditionally before step 6's cold
+    /// shard search), so this test is expected to FAIL until Improvement A is
+    /// implemented.
+    #[test]
+    fn cold_shard_search_is_free_once_warm() {
+        use crate::codec::pack::index::InlineEntry;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let tmp = TempDir::new().unwrap();
+        let base = make_remote_base(&tmp);
+        let remote_for_setup = LocalStore::for_remote(&base);
+
+        let data1 = vec![0xA1u8; 10];
+        let hash1 = Hash::compute(&data1);
+        let data2 = vec![0xA2u8; 10];
+        let hash2 = Hash::compute(&data2);
+
+        // Both hashes live in the SAME (single, shared) cold shard.
+        let shard_hash = write_raw_index(
+            &remote_for_setup,
+            vec![
+                IndexEntry::Inline(InlineEntry {
+                    hash: hash1.clone(),
+                    data: data1.clone(),
+                }),
+                IndexEntry::Inline(InlineEntry {
+                    hash: hash2.clone(),
+                    data: data2.clone(),
+                }),
+            ],
+        );
+
+        let mut root = IndexRoot::new_empty();
+        root.cold_shards = vec![*shard_hash.as_bytes_array()];
+        write_raw_index_root(&base, &root);
+
+        let (reader, record, _objcache_dir) = make_reader_with_stats(&base, &tmp);
+
+        // First resolution: the shard is not yet cached, so this legitimately
+        // costs one remote exists() probe (today's documented cold-start
+        // cost) plus one fetch of the shard itself.
+        let got1 = read_all(reader.open_read(&hash1).unwrap());
+        assert_eq!(got1, data1, "first object's bytes must round-trip correctly");
+        let exists_after_first = record.exists_found.load(Relaxed) + record.exists_miss.load(Relaxed);
+        assert_eq!(
+            exists_after_first, 1,
+            "first (cold-start) lookup must cost exactly one exists() probe"
+        );
+
+        // Second resolution: a DIFFERENT hash from the SAME now-cached shard.
+        let got2 = read_all(reader.open_read(&hash2).unwrap());
+        assert_eq!(got2, data2, "second object's bytes must round-trip correctly");
+        let exists_after_second = record.exists_found.load(Relaxed) + record.exists_miss.load(Relaxed);
+        assert_eq!(
+            exists_after_second, exists_after_first,
+            "resolving a second hash from an already-cached cold shard must not \
+             issue any additional remote exists() probe (Improvement A)"
+        );
+    }
+
+    /// Regression guard: the FIRST lookup of a hash whose cold shard has never
+    /// been fetched must still defer to the remote `exists()` probe before
+    /// fetching the shard -- Improvement A only changes behaviour once a shard
+    /// is already warm (design/02 "Why the cold shard is checked before the
+    /// remote probe when already cached"). This must hold both before and
+    /// after Improvement A is implemented.
+    #[test]
+    fn cold_shard_first_lookup_cost_is_unchanged() {
+        use crate::codec::pack::index::InlineEntry;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let tmp = TempDir::new().unwrap();
+        let base = make_remote_base(&tmp);
+        let remote_for_setup = LocalStore::for_remote(&base);
+
+        let data = vec![0xB1u8; 10];
+        let hash = Hash::compute(&data);
+        let shard_hash = write_raw_index(
+            &remote_for_setup,
+            vec![IndexEntry::Inline(InlineEntry {
+                hash: hash.clone(),
+                data: data.clone(),
+            })],
+        );
+
+        let mut root = IndexRoot::new_empty();
+        root.cold_shards = vec![*shard_hash.as_bytes_array()];
+        write_raw_index_root(&base, &root);
+
+        let (reader, record, objcache_dir) = make_reader_with_stats(&base, &tmp);
+
+        assert!(
+            !LocalStore::for_cache(&objcache_dir)
+                .exists(&shard_hash)
+                .unwrap(),
+            "shard must not be cached before the first lookup"
+        );
+
+        let got = read_all(reader.open_read(&hash).unwrap());
+        assert_eq!(got, data);
+
+        let exists_calls = record.exists_found.load(Relaxed) + record.exists_miss.load(Relaxed);
+        assert_eq!(
+            exists_calls, 1,
+            "first (cold-start) lookup of an uncached shard must cost exactly \
+             one exists() probe"
+        );
+        assert!(
+            LocalStore::for_cache(&objcache_dir)
+                .exists(&shard_hash)
+                .unwrap(),
+            "the shard must now be cached after its first fetch"
+        );
+    }
+
+    /// [Improvement C, corrected] When a Bloom filter is recorded and
+    /// reports a hash as "definitely absent", `locate` must still issue the
+    /// remote `exists()` probe (step 5) -- exactly one, the same cold-start
+    /// cost as if there were no Bloom filter at all -- because a standalone
+    /// object can be written to the remote at any time, after the Bloom
+    /// filter's snapshot was taken, and only the probe can observe it (see
+    /// `read_standalone_step5_unescapes`, and design/02 "Why the Bloom
+    /// filter is checked before the cold-shard fetch, but never before the
+    /// remote probe"). What the Bloom filter DOES still skip is the
+    /// cold-shard *fetch* (step 7): since the filter and the cold shards
+    /// share the same `omemfs pack` snapshot with no staleness gap, a
+    /// definite miss proves the hash cannot be in any cold shard, so the
+    /// shard is never downloaded -- verified here by asserting the shard is
+    /// NOT present in objcache afterward (a fetch would have cached it).
+    ///
+    /// This test previously asserted `exists_calls == 0`, which was the
+    /// unsafe behaviour this fix removes: a Bloom-negative hash used to skip
+    /// the probe entirely, which could wrongly report NotFound for a
+    /// standalone object written after the last `omemfs pack`.
+    #[test]
+    fn definite_absence_short_circuits_via_bloom_filter() {
+        use crate::codec::pack::index::InlineEntry;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let tmp = TempDir::new().unwrap();
+        let base = make_remote_base(&tmp);
+        let remote_for_setup = LocalStore::for_remote(&base);
+
+        // A cold shard covering some present hash -- unrelated to the absent
+        // hash below, but its non-fetch is what this test proves.
+        let present_data = vec![0xC1u8; 10];
+        let present_hash = Hash::compute(&present_data);
+        let shard_hash = write_raw_index(
+            &remote_for_setup,
+            vec![IndexEntry::Inline(InlineEntry {
+                hash: present_hash.clone(),
+                data: present_data,
+            })],
+        );
+
+        // The Bloom filter covers ONLY the present hash -- the hash below is
+        // never inserted, so `may_contain` must report "definitely absent".
+        let absent_hash = Hash::compute(b"genuinely-absent-object");
+        let bloom_hash = write_raw_bloom(&remote_for_setup, &[present_hash]);
+
+        let mut root = IndexRoot::new_empty();
+        root.cold_shards = vec![*shard_hash.as_bytes_array()];
+        root.bloom_hash = *bloom_hash.as_bytes_array();
+        write_raw_index_root(&base, &root);
+
+        let (reader, record, objcache_dir) = make_reader_with_stats(&base, &tmp);
+
+        let result = reader.open_read(&absent_hash);
+        assert!(result.is_err(), "a genuinely absent hash must resolve to an error");
+
+        let exists_calls = record.exists_found.load(Relaxed) + record.exists_miss.load(Relaxed);
+        assert_eq!(
+            exists_calls, 1,
+            "a Bloom-filter-confirmed absent hash must still cost exactly one \
+             remote exists() probe (step 5 is unconditional -- only a \
+             standalone object written after the Bloom filter's snapshot can \
+             be found there, and only the probe can observe it)"
+        );
+        assert!(
+            !LocalStore::for_cache(&objcache_dir)
+                .exists(&shard_hash)
+                .unwrap(),
+            "a Bloom-filter-confirmed absent hash must never trigger a \
+             cold-shard fetch -- the filter and the cold shards share the \
+             same pack snapshot, so a definite miss proves the hash cannot \
+             be in that shard"
+        );
+    }
+
+    /// Guard: when the index root has no Bloom filter recorded at all
+    /// (`bloom_hash_opt()` is `None`), a genuinely absent hash must still fall
+    /// through to the (slower) remote probe + cold-shard fetch, exactly as
+    /// before Improvement C (design/02 "or no Bloom filter recorded at all").
+    /// This must hold both now and after Improvement C is implemented.
+    #[test]
+    fn no_bloom_filter_recorded_falls_through_unchanged() {
+        use crate::codec::pack::index::InlineEntry;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let tmp = TempDir::new().unwrap();
+        let base = make_remote_base(&tmp);
+        let remote_for_setup = LocalStore::for_remote(&base);
+
+        let present_data = vec![0xD1u8; 10];
+        let present_hash = Hash::compute(&present_data);
+        let shard_hash = write_raw_index(
+            &remote_for_setup,
+            vec![IndexEntry::Inline(InlineEntry {
+                hash: present_hash.clone(),
+                data: present_data,
+            })],
+        );
+
+        let absent_hash = Hash::compute(b"also-genuinely-absent");
+
+        let mut root = IndexRoot::new_empty();
+        root.cold_shards = vec![*shard_hash.as_bytes_array()];
+        // bloom_hash intentionally left all-zero -> bloom_hash_opt() == None.
+        write_raw_index_root(&base, &root);
+
+        let (reader, record, objcache_dir) = make_reader_with_stats(&base, &tmp);
+
+        let result = reader.open_read(&absent_hash);
+        assert!(result.is_err());
+
+        let exists_calls = record.exists_found.load(Relaxed) + record.exists_miss.load(Relaxed);
+        assert_eq!(
+            exists_calls, 1,
+            "with no Bloom filter recorded, the remote exists() probe must still run"
+        );
+        assert!(
+            LocalStore::for_cache(&objcache_dir)
+                .exists(&shard_hash)
+                .unwrap(),
+            "with no Bloom filter recorded, the cold shard must still be fetched on a miss"
+        );
+    }
+
+    /// [design/02 "Cost and ordering only, never classification"] Improvements
+    /// A and C change WHEN/WHETHER network calls happen, but must never change
+    /// WHAT `locate` ultimately returns. Build one fixture covering every
+    /// `Located` variant and resolve each hash TWICE with the SAME reader (the
+    /// second call is served from the now-warm objcache); both calls must
+    /// agree. This test must pass on both the current code and the improved
+    /// code -- it locks in the invariant, not a specific implementation, and
+    /// is the sanity check that the other tests above are testing behaviour
+    /// rather than accidentally locking in a bug.
+    #[test]
+    fn classification_is_identical_cold_and_warm_for_every_variant() {
+        use crate::codec::pack::index::InlineEntry;
+
+        let tmp = TempDir::new().unwrap();
+        let base = make_remote_base(&tmp);
+        let remote_for_setup = LocalStore::for_remote(&base);
+
+        let delta_data = vec![0xE1u8; 10];
+        let delta_hash = Hash::compute(&delta_data);
+        let hot_data = vec![0xE2u8; 10];
+        let hot_hash_val = Hash::compute(&hot_data);
+        let cold_data = vec![0xE3u8; 10];
+        let cold_hash = Hash::compute(&cold_data);
+        let standalone_data = vec![0xE4u8; 10];
+        let standalone_hash = Hash::compute(&standalone_data);
+        let notfound_hash = Hash::compute(b"nowhere-to-be-found");
+
+        let delta_index_hash = write_raw_index(
+            &remote_for_setup,
+            vec![IndexEntry::Inline(InlineEntry {
+                hash: delta_hash.clone(),
+                data: delta_data.clone(),
+            })],
+        );
+        let hot_index_hash = write_raw_index(
+            &remote_for_setup,
+            vec![IndexEntry::Inline(InlineEntry {
+                hash: hot_hash_val.clone(),
+                data: hot_data.clone(),
+            })],
+        );
+        let cold_shard_hash = write_raw_index(
+            &remote_for_setup,
+            vec![IndexEntry::Inline(InlineEntry {
+                hash: cold_hash.clone(),
+                data: cold_data.clone(),
+            })],
+        );
+        // Standalone: written directly to objects/, with NO index entry at all
+        // -- found only via the direct remote presence check (locate step 5).
+        remote_for_setup
+            .write_from(&standalone_hash, &mut io::Cursor::new(&standalone_data))
+            .unwrap();
+
+        let bloom_hash = write_raw_bloom(
+            &remote_for_setup,
+            &[
+                delta_hash.clone(),
+                hot_hash_val.clone(),
+                cold_hash.clone(),
+                standalone_hash.clone(),
+            ],
+        );
+
+        let mut root = IndexRoot::new_empty();
+        root.delta_hashes = vec![*delta_index_hash.as_bytes_array()];
+        root.hot_hash = *hot_index_hash.as_bytes_array();
+        root.cold_shards = vec![*cold_shard_hash.as_bytes_array()];
+        root.bloom_hash = *bloom_hash.as_bytes_array();
+        write_raw_index_root(&base, &root);
+
+        let (reader, _record, _objcache_dir) = make_reader_with_stats(&base, &tmp);
+
+        // Entry via delta.
+        let d1 = read_all(reader.open_read(&delta_hash).unwrap());
+        let d2 = read_all(reader.open_read(&delta_hash).unwrap());
+        assert_eq!(d1, delta_data);
+        assert_eq!(d1, d2, "delta-index classification must be identical cold and warm");
+
+        // Entry via hot.
+        let h1 = read_all(reader.open_read(&hot_hash_val).unwrap());
+        let h2 = read_all(reader.open_read(&hot_hash_val).unwrap());
+        assert_eq!(h1, hot_data);
+        assert_eq!(h1, h2, "hot-index classification must be identical cold and warm");
+
+        // Entry via cold shard.
+        let c1 = read_all(reader.open_read(&cold_hash).unwrap());
+        let c2 = read_all(reader.open_read(&cold_hash).unwrap());
+        assert_eq!(c1, cold_data);
+        assert_eq!(c1, c2, "cold-shard classification must be identical cold and warm");
+
+        // Standalone.
+        let s1 = read_all(reader.open_read(&standalone_hash).unwrap());
+        let s2 = read_all(reader.open_read(&standalone_hash).unwrap());
+        assert_eq!(s1, standalone_data);
+        assert_eq!(s1, s2, "standalone classification must be identical cold and warm");
+
+        // NotFound.
+        assert!(
+            reader.open_read(&notfound_hash).is_err(),
+            "NotFound classification (first call) must be an error"
+        );
+        assert!(
+            reader.open_read(&notfound_hash).is_err(),
+            "NotFound classification (second, warm call) must also be an error"
         );
     }
 }

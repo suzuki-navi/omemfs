@@ -239,6 +239,12 @@ The local-directory backend also writes a lock file `<prefix>/INDEX_ROOT.lock` f
 
 The object-graph transfer loops (`push`'s upload-of-missing and the shared `transfer_objects` copy, which also serves `clone`'s per-file fetch and `expand`) may run in parallel: `OMEMFS_TRANSFER_CONCURRENCY` worker threads share the single `&dyn ObjectStore` (the trait is `Send + Sync`). The default is `1` (serial) for the local backend and `8` for cloud backends; set the variable to override. Parallelism is confined to these per-object transfer loops — it never changes the object format and never affects the single index-root CAS, which still runs once in `finish()` after all object writes have joined (see `03_sync_model.md` and `12_locking.md`). The working-tree materialisation phases of `clone`/`pull` stay serial (filesystem ordering), but their remote object fetches still go through the parallel `transfer_objects` path.
 
+**Multi-root batching (Improvement B)**
+
+`parallel_bfs` walks the object graph reachable from a **set** of root hashes, not just one: the shared work queue is seeded with all roots up front and the initial outstanding-work count is `roots.len()`. Everything else — the shared `visited` set for dedup, the outstanding-count termination signal, first-error-wins — is unchanged and already handles roots that share subtrees correctly (a hash claimed via one root is not re-walked via another). `transfer_objects_many` in `src/commands/push.rs` exposes this as a multi-root counterpart to `transfer_objects`, taking a slice of root hashes instead of one.
+
+This matters because per-root granularity, not just per-object granularity, determines how much parallelism is actually available to exploit. A BFS seeded with a single root has no parallel work until that root's own children are discovered — for a root that is itself one leaf blob (any file below the CDC `min_size` threshold of 1 MiB — see "Object routing (write path)" above), the BFS is a walk of exactly one node, so `workers` threads have nothing to divide between them regardless of how high `OMEMFS_TRANSFER_CONCURRENCY` is set. `expand` and `pull` were calling `transfer_objects` once per blob in a sequential loop across sibling files, so a tree of many small files paid for a full worker pool that never had more than one node of real work in flight at a time — the *outer* loop across files, not the *inner* per-object BFS, was the actual bottleneck, and the outer loop had no concurrency at all. Seeding one `transfer_objects_many` call with every blob hash that needs fetching turns that outer loop into work the shared queue can distribute across all `workers` threads from the start, so the existing cloud-backend concurrency default (`8`) is finally exploited across files, not just within one file's chunk graph.
+
 #### Two independent knobs: concurrency and memory
 
 The worker count alone is the wrong knob for peak memory. A single number `N` conflates two distinct resources: the number of **in-flight requests** (which hides network round-trip latency, and wants to be large) and the number of **object buffers resident at once** (`N × object-size`, which wants to be small). omemfs objects are variable-sized — a single chunk can be up to ≈16 MiB — so a concurrency that is healthy for many small objects can balloon peak RSS when many large chunks happen to be transferred at once. Measured: a fresh 400 MiB push on a 2-core machine at concurrency 16 peaked at ≈646 MiB resident, almost entirely transient upload buffers, while an incremental (mostly-cached) push of the same tree stayed near 64 MiB. A fully-dynamic search that probes concurrency upward until a resource saturates was rejected: the feedback signal is too noisy to converge — the *same* fresh-400 MiB / concurrency-8 push was measured at 82 MiB peak RSS on one run and 393 MiB on another, so an exploration loop would chase noise.
@@ -1028,24 +1034,87 @@ the remote on every push (reads grow linearly with the accumulated delta count,
 e.g. 24→79 reads over 6 pushes). With the cache, subsequent pushes find the
 same delta indexes in `.omemfs/objects/` and issue zero remote GETs for them.
 
-The Bloom filter is **not** cached this way: its hash changes on every push (a
-new bloom is written each push), so a cached copy would never be hit again.
-Bloom reads remain unconditional remote fetches.
+On the **push** path, the Bloom filter itself is not cached this way: it is
+loaded once per `PackWriter` construction (`load_remote_bloom`, a single
+fetch-and-decrypt) and held resident in memory (`Mutex<BloomFilter>`) for the
+whole push run, since every object-existence check during that run consults
+the same in-memory instance. Its hash also changes on every push (`finish()`
+inserts the run's new hashes and writes the result as a new CAS object — see
+"Push flow with Bloom filter" below), so a disk cache entry keyed by the old
+hash would never be looked up again; a single in-memory load per push is
+already the cheapest possible access pattern, and adding an `objects/` cache
+entry on top of it would only add cache-directory churn for no benefit.
+
+On the **read** path, the access pattern is different, which is why the read
+path *does* cache the Bloom filter this way (see "Read path" below,
+Improvement C): `PackReader::locate` may consult the Bloom filter once per
+resolved hash, and a single `pull` or `expand` run resolves many hashes over
+its lifetime — there is no equivalent single long-lived in-memory instance to
+reuse across those calls the way `PackWriter` has. Re-fetching and
+re-decrypting the same Bloom filter bytes from the remote for every hash
+lookup would be far more expensive than the push path's one-time load, so the
+read path fetches the Bloom filter once, decrypts it once, and caches the
+plaintext in `objects/` under its own hash — identical to how delta, hot, and
+cold index files are already cached. This also means a Bloom filter fetched
+during one command invocation stays cached for a later invocation (e.g. a
+second `expand` run), as long as no intervening `omemfs pack` has replaced it
+with a new one under a new hash.
 
 ### Read path
 
 ```
 load(target_hash):
   1. Check local objects/ cache — return immediately on hit.
-  2. Fetch the index root (local cache or S3 GET).
-  3. Search delta files newest-first (binary search within each).
-  4. Binary search the hot index.
-  5. Issue HEAD objects/<storage_key> to the remote backend.
-     → 200: fetch and return the object (standalone).
-     → 404: fall through to cold shard lookup.
-  6. Compute p = first cold_prefix_bits bits of target_hash.
-     Load cold_shard[p] → binary search.
-  7. If not found: the object does not exist (error).
+  2. locate(target_hash) — described below — to classify the hash as
+     Entry / Standalone / NotFound.
+  3. Resolve the classification to bytes per "On index hit" below.
+
+locate(target_hash):
+  1. Fetch the index root (local cache or S3 GET).
+  2. Search delta files newest-first (binary search within each).
+     → found: Entry (inline or pack).
+  3. Binary search the hot index.
+     → found: Entry.
+  4. [Improvement A] Compute p = first cold_prefix_bits bits of target_hash;
+     let shard = cold_shard[p]. If shard is already present in the local
+     objects/ cache (a purely local existence check, no network call):
+       Search it now.
+       → found: Entry. Done.
+       → not found: remember that this exact shard has already been
+         searched, so step 7 below is skipped later — continue to step 5.
+     Else (shard not yet cached locally): continue to step 5 without any
+     network call yet.
+  5. Issue HEAD objects/<storage_key> to the remote backend. This step is
+     unconditional — it always runs, regardless of what the Bloom filter
+     (step 6) would say — because a standalone object can be written to the
+     remote at any time, independently of when the last `omemfs pack` run
+     built the current Bloom filter snapshot (see "Why the Bloom filter is
+     checked before the cold-shard fetch, but never before the remote
+     probe" below). Skipping this probe on a Bloom "definitely absent"
+     answer would incorrectly report NotFound for such a recently-written
+     object.
+     → 200: Standalone. Done.
+     → 404: continue to step 6.
+  6. [Improvement C] If a Bloom filter is recorded for this snapshot
+     (index root's bloom_hash is set) and, once loaded (objects/ cache, or
+     fetch + decrypt + cache on first use — see above), it reports
+     target_hash as "definitely absent":
+       → the object does not exist (error). Step 7 (the cold-shard fetch)
+         is skipped: the Bloom filter and the cold shards are both built
+         from the same `omemfs pack` snapshot with no staleness gap between
+         them, so "definitely absent" from the filter is exact for "not
+         present in any cold shard" — unlike for the standalone case in
+         step 5, which is why this check must not also skip step 5.
+     Otherwise ("maybe present", no Bloom filter recorded at all, or step 4
+     already searched the covering shard): continue to step 7 exactly as
+     before this change.
+  7. If step 4 already searched this shard (cache hit, not found there), or
+     step 6 just ruled it out via the Bloom filter: skip — already known to
+     miss the cold layer, no need to fetch it. Otherwise: fetch
+     cold_shard[p] from remote, cache it in objects/, and binary search it
+     now.
+     → found: Entry.
+     → not found: the object does not exist (error).
 
 On index hit:
   inline entry     → return data bytes directly (already encrypted; caller decrypts).
@@ -1056,13 +1125,96 @@ On index hit:
   standalone entry → fetch objects/<storage_key> directly from remote.
 ```
 
-The search order places `objects/<storage_key>` lookup before the cold shard to avoid fetching a cold shard file for standalone objects. Cold shards contain only pack and inline entries, so a HEAD 404 at step 5 is the signal to proceed to the cold shard.
+**Why the cold shard is checked before the remote probe when already cached
+(Improvement A)**
+
+The original order placed the standalone `HEAD` probe before the cold shard
+specifically to avoid fetching a whole cold shard file just to learn it does
+not contain the target hash: cold shards hold only pack and inline entries,
+never standalone entries, so on a cold shard's *first* lookup, fetching it
+before probing the remote would frequently mean paying for a multi-hundred-
+KiB-to-multi-MiB download that cannot possibly answer a standalone hash. That
+tradeoff is correct only while the shard is not yet cached.
+
+Once a shard has been fetched at least once, though, it lives in `objects/`
+forever — index files are content-addressed and immutable (see "Index file
+local caching" above) — so a later search of it is a local disk read, not a
+network round trip. At that point there is no longer a reason to pay for the
+remote `HEAD` first: searching the already-cached shard is strictly cheaper
+than the probe, for any hash that shard happens to cover, whether the search
+hits or misses. Step 4 therefore checks whether the covering shard is already
+in the local cache — itself a purely local existence check — and, if so,
+searches it immediately instead of deferring to the probe. A shard that has
+never been fetched still defers to the probe exactly as before, so the
+original cold-start tradeoff this section used to describe is unchanged for
+that case; this only changes behaviour once a shard is warm.
+
+**Why the Bloom filter is checked before the cold-shard fetch, but never
+before the remote probe (Improvement C)**
+
+A Bloom filter answers "definitely absent" or "maybe present" for any hash
+known to the remote at all — inline, pack, or standalone (see "Bloom filter"
+below) — without touching the pack index or the object store beyond the one
+cached fetch of the filter itself. But the filter is a **snapshot**: it is
+built once during `omemfs pack` and covers exactly the hashes known to the
+remote *at that moment*. Cold shards are built from that *same* snapshot, at
+the *same* time, by the *same* `omemfs pack` run — so a Bloom "definitely
+absent" answer is safe to substitute for "this hash is definitely not in any
+cold shard either": both are derived from identical snapshot state with no
+staleness gap between them. False negatives are impossible by construction,
+so skipping the cold-shard *fetch* (step 7) on a definite miss never causes a
+missed object — if the filter is right that the hash was never known to the
+remote as of the last `pack`, it cannot be in a cold shard produced by that
+same `pack`.
+
+This reasoning does **not** extend to the remote HEAD probe (step 5). A
+standalone object can be written directly to the remote (`objects/<hash>`,
+with no index entry) at **any** time, including after the last `omemfs pack`
+run that built the current Bloom filter. Such an object is real and present
+on the remote right now, but it was never inserted into the filter — it
+didn't exist yet when the filter was built — so the filter reports
+"definitely absent" for it. Trusting that answer to skip the HEAD probe would
+incorrectly report `NotFound` for an object that genuinely exists. The HEAD
+probe is therefore always run unconditionally (step 5), and the Bloom filter
+is consulted only afterwards (step 6), where its sole job is to decide
+whether it is worth paying for a cold-shard fetch — a network download of a
+whole shard file — for a hash the filter proves cannot be in any cold shard.
+
+When the filter answers "maybe present" (a false positive, or a true
+positive from a category the filter cannot narrow down — it cannot
+distinguish a pack entry from a standalone object by design), or when no
+Bloom filter is recorded at all (`bloom_hash_opt()` returns `None`: an older
+remote that predates this feature, or one that has never run `omemfs pack`),
+or when step 4 already searched the covering shard, the read path falls
+through to the cold-shard fetch exactly as it did before this change. The
+Bloom filter is therefore a pure additive fast path for skipping an
+unnecessary shard download: it never changes the final classification of a
+hash that does exist, and it never substitutes for the remote HEAD probe —
+only for the cold-shard fetch.
+
+**Cost and ordering only, never classification**
+
+Improvements A and C change *when* and *whether* network calls happen while
+resolving a hash; they never change *what* `locate` ultimately returns. For
+any given hash, the final classification — Entry, Standalone, or NotFound —
+is exactly the same before and after these changes, because the same
+underlying sources of truth (the delta/hot/cold indexes, the Bloom filter,
+and the remote's own set of standalone objects) are consulted either way,
+only in a different order and with two new opportunities to stop early once
+the answer is already certain from information already at hand: a shard
+that's already warm in the cache (Improvement A, which can still resolve a
+hit or a shard-covered miss before the remote probe ever runs), or a Bloom
+filter's definite-absence answer (Improvement C, which — precisely because
+it can only ever prove absence from the cold-shard snapshot, not from the
+remote's live set of standalone objects — always runs after the remote probe
+has already missed, so it only ever skips the cold-shard fetch, never the
+probe itself).
 
 ### Bloom filter
 
-The pack stage maintains a Bloom filter over **all** known remote object hashes — inline, pack, and standalone. It is used during push to quickly determine whether an object with the same hash has already been pushed before, avoiding redundant writes.
+The pack stage maintains a Bloom filter over **all** known remote object hashes — inline, pack, and standalone. It is used during push to quickly determine whether an object with the same hash has already been pushed before, avoiding redundant writes; it is also consulted on the read path (see "Read path" above, Improvement C) to recognise a genuinely-absent hash without a remote probe or cold-shard fetch.
 
-**Membership test semantics**
+**Membership test semantics (push path)**
 
 - `"definitely absent"` → the object has never been pushed; include it in the push batch without further checks.
 - `"maybe present"` → the object may already exist. Consult the **locally cached index first** (delta → hot → cold shard via `PackWriter::load_index_file`, which serves immutable index files from `.omemfs/objects/` without remote I/O on a cache hit). Only if the index lookup misses, issue a `HEAD objects/<storage_key>` request to the remote to catch a standalone object that was written by an earlier push but is not yet recorded in the snapshot index.
@@ -1070,6 +1222,22 @@ The pack stage maintains a Bloom filter over **all** known remote object hashes 
   The index is consulted **before** the remote `HEAD` because, after a `pack`, every previously pushed object lives in the pack layer (recorded in the index, not as `objects/<storage_key>`). Probing the remote first would issue a `HEAD` for each such object that always 404s and then falls through to the index anyway — a wasted remote round-trip per sibling object in any touched directory. The remote `HEAD` is reserved for the minority case (standalone objects pushed since the last snapshot index was built) where the index genuinely cannot answer.
 
 False negatives are impossible by design. False positives trigger an unnecessary index lookup but never cause data loss.
+
+**Membership test semantics (read path, Improvement C)** — see "Read path"
+above for the full step ordering (the Bloom check runs after delta/hot/cached-
+shard lookups have already missed, **and** after the remote HEAD probe has
+already missed). In short: the remote HEAD probe (step 5) always runs first
+and is never skipped, because it is the only check that can observe a
+standalone object written after the Bloom filter's last `omemfs pack`
+snapshot. Only once the probe has also missed does `"definitely absent"`
+short-circuit `locate` straight to `NotFound`, skipping the cold-shard fetch
+(step 7) — safe because the Bloom filter and the cold shards share the same
+snapshot with no staleness gap between them. `"maybe present"` (or no Bloom
+filter recorded) falls through to the cold shard search exactly as `locate`
+would without a Bloom filter at all. The read path's use is strictly a fast
+path for skipping an unnecessary shard download — unlike the push path, it
+never substitutes for the index or remote HEAD lookups when the filter cannot
+rule an object out, and it never skips the remote HEAD probe itself.
 
 **Bloom filter file format** (stored as a CAS object, magic `ED E4`):
 

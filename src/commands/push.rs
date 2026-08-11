@@ -784,6 +784,40 @@ pub fn transfer_objects(
     src_key: Option<&crate::codec::encrypt::EncryptKey>,
     traverse_existing: bool,
 ) -> Result<(), Error> {
+    transfer_objects_many(
+        src,
+        dst,
+        std::slice::from_ref(root_hash),
+        src_key,
+        traverse_existing,
+    )
+}
+
+/// Multi-root counterpart of [`transfer_objects`]: transfer all objects
+/// reachable from **any** of `root_hashes` that are absent in `dst`, in one
+/// walk with dedup shared across every root.
+///
+/// Semantics per root are identical to calling [`transfer_objects`] once per
+/// root; the difference is scheduling. One walk seeded with the whole batch
+/// gives the worker pool parallel work from the start, whereas a per-root loop
+/// of single-node BFS walks (the common case for leaf blobs below the CDC
+/// chunking threshold) has no work to divide and therefore no concurrency at
+/// all. It also means an object referenced by several roots is fetched once
+/// rather than once per root. See `design/02_storage_format.md`, "Multi-root
+/// batching (Improvement B)".
+///
+/// An empty `root_hashes` slice is a no-op, so callers can pass their collected
+/// batch unconditionally.
+pub fn transfer_objects_many(
+    src: &dyn crate::store::ObjectStore,
+    dst: &dyn crate::store::ObjectStore,
+    root_hashes: &[Hash],
+    src_key: Option<&crate::codec::encrypt::EncryptKey>,
+    traverse_existing: bool,
+) -> Result<(), Error> {
+    if root_hashes.is_empty() {
+        return Ok(());
+    }
     // Bound the total size of object buffers held resident across all workers,
     // independently of the worker count (design/02 "Two independent knobs").
     let budget = crate::commands::transfer::ByteBudget::new(
@@ -822,15 +856,16 @@ pub fn transfer_objects(
     let workers = crate::commands::transfer::resolve_concurrency(src)
         .max(crate::commands::transfer::resolve_concurrency(dst));
     if workers >= 2 {
-        return crate::commands::transfer::parallel_bfs(root_hash, workers, &process);
+        return crate::commands::transfer::parallel_bfs(root_hashes, workers, &process);
     }
 
     // Serial path (default for local backends) — byte-identical to the
-    // pre-Phase-5 loop.
+    // pre-Phase-5 loop, except that the queue is seeded with every root so
+    // dedup spans all of them (one walk, not one walk per root).
     use std::collections::{HashSet, VecDeque};
     let mut queue: VecDeque<Hash> = VecDeque::new();
     let mut visited: HashSet<Hash> = HashSet::new();
-    queue.push_back(root_hash.clone());
+    queue.extend(root_hashes.iter().cloned());
     while let Some(hash) = queue.pop_front() {
         // Skip hashes we have already processed; shared subtrees and duplicate
         // blobs (identical content under multiple paths) only need handling once.
@@ -971,7 +1006,11 @@ pub fn upload_missing_with_progress(
     let workers = crate::commands::transfer::resolve_concurrency(local)
         .max(crate::commands::transfer::resolve_concurrency(remote));
     if workers >= 2 {
-        return crate::commands::transfer::parallel_bfs(root_hash, workers, &process);
+        return crate::commands::transfer::parallel_bfs(
+            std::slice::from_ref(root_hash),
+            workers,
+            &process,
+        );
     }
 
     // Serial path (default for local backends) — byte-identical to the
@@ -1109,4 +1148,338 @@ fn colored_println(msg: &str, style: Option<anstyle::Style>) {
     };
     let _ = out.writeln(&text);
     let _ = out.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::local::LocalStore;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    /// A read-side `ObjectStore` wrapper around a `LocalStore` that:
+    /// - counts `open_read` calls (to verify dedup: a shared object must be
+    ///   read exactly once across a whole batched transfer), and
+    /// - tracks how many `open_read` calls are concurrently in flight, with a
+    ///   short artificial delay so real overlap is observable, and
+    /// - forces a fixed `default_transfer_concurrency()` value.
+    ///
+    /// Forcing the concurrency value directly (rather than setting the
+    /// `OMEMFS_TRANSFER_CONCURRENCY` env var) avoids mutating shared process
+    /// state across Rust's parallel test runner -- see transfer.rs's own
+    /// `resolve_concurrency_env_overrides_default` test for the same caveat.
+    struct ConcurrencyTrackingStore {
+        inner: LocalStore,
+        forced_concurrency: usize,
+        delay: Duration,
+        in_flight: AtomicUsize,
+        max_in_flight: AtomicUsize,
+        open_read_calls: AtomicUsize,
+    }
+
+    impl ConcurrencyTrackingStore {
+        fn new(inner: LocalStore, forced_concurrency: usize, delay: Duration) -> Self {
+            ConcurrencyTrackingStore {
+                inner,
+                forced_concurrency,
+                delay,
+                in_flight: AtomicUsize::new(0),
+                max_in_flight: AtomicUsize::new(0),
+                open_read_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl ObjectStore for ConcurrencyTrackingStore {
+        fn exists(&self, hash: &Hash) -> Result<bool, Error> {
+            self.inner.exists(hash)
+        }
+        fn size(&self, hash: &Hash) -> Result<u64, Error> {
+            self.inner.size(hash)
+        }
+        fn list_with_sizes(&self) -> Result<Vec<(String, u64)>, Error> {
+            self.inner.list_with_sizes()
+        }
+        fn open_read(&self, hash: &Hash) -> Result<Box<dyn std::io::Read>, Error> {
+            self.open_read_calls.fetch_add(1, Ordering::SeqCst);
+            let cur = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(cur, Ordering::SeqCst);
+            // Hold the "in-flight" window open long enough for concurrent
+            // workers (if any) to overlap with this call.
+            std::thread::sleep(self.delay);
+            let result = self.inner.open_read(hash);
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            result
+        }
+        fn write_from(&self, hash: &Hash, reader: &mut dyn std::io::Read) -> Result<(), Error> {
+            self.inner.write_from(hash, reader)
+        }
+        fn default_transfer_concurrency(&self) -> usize {
+            self.forced_concurrency
+        }
+    }
+
+    /// Build an unencrypted `LocalStore` ("remote") populated with `n`
+    /// independent single-chunk blobs. Returns the store, its backing
+    /// `TempDir` (kept alive for the caller), and the blob hashes.
+    fn populate_independent_blobs(n: usize) -> (LocalStore, TempDir, Vec<Hash>) {
+        let dir = TempDir::new().unwrap();
+        let store = LocalStore::for_remote(dir.path());
+        let mut hashes = Vec::with_capacity(n);
+        for i in 0..n {
+            let content = format!("blob-content-{i}").into_bytes();
+            let serialised = crate::object::serialise_blob(&content);
+            let hash = crate::object::blob_hash(&content);
+            codec::chunk::store_chunked(&store, &hash, &serialised, None).unwrap();
+            hashes.push(hash);
+        }
+        (store, dir, hashes)
+    }
+
+    /// Build a minimal serialised `Tree::Normal` with blob entries pointing at
+    /// the given hashes (mirrors `transfer.rs`'s test helper of the same shape).
+    fn make_test_tree(entries: &[(&str, &Hash)]) -> Vec<u8> {
+        use crate::object::Tree;
+        let entries = entries
+            .iter()
+            .map(|(name, h)| TreeEntry::Blob {
+                name: name.to_string(),
+                hash: (*h).clone(),
+                size: 0,
+                mtime: None,
+                mode: None,
+            })
+            .collect();
+        Tree::Normal { entries }.serialise()
+    }
+
+    // -----------------------------------------------------------------------
+    // transfer_objects_many (Improvement B) -- design/02_storage_format.md,
+    // "Multi-root batching (Improvement B)".
+    //
+    // `transfer_objects_many` does not exist yet; these tests are written
+    // against its intended signature (same as `transfer_objects` but taking
+    // `&[Hash]` instead of a single root hash). The whole test binary
+    // therefore fails to *compile* until it is added -- the expected
+    // test-first state, not a mistake in these tests.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn transfer_objects_many_copies_all_independent_roots() {
+        // Copying N independent root objects in one `transfer_objects_many`
+        // call must produce the same end state (dst has all of them) as
+        // calling `transfer_objects` once per root.
+        let (remote, _remote_dir, hashes) = populate_independent_blobs(5);
+        let dst_dir = TempDir::new().unwrap();
+        let dst = LocalStore::for_cache(dst_dir.path());
+
+        transfer_objects_many(&remote, &dst, &hashes, None, false).unwrap();
+
+        for hash in &hashes {
+            assert!(
+                dst.exists(hash).unwrap(),
+                "expected {} to have been copied",
+                hash.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn transfer_objects_many_matches_per_root_transfer_objects_calls() {
+        // The batched call must produce an end state identical to calling
+        // `transfer_objects` once per root (the pre-Improvement-B behaviour),
+        // for a set of independent roots with no shared content.
+        let (remote, _remote_dir, hashes) = populate_independent_blobs(4);
+
+        let dst_a_dir = TempDir::new().unwrap();
+        let dst_a = LocalStore::for_cache(dst_a_dir.path());
+        for hash in &hashes {
+            transfer_objects(&remote, &dst_a, hash, None, false).unwrap();
+        }
+
+        let dst_b_dir = TempDir::new().unwrap();
+        let dst_b = LocalStore::for_cache(dst_b_dir.path());
+        transfer_objects_many(&remote, &dst_b, &hashes, None, false).unwrap();
+
+        for hash in &hashes {
+            assert_eq!(
+                dst_a.exists(hash).unwrap(),
+                dst_b.exists(hash).unwrap(),
+                "per-root loop and batched call must agree on {}",
+                hash.as_str()
+            );
+            assert!(dst_b.exists(hash).unwrap());
+        }
+    }
+
+    #[test]
+    fn transfer_objects_many_dedups_shared_subtree_across_roots() {
+        // Two tree roots that share one child blob: the shared blob must be
+        // read from `remote` exactly once across the whole batched call, not
+        // once per root that references it.
+        let remote_dir = TempDir::new().unwrap();
+        let remote = ConcurrencyTrackingStore::new(
+            LocalStore::for_remote(remote_dir.path()),
+            1, // concurrency is irrelevant here; this test only counts opens
+            Duration::from_millis(0),
+        );
+
+        let shared_content = b"shared-child-blob".to_vec();
+        let shared_serialised = crate::object::serialise_blob(&shared_content);
+        let shared_hash = crate::object::blob_hash(&shared_content);
+        codec::chunk::store_chunked(&remote, &shared_hash, &shared_serialised, None).unwrap();
+
+        let a_tree = make_test_tree(&[("from_a", &shared_hash)]);
+        let b_tree = make_test_tree(&[("from_b", &shared_hash)]);
+        let a_hash = Hash::compute(&a_tree);
+        let b_hash = Hash::compute(&b_tree);
+        assert_ne!(a_hash, b_hash);
+        codec::store_write(&remote, &a_hash, &a_tree, None).unwrap();
+        codec::store_write(&remote, &b_hash, &b_tree, None).unwrap();
+
+        let dst_dir = TempDir::new().unwrap();
+        let dst = LocalStore::for_cache(dst_dir.path());
+
+        transfer_objects_many(&remote, &dst, &[a_hash.clone(), b_hash.clone()], None, false)
+            .unwrap();
+
+        assert!(dst.exists(&a_hash).unwrap());
+        assert!(dst.exists(&b_hash).unwrap());
+        assert!(dst.exists(&shared_hash).unwrap());
+        // 3 distinct objects (a, b, shared) -> 3 open_read calls, not 4.
+        assert_eq!(
+            remote.open_read_calls.load(Ordering::SeqCst),
+            3,
+            "the shared child blob must be read from remote exactly once, \
+             regardless of how many roots reference it"
+        );
+    }
+
+    #[test]
+    fn transfer_objects_many_serial_path_dedups_across_roots() {
+        // With concurrency forced to 1 (the local-backend default), the
+        // fallback serial loop must still dedup a hash shared by multiple
+        // roots -- not just within one root's own descendants.
+        let remote_dir = TempDir::new().unwrap();
+        let remote = ConcurrencyTrackingStore::new(
+            LocalStore::for_remote(remote_dir.path()),
+            1,
+            Duration::from_millis(0),
+        );
+        let shared_content = b"serial-shared-blob".to_vec();
+        let shared_serialised = crate::object::serialise_blob(&shared_content);
+        let shared_hash = crate::object::blob_hash(&shared_content);
+        codec::chunk::store_chunked(&remote, &shared_hash, &shared_serialised, None).unwrap();
+
+        let dst_dir = TempDir::new().unwrap();
+        let dst = LocalStore::for_cache(dst_dir.path());
+
+        // Same hash listed 3 times, as if 3 stub records happened to
+        // reference identical content.
+        transfer_objects_many(
+            &remote,
+            &dst,
+            &[shared_hash.clone(), shared_hash.clone(), shared_hash.clone()],
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert!(dst.exists(&shared_hash).unwrap());
+        assert_eq!(
+            remote.open_read_calls.load(Ordering::SeqCst),
+            1,
+            "a hash repeated across roots must be fetched only once"
+        );
+    }
+
+    #[test]
+    fn transfer_objects_many_achieves_concurrency_across_independent_roots() {
+        // The crux of Improvement B: a batch of N independent, childless
+        // roots (each a single-node BFS on its own) has NO parallel work
+        // available when transferred one root per call -- but seeding one
+        // `transfer_objects_many` call with the whole batch lets the shared
+        // worker pool distribute them from the start.
+        if std::env::var("OMEMFS_TRANSFER_CONCURRENCY").is_ok() {
+            // Skip when the ambient environment overrides concurrency, to
+            // avoid a spurious result unrelated to this test's own setup
+            // (mirrors the guard used by transfer.rs's concurrency test).
+            return;
+        }
+
+        let remote_dir = TempDir::new().unwrap();
+        let remote = ConcurrencyTrackingStore::new(
+            LocalStore::for_remote(remote_dir.path()),
+            4,
+            Duration::from_millis(20),
+        );
+        const N: usize = 6;
+        let mut hashes = Vec::with_capacity(N);
+        for i in 0..N {
+            let content = format!("concurrent-blob-{i}").into_bytes();
+            let serialised = crate::object::serialise_blob(&content);
+            let hash = crate::object::blob_hash(&content);
+            codec::chunk::store_chunked(&remote, &hash, &serialised, None).unwrap();
+            hashes.push(hash);
+        }
+
+        let dst_dir = TempDir::new().unwrap();
+        let dst = LocalStore::for_cache(dst_dir.path());
+
+        transfer_objects_many(&remote, &dst, &hashes, None, false).unwrap();
+
+        for hash in &hashes {
+            assert!(dst.exists(hash).unwrap());
+        }
+        assert!(
+            remote.max_in_flight.load(Ordering::SeqCst) >= 2,
+            "batching {} independent roots into one transfer_objects_many call \
+             should let the worker pool overlap requests (max observed: {})",
+            N,
+            remote.max_in_flight.load(Ordering::SeqCst)
+        );
+    }
+
+    #[test]
+    fn transfer_objects_per_root_loop_never_exceeds_concurrency_one() {
+        // Contrast case (documents the bug Improvement B fixes; must PASS
+        // today): calling the existing single-root `transfer_objects` once
+        // per root in a plain loop can never observe concurrency > 1, because
+        // each call's own BFS is a lone childless node with nothing to divide
+        // across workers, and the outer loop itself has no parallelism of
+        // its own.
+        let remote_dir = TempDir::new().unwrap();
+        let remote = ConcurrencyTrackingStore::new(
+            LocalStore::for_remote(remote_dir.path()),
+            4,
+            Duration::from_millis(20),
+        );
+        const N: usize = 6;
+        let mut hashes = Vec::with_capacity(N);
+        for i in 0..N {
+            let content = format!("loop-blob-{i}").into_bytes();
+            let serialised = crate::object::serialise_blob(&content);
+            let hash = crate::object::blob_hash(&content);
+            codec::chunk::store_chunked(&remote, &hash, &serialised, None).unwrap();
+            hashes.push(hash);
+        }
+
+        let dst_dir = TempDir::new().unwrap();
+        let dst = LocalStore::for_cache(dst_dir.path());
+
+        for hash in &hashes {
+            transfer_objects(&remote, &dst, hash, None, false).unwrap();
+        }
+
+        assert_eq!(
+            remote.max_in_flight.load(Ordering::SeqCst),
+            1,
+            "a per-root loop of single-node BFS calls has no parallel work available"
+        );
+    }
 }

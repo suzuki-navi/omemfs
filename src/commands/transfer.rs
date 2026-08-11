@@ -1,8 +1,9 @@
 //! Parallel object-transfer engine (Phase 5).
 //!
-//! Both push (`upload_missing_with_progress`) and copy (`transfer_objects`)
-//! perform the same shape of work: a breadth-first walk of the object graph
-//! reachable from a root hash, where each node is checked/read/written on a
+//! Both push (`upload_missing_with_progress`) and copy (`transfer_objects` /
+//! `transfer_objects_many`) perform the same shape of work: a breadth-first walk
+//! of the object graph reachable from **one or more** root hashes, where each
+//! node is checked/read/written on a
 //! `Send + Sync` [`ObjectStore`] and its children are discovered by parsing the
 //! fetched bytes (chunk manifest or tree). The walk has **no ordering
 //! dependency** between nodes and writes are content-addressed and idempotent,
@@ -17,7 +18,10 @@
 //! could block on `send` with no one left to `recv` (deadlock). Instead we use:
 //!
 //! - a shared `Mutex<VecDeque<Hash>>` work queue + a `Condvar` to park idle
-//!   workers,
+//!   workers, seeded with *all* root hashes up front so a batch of independent
+//!   childless roots (e.g. many small leaf blobs) is divisible across workers
+//!   from the start — see `design/02_storage_format.md`, "Multi-root batching
+//!   (Improvement B)",
 //! - a shared `Mutex<HashSet<Hash>>` of visited hashes (claim-before-process, so
 //!   a shared subtree or duplicate blob is handled exactly once),
 //! - an `AtomicUsize` count of *outstanding* items (queued + in-flight). The run
@@ -196,20 +200,28 @@ impl Shared {
     }
 }
 
-/// Run a parallel breadth-first transfer from `root` using `workers` threads,
-/// invoking `node_fn` on each unique reachable hash.
+/// Run a parallel breadth-first transfer from **one or more** `roots` using
+/// `workers` threads, invoking `node_fn` on each unique reachable hash.
 ///
 /// `node_fn` returns `Some(bytes)` to enqueue the children parsed from `bytes`,
 /// or `None` to enqueue nothing. Requires `workers >= 2`; callers use their
 /// serial loop for `workers == 1`.
-pub fn parallel_bfs(root: &Hash, workers: usize, node_fn: &NodeFn<'_>) -> Result<(), Error> {
+///
+/// The whole `roots` slice seeds the shared queue at once, so a batch of
+/// independent roots is distributed across all workers immediately instead of
+/// being walked one root at a time (`design/02_storage_format.md`, "Multi-root
+/// batching (Improvement B)"). The shared `visited` set makes dedup uniform:
+/// a hash reachable from several roots — including the same hash appearing more
+/// than once in `roots` — is claimed and processed exactly once. An empty
+/// `roots` slice is a no-op.
+pub fn parallel_bfs(roots: &[Hash], workers: usize, node_fn: &NodeFn<'_>) -> Result<(), Error> {
     debug_assert!(workers >= 2, "parallel_bfs requires >= 2 workers");
 
     let shared = Shared {
-        queue: Mutex::new(VecDeque::from([root.clone()])),
+        queue: Mutex::new(roots.iter().cloned().collect::<VecDeque<Hash>>()),
         visited: Mutex::new(HashSet::new()),
         cv: Condvar::new(),
-        outstanding: AtomicUsize::new(1),
+        outstanding: AtomicUsize::new(roots.len()),
         failed: AtomicBool::new(false),
         error: Mutex::new(None),
     };
@@ -444,7 +456,14 @@ mod tests {
             Ok(Some(bytes))
         };
 
-        parallel_bfs(&root, 4, &node_fn).unwrap();
+        // NOTE (test-first / Improvement B): `parallel_bfs` is being extended to
+        // take a *slice* of root hashes instead of a single `&Hash` (see
+        // design/02_storage_format.md, "Multi-root batching (Improvement B)").
+        // This call site is updated to the new intended signature ahead of the
+        // implementation, so this whole test module currently fails to
+        // *compile* against today's `pub fn parallel_bfs(root: &Hash, ...)`.
+        // That compile failure is the expected test-first state.
+        parallel_bfs(&[root.clone()], 4, &node_fn).unwrap();
 
         // 4 distinct nodes (root, a, b, shared) — `shared` is reachable via both
         // a and b but must be visited/written exactly once.
@@ -472,8 +491,144 @@ mod tests {
             }
             Ok(Some(store.objects.get(h.as_str()).cloned().unwrap()))
         };
-        let err = parallel_bfs(&root, 4, &node_fn).unwrap_err();
+        // See NOTE above: multi-root signature, single-element slice.
+        let err = parallel_bfs(&[root.clone()], 4, &node_fn).unwrap_err();
         assert!(err.to_string().contains("boom"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-root batching (Improvement B) — design/02_storage_format.md,
+    // "Multi-root batching (Improvement B)".
+    //
+    // `parallel_bfs` is extended to seed the shared work queue with *all* roots
+    // up front (`outstanding = roots.len()`), instead of a single root hash.
+    // These tests exercise that contract directly against the intended new
+    // signature `parallel_bfs(roots: &[Hash], workers: usize, node_fn: &NodeFn)`.
+    // Until the signature is changed, this test module fails to compile — the
+    // expected test-first state.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parallel_bfs_multiple_independent_roots() {
+        // Two independent leaf blobs with no shared content and no children:
+        // both must be visited when seeded together in one call.
+        let leaf_a = Hash::compute(b"leaf-a");
+        let leaf_b = Hash::compute(b"leaf-b");
+        let mut objects = std::collections::HashMap::new();
+        objects.insert(leaf_a.as_str().to_string(), b"leaf-a".to_vec());
+        objects.insert(leaf_b.as_str().to_string(), b"leaf-b".to_vec());
+        let store = GraphStore {
+            objects,
+            written: Mutex::new(HashSet::new()),
+            visits: AtomicUsize::new(0),
+        };
+        let node_fn = |h: &Hash| -> Result<Option<Vec<u8>>, Error> {
+            store.visits.fetch_add(1, Ordering::SeqCst);
+            store.written.lock().unwrap().insert(h.as_str().to_string());
+            Ok(Some(store.objects.get(h.as_str()).cloned().unwrap()))
+        };
+
+        parallel_bfs(&[leaf_a.clone(), leaf_b.clone()], 4, &node_fn).unwrap();
+
+        assert_eq!(store.written.lock().unwrap().len(), 2);
+        assert_eq!(store.visits.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn parallel_bfs_multiple_roots_dedup_shared_subtree() {
+        // Two independent roots (a, b) that both reference the same shared
+        // leaf. The shared leaf is reachable via two *different roots*, not
+        // just via one root's descendants -- it must still be claimed and
+        // processed exactly once.
+        let shared = Hash::compute(b"shared-leaf-multi-root");
+        let a_tree = make_tree(&[("from_a", &shared)]);
+        let b_tree = make_tree(&[("from_b", &shared)]);
+        let a = Hash::compute(&a_tree);
+        let b = Hash::compute(&b_tree);
+        assert_ne!(a, b, "a and b must be distinct subtrees");
+
+        let mut objects = std::collections::HashMap::new();
+        objects.insert(a.as_str().to_string(), a_tree);
+        objects.insert(b.as_str().to_string(), b_tree);
+        objects.insert(shared.as_str().to_string(), b"shared-leaf-multi-root".to_vec());
+        let store = GraphStore {
+            objects,
+            written: Mutex::new(HashSet::new()),
+            visits: AtomicUsize::new(0),
+        };
+        let node_fn = |h: &Hash| -> Result<Option<Vec<u8>>, Error> {
+            store.visits.fetch_add(1, Ordering::SeqCst);
+            store.written.lock().unwrap().insert(h.as_str().to_string());
+            Ok(Some(store.objects.get(h.as_str()).cloned().unwrap()))
+        };
+
+        // Seed the two subtree roots directly (no common parent root) --
+        // this is the shape that matters for Improvement B: independent
+        // roots passed straight into one `parallel_bfs` call.
+        parallel_bfs(&[a.clone(), b.clone()], 4, &node_fn).unwrap();
+
+        // a, b, shared: 3 distinct nodes. `shared` must be visited once, not
+        // once per root that reaches it.
+        assert_eq!(store.written.lock().unwrap().len(), 3);
+        assert_eq!(store.visits.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn parallel_bfs_duplicate_roots_processed_once() {
+        // The same hash appearing twice in the roots slice (e.g. two blobs
+        // that happen to have identical content) must be processed exactly
+        // once, not twice.
+        let leaf = Hash::compute(b"dup-leaf");
+        let mut objects = std::collections::HashMap::new();
+        objects.insert(leaf.as_str().to_string(), b"dup-leaf".to_vec());
+        let store = GraphStore {
+            objects,
+            written: Mutex::new(HashSet::new()),
+            visits: AtomicUsize::new(0),
+        };
+        let node_fn = |h: &Hash| -> Result<Option<Vec<u8>>, Error> {
+            store.visits.fetch_add(1, Ordering::SeqCst);
+            store.written.lock().unwrap().insert(h.as_str().to_string());
+            Ok(Some(store.objects.get(h.as_str()).cloned().unwrap()))
+        };
+
+        parallel_bfs(&[leaf.clone(), leaf.clone()], 4, &node_fn).unwrap();
+
+        assert_eq!(store.written.lock().unwrap().len(), 1);
+        assert_eq!(
+            store.visits.load(Ordering::SeqCst),
+            1,
+            "a duplicate root hash must be claimed and processed exactly once"
+        );
+    }
+
+    #[test]
+    fn parallel_bfs_first_error_wins_across_multiple_roots() {
+        // One of several independent roots fails; the run must still surface
+        // that error (first-error-wins) instead of silently completing just
+        // because the other roots succeeded.
+        let ok_leaf = Hash::compute(b"ok-multi-root");
+        let bad_leaf = Hash::compute(b"bad-multi-root");
+        let mut objects = std::collections::HashMap::new();
+        objects.insert(ok_leaf.as_str().to_string(), b"ok-multi-root".to_vec());
+        objects.insert(bad_leaf.as_str().to_string(), b"bad-multi-root".to_vec());
+        let store = GraphStore {
+            objects,
+            written: Mutex::new(HashSet::new()),
+            visits: AtomicUsize::new(0),
+        };
+        let bad_hex = bad_leaf.as_str().to_string();
+        let node_fn = |h: &Hash| -> Result<Option<Vec<u8>>, Error> {
+            if h.as_str() == bad_hex {
+                return Err(Error::Other("boom-multi-root".into()));
+            }
+            store.visits.fetch_add(1, Ordering::SeqCst);
+            store.written.lock().unwrap().insert(h.as_str().to_string());
+            Ok(Some(store.objects.get(h.as_str()).cloned().unwrap()))
+        };
+
+        let err = parallel_bfs(&[ok_leaf.clone(), bad_leaf.clone()], 4, &node_fn).unwrap_err();
+        assert!(err.to_string().contains("boom-multi-root"));
     }
 
     /// Build a minimal serialised `Tree::Normal` with blob entries pointing at

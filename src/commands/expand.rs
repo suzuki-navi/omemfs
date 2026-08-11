@@ -90,6 +90,47 @@ pub fn run(opts: ExpandOptions) -> Result<(), Error> {
     let remote_key = remote_key.as_ref();
 
     let phase = crate::progress::begin_phase("Expand stubs");
+
+    // Phase 1 (Improvement B, design/02_storage_format.md "Multi-root
+    // batching"): walk the whole target scope and collect every blob hash that
+    // is missing from the local cache, WITHOUT fetching or writing anything.
+    // Then fetch the entire batch with a single multi-root transfer, so the
+    // worker pool has all of the (typically childless) leaf blobs to divide
+    // between its threads at once. Phase 2 below is the unchanged
+    // materialisation walk; it finds every batched blob already cached.
+    //
+    // --dry-run must not fetch any object or touch the local cache, so the
+    // collection walk is skipped entirely in that mode.
+    if !opts.dry_run {
+        let mut pending: Vec<crate::object::Hash> = Vec::new();
+        for (_rel_path, record) in &to_expand {
+            match &record.target_type {
+                StubTargetType::Tree => {
+                    collect_tree_fetches(
+                        &record.hash,
+                        &local,
+                        &pack_reader,
+                        remote_key,
+                        opts.stub_threshold,
+                        &mut pending,
+                    )?;
+                }
+                StubTargetType::Blob => {
+                    if !local.exists(&record.hash)? {
+                        pending.push(record.hash.clone());
+                    }
+                }
+            }
+        }
+        crate::commands::push::transfer_objects_many(
+            &pack_reader,
+            &local,
+            &pending,
+            remote_key,
+            true,
+        )?;
+    }
+
     let mut count = 0usize;
     for (rel_path, record) in &to_expand {
         match &record.target_type {
@@ -227,15 +268,126 @@ pub fn run(opts: ExpandOptions) -> Result<(), Error> {
     Ok(())
 }
 
-/// Recursively materialise the tree at `tree_hash` into `base_dir`.
-/// Downloads any objects missing from `local` from `remote`.
+/// Plan the blob fetches a whole `expand_tree` run will need, without fetching
+/// any blob or touching the working tree (phase 1 of the two-phase expansion —
+/// design/02_storage_format.md, "Multi-root batching (Improvement B)").
+///
+/// Appends to `out` every blob hash, at any depth below `tree_hash`, that is
+/// missing from `local` and will therefore have to come from `remote`. The
+/// caller fetches the whole batch with one `transfer_objects_many` call, so the
+/// worker pool can pull independent (typically childless) leaf blobs
+/// concurrently instead of one per sequential `transfer_objects` call.
+///
+/// Tree objects are still read one at a time here: their bytes are what reveals
+/// their children, so they cannot be part of the batch (design/04_cli_spec.md,
+/// expand step 3). Reading them through `ensure_local_then_read` caches them
+/// locally, so the materialisation walk re-reads them from the local cache
+/// rather than the remote.
+///
+/// Entries at or above `stub_threshold` are deliberately **not** planned. Whether
+/// such an entry is expanded or left stubbed depends on
+/// `stub::stub_would_be_visible_to_git`, a `git check-ignore` subprocess whose
+/// answer can change as the materialisation walk writes files; evaluating it here
+/// would both duplicate the subprocess and move the decision earlier than it
+/// happens today. Those entries therefore keep their existing per-entry
+/// behaviour (the materialisation walk's own `local.exists` fallback fetches one
+/// if it does turn out to need expanding), and batching covers exactly the
+/// unconditionally-expanded blobs below the threshold — the many-small-files case
+/// Improvement B targets.
+fn collect_tree_fetches(
+    tree_hash: &crate::object::Hash,
+    local: &dyn ObjectStore,
+    remote: &dyn ObjectStore,
+    remote_key: Option<&crate::codec::encrypt::EncryptKey>,
+    stub_threshold: u64,
+    out: &mut Vec<crate::object::Hash>,
+) -> Result<(), Error> {
+    let data = codec::ensure_local_then_read(remote, local, tree_hash, remote_key)?;
+    let Tree::Normal { entries } = Tree::deserialise(&data)?;
+
+    for entry in &entries {
+        match entry {
+            TreeEntry::Blob { hash, size, .. } => {
+                if stub_threshold > 0 && *size >= stub_threshold {
+                    continue;
+                }
+                if !local.exists(hash)? {
+                    out.push(hash.clone());
+                }
+            }
+            TreeEntry::Tree { hash, size, .. } => {
+                if stub_threshold > 0 && *size >= stub_threshold {
+                    continue;
+                }
+                collect_tree_fetches(hash, local, remote, remote_key, stub_threshold, out)?;
+            }
+            // Symlinks carry their target inline — nothing to fetch.
+            TreeEntry::Symlink { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+/// Expand the tree at `tree_hash` into `base_dir`: plan every blob fetch it
+/// needs, pull them all in one batched multi-root transfer, then materialise.
+///
+/// Returns the number of files (blobs and symlinks) actually materialised into
+/// the working tree. Children left stubbed do not count; nested directories
+/// contribute the files materialised within them.
+///
+/// This is the self-contained entry point. `run` above widens the batch further
+/// by planning across *every* stub it is expanding (top-level blob stubs
+/// included) and issuing a single transfer before this point, which leaves this
+/// function's own planning pass finding everything already cached — a local
+/// re-walk with no remote I/O.
+fn expand_tree(
+    tree_hash: &crate::object::Hash,
+    base_dir: &std::path::Path,
+    work_dir: &std::path::Path,
+    rel_base: &str,
+    local: &dyn ObjectStore,
+    remote: &dyn ObjectStore,
+    remote_key: Option<&crate::codec::encrypt::EncryptKey>,
+    stub_threshold: u64,
+) -> Result<usize, Error> {
+    let mut pending: Vec<crate::object::Hash> = Vec::new();
+    collect_tree_fetches(
+        tree_hash,
+        local,
+        remote,
+        remote_key,
+        stub_threshold,
+        &mut pending,
+    )?;
+    crate::commands::push::transfer_objects_many(remote, local, &pending, remote_key, true)?;
+
+    expand_tree_materialise(
+        tree_hash,
+        base_dir,
+        work_dir,
+        rel_base,
+        local,
+        remote,
+        remote_key,
+        stub_threshold,
+    )
+}
+
+/// Recursively materialise the tree at `tree_hash` into `base_dir` (phase 2).
+/// Downloads any objects still missing from `local` from `remote`.
 /// Children whose size is >= `stub_threshold` (and threshold > 0) are left as stubs
 /// rather than being fully expanded.
 ///
 /// Returns the number of files (blobs and symlinks) actually materialised into
 /// the working tree. Children left stubbed do not count; nested directories
 /// contribute the files materialised within them.
-fn expand_tree(
+///
+/// The per-blob `transfer_objects` call below is now a fallback rather than the
+/// normal path: `collect_tree_fetches` + `transfer_objects_many` has already
+/// batched every blob it could plan for, so this only fires for a blob the
+/// planner deliberately skipped (an at-or-above-threshold entry that turns out
+/// to be expanded because its stub would be visible to Git).
+fn expand_tree_materialise(
     tree_hash: &crate::object::Hash,
     base_dir: &std::path::Path,
     work_dir: &std::path::Path,
@@ -323,7 +475,7 @@ fn expand_tree(
                     )?;
                     continue;
                 }
-                materialised += expand_tree(
+                materialised += expand_tree_materialise(
                     &hash,
                     &sub_dir,
                     work_dir,
@@ -355,4 +507,209 @@ fn expand_tree(
         }
     }
     Ok(materialised)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::object::Hash;
+    use crate::store::local::LocalStore;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    /// Read-side `ObjectStore` wrapper that tracks concurrently-in-flight
+    /// `open_read` calls (with an artificial delay to make overlap
+    /// observable) and forces a fixed `default_transfer_concurrency()`.
+    /// Duplicated from the equivalent fixture in `push.rs`'s and `pull.rs`'s
+    /// tests -- there is no shared test-utility module in this crate today
+    /// (see e.g. `transfer.rs`'s own self-contained `GraphStore` fixture for
+    /// the same per-file convention), and forcing the concurrency value
+    /// directly avoids mutating the process-wide `OMEMFS_TRANSFER_CONCURRENCY`
+    /// env var across Rust's parallel test runner.
+    struct ConcurrencyTrackingStore {
+        inner: LocalStore,
+        forced_concurrency: usize,
+        delay: Duration,
+        in_flight: AtomicUsize,
+        max_in_flight: AtomicUsize,
+    }
+
+    impl ConcurrencyTrackingStore {
+        fn new(inner: LocalStore, forced_concurrency: usize, delay: Duration) -> Self {
+            ConcurrencyTrackingStore {
+                inner,
+                forced_concurrency,
+                delay,
+                in_flight: AtomicUsize::new(0),
+                max_in_flight: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl ObjectStore for ConcurrencyTrackingStore {
+        fn exists(&self, hash: &Hash) -> Result<bool, Error> {
+            self.inner.exists(hash)
+        }
+        fn size(&self, hash: &Hash) -> Result<u64, Error> {
+            self.inner.size(hash)
+        }
+        fn list_with_sizes(&self) -> Result<Vec<(String, u64)>, Error> {
+            self.inner.list_with_sizes()
+        }
+        fn open_read(&self, hash: &Hash) -> Result<Box<dyn std::io::Read>, Error> {
+            let cur = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(cur, Ordering::SeqCst);
+            // Hold the "in-flight" window open long enough for concurrent
+            // workers (if any) to overlap with this call.
+            std::thread::sleep(self.delay);
+            let result = self.inner.open_read(hash);
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            result
+        }
+        fn write_from(&self, hash: &Hash, reader: &mut dyn std::io::Read) -> Result<(), Error> {
+            self.inner.write_from(hash, reader)
+        }
+        fn default_transfer_concurrency(&self) -> usize {
+            self.forced_concurrency
+        }
+    }
+
+    /// Populate `store` with a tree containing `n` independent single-chunk
+    /// blob children (each well under the 1 MiB chunk threshold). Returns the
+    /// tree hash and the (file name, content) pairs the tree references.
+    fn populate_tree_with_blobs(
+        store: &dyn ObjectStore,
+        n: usize,
+    ) -> (Hash, Vec<(String, Vec<u8>)>) {
+        let mut files = Vec::with_capacity(n);
+        let mut entries = Vec::with_capacity(n);
+        for i in 0..n {
+            let name = format!("file{i}.txt");
+            let content = format!("expand-test-content-{i}").into_bytes();
+            let serialised = crate::object::serialise_blob(&content);
+            let hash = crate::object::blob_hash(&content);
+            codec::chunk::store_chunked(store, &hash, &serialised, None).unwrap();
+            entries.push(TreeEntry::Blob {
+                name: name.clone(),
+                hash,
+                size: content.len() as u64,
+                mtime: None,
+                mode: None,
+            });
+            files.push((name, content));
+        }
+        let tree_bytes = Tree::Normal { entries }.serialise();
+        let tree_hash = Hash::compute(&tree_bytes);
+        codec::store_write(store, &tree_hash, &tree_bytes, None).unwrap();
+        (tree_hash, files)
+    }
+
+    #[test]
+    fn expand_tree_materialises_correct_content() {
+        // Correctness only (design/04 expand step 4). This must already pass
+        // today, before the batched-fetch change: expand_tree's end result is
+        // unaffected by *how many* transfer calls it takes to get there.
+        let remote_dir = TempDir::new().unwrap();
+        let remote = LocalStore::for_remote(remote_dir.path());
+        let (tree_hash, files) = populate_tree_with_blobs(&remote, 6);
+
+        let local_dir = TempDir::new().unwrap();
+        let local = LocalStore::for_cache(local_dir.path());
+        let work_dir = TempDir::new().unwrap();
+        let base_dir = work_dir.path().join("dest");
+
+        let materialised = expand_tree(
+            &tree_hash,
+            &base_dir,
+            work_dir.path(),
+            "dest",
+            &local,
+            &remote,
+            None,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(materialised, 6);
+        for (name, content) in &files {
+            let path = base_dir.join(name);
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                *content,
+                "materialised content mismatch for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn expand_tree_batches_blob_fetches_for_concurrency() {
+        // Improvement B applied to expand (design/02_storage_format.md,
+        // "Multi-root batching"; design/04_cli_spec.md expand step 3): the
+        // design calls for collecting every blob hash an expansion needs and
+        // fetching all of them via a single batched, concurrent transfer,
+        // instead of the current per-blob sequential loop over tree entries
+        // (`expand_tree`'s `for entry in entries` loop above calls
+        // `transfer_objects` once per blob).
+        //
+        // A tree of N small files, each below the CDC min_size chunk
+        // threshold, is exactly the case the design doc calls out: each
+        // blob's own BFS is a single childless node with nothing to divide
+        // across workers, so today's per-blob sequential loop can never
+        // observe concurrency > 1 no matter how `OMEMFS_TRANSFER_CONCURRENCY`
+        // is set. This is expected to FAIL at runtime today (not a compile
+        // failure -- `expand_tree` already exists) until the batched-fetch
+        // change lands.
+        //
+        // JUDGMENT CALL: design/04_cli_spec.md's updated expand step 3 does
+        // not name a specific "collect hashes" helper function or signature,
+        // so rather than invent one and risk testing an API shape the
+        // implementer doesn't choose, this test exercises the existing
+        // `expand_tree` function directly (shared by both the top-level
+        // directory-stub branch in `run()` and its own recursion) and
+        // observes concurrency through an instrumented `remote` store --
+        // the same "achievable concurrency" proxy used for
+        // `transfer_objects_many` in push.rs's tests. See this task's final
+        // report for the full rationale, including the known gap this
+        // leaves (run()'s top-level loop over sibling Blob-type stubs, lines
+        // ~94-172, is not separately covered here).
+        if std::env::var("OMEMFS_TRANSFER_CONCURRENCY").is_ok() {
+            return;
+        }
+
+        let remote_dir = TempDir::new().unwrap();
+        let inner_remote = LocalStore::for_remote(remote_dir.path());
+        let (tree_hash, files) = populate_tree_with_blobs(&inner_remote, 6);
+        let remote = ConcurrencyTrackingStore::new(inner_remote, 4, Duration::from_millis(20));
+
+        let local_dir = TempDir::new().unwrap();
+        let local = LocalStore::for_cache(local_dir.path());
+        let work_dir = TempDir::new().unwrap();
+        let base_dir = work_dir.path().join("dest");
+
+        let materialised = expand_tree(
+            &tree_hash,
+            &base_dir,
+            work_dir.path(),
+            "dest",
+            &local,
+            &remote,
+            None,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(materialised, files.len());
+        assert!(
+            remote.max_in_flight.load(Ordering::SeqCst) >= 2,
+            "expanding {} independently-stubbed small files should let the \
+             worker pool overlap their fetches (max observed: {})",
+            files.len(),
+            remote.max_in_flight.load(Ordering::SeqCst)
+        );
+    }
 }
