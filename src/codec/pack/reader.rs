@@ -3,33 +3,54 @@
 /// PackReader wraps a raw remote ObjectStore and implements `open_read` using
 /// the three-tier index (delta / hot / cold) instead of direct object lookup.
 ///
-/// Search order for `open_read(target_hash)` (see design/02_storage_format.md
-/// "Read path" for the full rationale behind steps 3a/4a below, Improvements
-/// A and C):
+/// `open_read`/`exists`/`resolve` are **SnapshotOnly**: they never issue a
+/// remote HEAD/GET for a hash the index does not reference (design/02
+/// "Snapshot read path"). Search order for `open_read(target_hash)` (see
+/// design/02_storage_format.md "Read path" for the full rationale behind
+/// steps 3a/4a below, Improvements A and C):
 ///   1. Local objects/ cache — return immediately on hit.
-///   2. Fetch INDEX_ROOT (local cache or remote file).
+///   2. Fetch INDEX_ROOT (local cache or remote file). If the remote has no
+///      INDEX_ROOT at all (never pushed), skip straight to a direct remote
+///      fetch instead of the steps below — see `Located::NoIndexRoot`.
 ///   3. Search delta files newest-first (binary search within each).
 ///   4. Binary search the hot index.
 ///   3a. [Improvement A] If the covering cold shard is already cached
-///       locally, search it now (a local disk read, no network call).
-///   5. Check if objects/<hash> exists directly (standalone). Unconditional —
-///      always runs, since a standalone object can be written to the remote
-///      at any time, after the Bloom filter's snapshot was taken.
-///   4a. [Improvement C] If a Bloom filter is recorded, consult it; a
+///       locally, search it now (a local disk read, no network call) and
+///       remember that this exact shard was already searched.
+///   4a. [Improvement C] Unless step 3a already searched the covering shard,
+///       consult the Bloom filter (if the index root has one recorded); a
 ///       "definitely absent" answer short-circuits straight to NotFound,
-///       skipping ONLY the cold-shard fetch (step 6) — never step 5, which
-///       already ran above.
-///   6. Compute prefix → load cold shard → binary search (skipped if 3a
-///      already searched this exact shard, or if 4a ruled it out).
-///   7. Not found → error.
+///       skipping the cold-shard fetch in step 6.
+///   6. Compute the covering cold shard → load it (unless 3a already
+///      searched it, or 4a ruled it out) → binary search.
+///   7. Not found → error. No unconditional remote HEAD probe here: an
+///      unindexed standalone object is an orphan outside this reader's
+///      snapshot, and a normal read must not pay a network round trip on
+///      every miss to discover that — see `Located::NotFound` and the
+///      "Diagnostic LiveFallback lookup" section below.
 ///
 /// On index hit:
-///   inline  → return data bytes (already encrypted; caller decrypts via codec).
-///   pack    → fetch pack file → slice at [offset, offset+length) → return bytes.
+///   inline     → return data bytes (already encrypted; caller decrypts via codec).
+///   pack       → fetch pack file → slice at [offset, offset+length) → return bytes.
 ///   standalone → fetch objects/<hash> directly from remote.
 ///
 /// After fetching from remote, the encrypted bytes are stored in the local
 /// objects/ cache (decrypt happens at the codec layer, not here).
+///
+/// # Diagnostic LiveFallback lookup
+///
+/// `resolve_diagnostic` is a second, separately-named lookup for the one case
+/// SnapshotOnly deliberately excludes: an object physically present on the
+/// remote (e.g. an orphan left by an interrupted or obsolete write) but not
+/// referenced by any delta/hot/cold index entry. It is never called from
+/// `open_read`/`exists`/`resolve` and must not be added to their call graph —
+/// it exists purely for an explicit diagnostic call site. It runs the same
+/// SnapshotOnly `locate()` first; only on a `NotFound` does it take the extra
+/// step of probing `remote.exists`/`remote.open_read` directly, and it
+/// reports whether the returned bytes came from that probe. The only caller
+/// is `omemfs cat` (`src/commands/cat.rs`) on a full 64-character hash, after
+/// ordinary SnapshotOnly resolution has already missed — see
+/// design/02_storage_format.md, "Snapshot read path" (LiveFallback).
 use std::collections::HashMap;
 use std::io::{self, Cursor, Read};
 use std::sync::{Arc, Condvar, Mutex};
@@ -459,6 +480,47 @@ impl PackReader {
         let mut buf = Vec::new();
         r.read_to_end(&mut buf).map_err(Error::Io)?;
         Ok(unescape_standalone(buf))
+    }
+
+    // -----------------------------------------------------------------------
+    // Diagnostic LiveFallback lookup (see the module doc comment above)
+    // -----------------------------------------------------------------------
+
+    /// Resolve `hash` for an explicit diagnostic/raw-hash operation, opting
+    /// into **LiveFallback** lookup (design/02_storage_format.md, "Snapshot
+    /// read path"). Unlike `resolve()` — which `open_read`/`exists` use, and
+    /// which this method must never be called from — a SnapshotOnly miss here
+    /// is not immediately an error: it is followed by a single `exists()`
+    /// probe and, on a hit, a single `open_read()` fetch of the remote's raw
+    /// standalone key, exactly the safety net a plain SnapshotOnly miss
+    /// deliberately skips.
+    ///
+    /// Returns the object's bytes in the same representation `resolve()`
+    /// returns (still encrypted; the caller decodes via the codec layer),
+    /// together with a flag: `true` when the bytes were obtained ONLY via the
+    /// raw probe — meaning `hash` has no entry in this reader's snapshot and
+    /// is potentially an orphan from an interrupted or obsolete write — and
+    /// `false` when the object resolved normally (through the snapshot index,
+    /// or via the pre-existing `Located::NoIndexRoot` fallback `resolve()`
+    /// already uses when the remote has never been pushed to at all).
+    ///
+    /// This costs at most one extra remote round trip (`exists()` +
+    /// `open_read()`) beyond what `resolve()` already pays, and only on a
+    /// genuine SnapshotOnly miss — it must only be called from an explicit
+    /// diagnostic call site (currently `omemfs cat` on a full hash), never
+    /// from a hot path.
+    pub fn resolve_diagnostic(&self, hash: &Hash) -> Result<(Vec<u8>, bool), Error> {
+        match self.locate(hash)? {
+            Located::Entry(entry) => Ok((self.resolve_entry(&entry, hash)?, false)),
+            Located::NoIndexRoot => Ok((self.fetch_from_remote_direct(hash)?, false)),
+            Located::NotFound => {
+                if self.remote.exists(hash)? {
+                    Ok((self.fetch_from_remote_direct(hash)?, true))
+                } else {
+                    Err(Error::ObjectNotFound(hash.as_str().to_string()))
+                }
+            }
+        }
     }
 }
 
@@ -1513,6 +1575,187 @@ mod tests {
         assert!(
             reader.open_read(&notfound_hash).is_err(),
             "NotFound classification (second, warm call) must also be an error"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Diagnostic LiveFallback lookup (`resolve_diagnostic`; design/02
+    // "Snapshot read path", LiveFallback). Only `omemfs cat` on a full hash
+    // opts into this; `resolve()`/`open_read()`/`exists()` (used by ls/pull/
+    // expand/clone) must stay exactly SnapshotOnly, which is what the
+    // existing tests above (e.g. `snapshot_reader_rejects_unindexed_
+    // standalone`, `cold_shard_search_is_free_once_warm`) already lock in.
+    // -------------------------------------------------------------------------
+
+    /// The counterpart to `snapshot_reader_rejects_unindexed_standalone`: the
+    /// same orphaned standalone object (raw bytes on the remote, no index
+    /// entry anywhere) that ordinary SnapshotOnly `resolve()` correctly
+    /// rejects must still be retrievable through the explicit diagnostic
+    /// LiveFallback method, and reported as outside the snapshot.
+    #[test]
+    fn diagnostic_lookup_resolves_unindexed_standalone_and_flags_outside_snapshot() {
+        use crate::codec::pack::writer::{PackWriter, STANDALONE_ESCAPE_MAGIC};
+
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().to_path_buf();
+        std::fs::create_dir_all(base.join("objects")).unwrap();
+        std::fs::create_dir_all(base.join("tmp")).unwrap();
+        let cache_dir = tmp.path().join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        // Original object bytes begin with ED E2 (an L6 index magic), so they
+        // require the standalone escape on write.
+        let mut data = vec![0u8; 64];
+        data[0] = 0xED;
+        data[1] = 0xE2;
+        let hash = Hash::compute(&data);
+
+        // Write the escaped bytes directly into the remote objects/ store, with
+        // no index entry referencing the hash -- exactly the orphan scenario
+        // LiveFallback exists to diagnose.
+        let remote = LocalStore::for_remote(&base);
+        let mut wrapped = Vec::with_capacity(2 + data.len());
+        wrapped.extend_from_slice(&STANDALONE_ESCAPE_MAGIC);
+        wrapped.extend_from_slice(&data);
+        remote
+            .write_from(&hash, &mut Cursor::new(&wrapped))
+            .unwrap();
+
+        // Produce an INDEX_ROOT (with no entry for `hash`) via a separate push,
+        // so `locate` reaches the ordinary NotFound path instead of the
+        // no-INDEX_ROOT shortcut.
+        let writer_remote = LocalStore::for_remote(&base);
+        let writer_objcache = LocalStore::for_cache(tmp.path().join("writer_objcache"));
+        let mut writer = PackWriter::new(
+            Box::new(writer_remote),
+            Box::new(LocalRootPointer::new(base.clone(), None)),
+            writer_objcache,
+            None,
+        )
+        .unwrap();
+        let dummy = vec![0x11; 50];
+        let dummy_hash = Hash::compute(&dummy);
+        writer
+            .write_from(&dummy_hash, &mut Cursor::new(&dummy))
+            .unwrap();
+        writer.finish(&Hash::compute(b"root")).unwrap();
+
+        let packcache_dir = tmp.path().join("packcache2");
+        std::fs::create_dir_all(&packcache_dir).unwrap();
+        let objcache_dir = tmp.path().join("objcache2");
+        std::fs::create_dir_all(&objcache_dir).unwrap();
+
+        let reader = PackReader::new(
+            Box::new(LocalStore::for_remote(&base)),
+            LocalStore::for_cache(&cache_dir),
+            LocalStore::for_cache(&packcache_dir),
+            LocalStore::for_cache(&objcache_dir),
+            Box::new(LocalRootPointer::new(base.clone(), None)),
+            None,
+        );
+
+        // Regression guard: SnapshotOnly `resolve()` must still reject it --
+        // this must NOT change as a side effect of adding LiveFallback.
+        assert!(
+            reader.resolve(&hash).is_err(),
+            "SnapshotOnly resolve() must still reject an unindexed standalone object"
+        );
+
+        // New behaviour: the diagnostic LiveFallback method retrieves it and
+        // flags it as outside the snapshot.
+        let (bytes, outside_snapshot) = reader.resolve_diagnostic(&hash).unwrap();
+        assert_eq!(
+            bytes, data,
+            "diagnostic lookup must return the orphan's unescaped bytes"
+        );
+        assert!(
+            outside_snapshot,
+            "an object with no index entry, found only via the raw probe, must be flagged as outside the snapshot"
+        );
+    }
+
+    /// LiveFallback must not invent data: a hash absent from both the
+    /// snapshot index and the raw remote must still error via the diagnostic
+    /// method, exactly like `resolve()`.
+    #[test]
+    fn diagnostic_lookup_errors_for_truly_absent_hash() {
+        use crate::codec::pack::index::InlineEntry;
+
+        let tmp = TempDir::new().unwrap();
+        let base = make_remote_base(&tmp);
+        let remote_for_setup = LocalStore::for_remote(&base);
+
+        // An unrelated indexed object, purely so the snapshot has a real
+        // INDEX_ROOT and `locate` reaches the ordinary NotFound path instead
+        // of the no-INDEX_ROOT shortcut.
+        let present_data = vec![0xF2u8; 10];
+        let present_hash = Hash::compute(&present_data);
+        let shard_hash = write_raw_index(
+            &remote_for_setup,
+            vec![IndexEntry::Inline(InlineEntry {
+                hash: present_hash.clone(),
+                data: present_data,
+            })],
+        );
+        let mut root = IndexRoot::new_empty();
+        root.delta_hashes = vec![*shard_hash.as_bytes_array()];
+        write_raw_index_root(&base, &root);
+
+        let (reader, _record, _objcache_dir) = make_reader_with_stats(&base, &tmp);
+
+        let absent_hash = Hash::compute(b"nothing-here-at-all-not-even-raw");
+        let result = reader.resolve_diagnostic(&absent_hash);
+        assert!(
+            result.is_err(),
+            "LiveFallback must not invent data for a hash absent from both the index and the raw remote"
+        );
+    }
+
+    /// An ordinarily-indexed object (an `Inline` entry here; the same holds
+    /// for `Pack`) must resolve via the diagnostic method with
+    /// `outside_snapshot == false`, and must NOT pay a needless remote
+    /// `exists()` probe just because the diagnostic method was used instead
+    /// of `resolve()` -- the LiveFallback probe is reserved strictly for a
+    /// genuine SnapshotOnly miss.
+    #[test]
+    fn diagnostic_lookup_on_indexed_object_does_not_probe_remote() {
+        use crate::codec::pack::index::InlineEntry;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let tmp = TempDir::new().unwrap();
+        let base = make_remote_base(&tmp);
+        let remote_for_setup = LocalStore::for_remote(&base);
+
+        let data = vec![0xF1u8; 10];
+        let hash = Hash::compute(&data);
+        let shard_hash = write_raw_index(
+            &remote_for_setup,
+            vec![IndexEntry::Inline(InlineEntry {
+                hash: hash.clone(),
+                data: data.clone(),
+            })],
+        );
+
+        let mut root = IndexRoot::new_empty();
+        root.delta_hashes = vec![*shard_hash.as_bytes_array()];
+        write_raw_index_root(&base, &root);
+
+        let (reader, record, _objcache_dir) = make_reader_with_stats(&base, &tmp);
+
+        let (bytes, outside_snapshot) = reader.resolve_diagnostic(&hash).unwrap();
+        assert_eq!(
+            bytes, data,
+            "diagnostic lookup must return the indexed object's bytes"
+        );
+        assert!(
+            !outside_snapshot,
+            "an ordinarily-indexed object must not be flagged as outside the snapshot"
+        );
+
+        let exists_calls = record.exists_found.load(Relaxed) + record.exists_miss.load(Relaxed);
+        assert_eq!(
+            exists_calls, 0,
+            "diagnostic lookup must not probe the remote when the object is already indexed"
         );
     }
 }

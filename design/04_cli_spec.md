@@ -779,9 +779,10 @@ omemfs cat [--hash] [--remote <name>] <target>
 When a hash (or prefix) is given, the command tries in order:
 
 1. **Local cache** — if the object exists locally (resolving a 4+ character prefix against the local store), decode it (decrypt → decompress → deserialise) and display the logical object content.
-2. **Remote store** — if not found locally, resolve the target against the remote and display the pack-layer object. A full 64-character hash is fetched directly; a 4+ character **prefix** is resolved against the remote pack index (enumerating the delta, hot, and cold-shard index files) so the abbreviated hash that `ls` prints can be pasted directly. A prefix that matches more than one stored object is reported as ambiguous with a sample of the matches. See **Pack-layer output** below.
+2. **Remote store, SnapshotOnly** — if not found locally, resolve the target against the remote's snapshot index (delta / hot / cold, the same lookup `ls`/`pull`/`expand` use). A 4+ character **prefix** is resolved by enumerating the delta, hot, and cold-shard index files so the abbreviated hash that `ls` prints can be pasted directly; a full 64-character hash is resolved the same way (through the index, not by fetching the raw remote key directly). A prefix that matches more than one stored object is reported as ambiguous with a sample of the matches. On a hit, the object (and anything it references — chunk manifests, tree children) is transferred into the local cache and displayed exactly like a local-cache hit, with no warning.
+3. **Remote store, LiveFallback (full hash only)** — if step 2 misses for a full 64-character hash, `cat` makes one last-resort probe directly against the remote key: if the raw object is present despite having no snapshot index entry, it is fetched and either (a) recognised as a pack-layer artifact (pack file / index file / Bloom filter) and shown via the existing **Pack-layer output** view below, unchanged, or (b) decoded and displayed as a logical object (tree → JSON, blob → raw bytes) exactly like a local-cache hit, but with a warning printed to **stderr** noting that the object is outside the current snapshot (not indexed; likely an orphan from an interrupted or obsolete write) — stdout carries only the decoded content, so scripts piping `cat`'s stdout are unaffected. This step never runs for a hash **prefix**: there is no exact remote key to probe for a prefix, so an unresolved prefix is reported as not found, exactly as before.
 
-If neither source has the object, an error is returned.
+If no step resolves the object, an error is returned.
 
 **Behaviour**
 - blob: print raw bytes to stdout (no trailing newline added).
@@ -789,6 +790,7 @@ If neither source has the object, an error is returned.
 - When stdout is a TTY, JSON output (tree objects and pack-layer objects) is syntax-highlighted.
 - Symlinks have no associated object; `<ref>/<path>` targeting a symlink is an error.
 - With `--hash`, `/<path>` traversal still occurs; the hash of the resolved leaf object is printed.
+- LiveFallback (see **Resolution order for hash targets**, step 3): when a full-hash target is displayed only because it was found outside the current snapshot, a warning is printed to stderr, e.g. `warning: <hash> was found outside the current snapshot (no delta/hot/cold index entry references it; likely an orphan from an interrupted or obsolete write) -- it is not reachable from any recorded root`. This never happens for a hash resolved through the local cache or through the snapshot index (steps 1–2).
 
 **Output examples**
 

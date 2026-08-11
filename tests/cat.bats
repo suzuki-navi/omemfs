@@ -427,3 +427,71 @@ print(count)
     restored_hash="$(sha256sum out.bin | cut -d' ' -f1)"
     [ "$original_hash" = "$restored_hash" ]
 }
+
+# ---------------------------------------------------------------------------
+# LiveFallback: `cat <full-hash>` on an object outside the current snapshot
+# (design/02_storage_format.md, "Snapshot read path"; design/04_cli_spec.md,
+# "Resolution order for hash targets", step 3).
+# ---------------------------------------------------------------------------
+
+@test "cat: LiveFallback resolves an orphaned standalone object and warns on stderr" {
+    # Produce a well-formed standalone-sized (>= 1 MiB) object via a real push
+    # into a disposable donor clone/remote, so the harvested stored bytes are
+    # exactly what a real omemfs write would produce (encode pipeline and all).
+    local donor_dir donor_remote orphan_hash
+    donor_dir="$(mktemp -d)"
+    donor_remote="$(mktemp -d)"
+    (
+        cd "$donor_dir"
+        "$OMEMFS" clone --new --url "$donor_remote" . >/dev/null
+        head -c 1048577 /dev/urandom > orphan.bin
+        "$OMEMFS" push >/dev/null
+    )
+    orphan_hash="$(cd "$donor_dir" && "$OMEMFS" ls --full-hash orphan.bin | awk '{print $1}')"
+
+    # Standalone objects are written directly at objects/<hash> on the remote
+    # (src/codec/pack/writer.rs `route()`). All remote backends use the fixed
+    # 3-level sharding in src/store/remote_objects_dir.rs (NOT the local
+    # cache's adaptive-depth layout): objects/<2>/<2>/<2>/<rest>.
+    local p1="${orphan_hash:0:2}" p2="${orphan_hash:2:2}" p3="${orphan_hash:4:2}" rest="${orphan_hash:6}"
+    local donor_obj_path="$donor_remote/objects/$p1/$p2/$p3/$rest"
+    [ -f "$donor_obj_path" ]
+
+    # This test's own repo (from setup_repo) already has a remote at
+    # $REMOTE_DIR. Push unrelated content first so an INDEX_ROOT exists here
+    # too, then splice in the donor's raw bytes under the SAME hash, with no
+    # index entry anywhere referencing it in THIS remote -- a genuine orphan,
+    # e.g. from an interrupted or obsolete write.
+    echo "unrelated tracked content" > tracked.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    local target_obj_path="$REMOTE_DIR/objects/$p1/$p2/$p3/$rest"
+    mkdir -p "$(dirname "$target_obj_path")"
+    cp "$donor_obj_path" "$target_obj_path"
+
+    "$OMEMFS" cat "$orphan_hash" > out.bin 2> err.txt
+    local cat_status=$?
+    [ "$cat_status" -eq 0 ]
+
+    # stdout carries only the decoded content, byte-exact.
+    cmp "$donor_dir/orphan.bin" out.bin
+
+    # The warning is on stderr only, and identifies the object as outside the
+    # snapshot -- never on stdout, so scripts piping cat's stdout are unaffected.
+    grep -q "outside the current snapshot" err.txt
+    ! grep -aq "outside the current snapshot" out.bin
+
+    rm -rf "$donor_dir" "$donor_remote" out.bin err.txt
+
+    # ls/pull against this remote must be completely unaffected: no error, and
+    # the orphan hash never appears as if it were part of the remote-tracked
+    # tree. `--remote` scans the remote's tree (walked from its root), as
+    # opposed to the working tree, which would otherwise show `out.bin`
+    # (removed above) as a false positive since it has identical content.
+    run "$OMEMFS" ls -r --remote --full-hash .
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"$orphan_hash"* ]]
+
+    run "$OMEMFS" pull
+    [ "$status" -eq 0 ]
+}

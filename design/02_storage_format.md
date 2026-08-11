@@ -590,6 +590,50 @@ and it must identify such a result as outside the snapshot. This preserves
 repair and diagnosis without adding an S3 round trip to every normal graph
 lookup.
 
+**Implementation.** LiveFallback is implemented as `PackReader::resolve_diagnostic`
+(`src/codec/pack/reader.rs`), a method distinct from — and never called by —
+`resolve()`/`open_read()`/`exists()`. It first runs the same index-only
+`locate()` used by `resolve()`; on `Located::Entry` or `Located::NoIndexRoot`
+it returns the object's bytes with `outside_snapshot = false`, identical to
+what `resolve()` would return. Only on `Located::NotFound` does it take the
+extra step: a single `self.remote.exists(hash)` probe, and if that reports
+presence, a single `self.remote.open_read(hash)` fetch, returning the bytes
+with `outside_snapshot = true`. If the probe reports absence, it returns the
+same `Error::ObjectNotFound` a plain SnapshotOnly miss would. This is a
+bounded, single extra remote round trip that only happens on a genuine
+SnapshotOnly miss.
+
+The only caller of `resolve_diagnostic` is `omemfs cat` (`src/commands/cat.rs`),
+and only for a **full 64-character hash** target that is not already in the
+local cache: `cat` first attempts ordinary SnapshotOnly resolution (the same
+`PackReader` + `transfer_objects` graph walk used for a resolved hash prefix);
+only when that misses does it fall to `resolve_diagnostic`. A hash **prefix**
+(4..63 chars) never uses LiveFallback — there is no exact remote key to probe
+for a prefix, so an unresolved prefix is reported as not found exactly as
+before. `ls`, `pull`, `expand`, and clone materialisation are unaffected and
+remain strictly SnapshotOnly, as described above.
+
+When `cat` displays an object obtained via LiveFallback (`outside_snapshot ==
+true`), it prints a warning to **stderr** (stdout carries only the decoded
+object content, so scripts consuming `cat`'s stdout are not affected) along
+the lines of:
+
+```
+warning: <hash> was found outside the current snapshot (no delta/hot/cold
+index entry references it; likely an orphan from an interrupted or obsolete
+write) -- it is not reachable from any recorded root
+```
+
+Pack-layer artifacts (pack files, index files, Bloom filters) are a separate
+concept: they are never referenced by the logical delta/hot/cold index by
+design (they ARE that index), so a full hash naming one of them also misses
+SnapshotOnly resolution and is also fetched through the same raw probe — but
+`cat` recognises their leading magic bytes and renders the existing pack-layer
+diagnostic view (design/04_cli_spec.md, "Pack-layer output") for them
+unconditionally, without the "outside the snapshot" warning, since that
+warning is about logical objects missing from the index, not about the index
+files themselves.
+
 ```
 load(target_hash):
   1. Check local objects/ cache — return immediately on hit.

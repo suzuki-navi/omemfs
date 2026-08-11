@@ -1,4 +1,3 @@
-use std::io::Read;
 use std::path::PathBuf;
 
 use crate::codec;
@@ -77,47 +76,54 @@ pub fn run(opts: CatOptions) -> Result<(), Error> {
                             "--hash is not supported for pack-layer objects".to_string(),
                         ));
                     }
-                    let remote = repo.remote_store(&opts.remote_name)?;
-                    let remote_key = remote.encrypt_key.clone();
-                    // A short prefix (4..64 chars) is resolved against the remote
-                    // pack index so the user can paste the abbreviated hash shown
-                    // by `ls`. A full 64-char hash skips the scan and is fetched
-                    // directly.
+                    let (pack_reader, remote, remote_key) =
+                        repo.pack_reader(&opts.remote_name, None)?;
                     if ref_str.len() == 64 {
                         // A full hash may name any stored object — a logical
-                        // blob/tree, or a pack-layer artifact (pack file, index
-                        // file, bloom filter). Show the pack-layer diagnostic
-                        // view, which inspects the leading bytes and renders the
-                        // appropriate form.
+                        // blob/tree/chunk manifest reachable through the
+                        // snapshot's delta/hot/cold index (SnapshotOnly, exactly
+                        // like the prefix branch below), or a pack-layer
+                        // artifact (pack file, index file, Bloom filter), which
+                        // is never in that index by design. Try SnapshotOnly
+                        // resolution first; only on a miss does `print_pack_object`
+                        // fall to the raw diagnostic view — a LiveFallback probe
+                        // for a genuinely orphaned logical object, or the
+                        // unchanged pack-layer summary for an artifact hash.
                         let hash = parse_hash_for_remote(ref_str)?;
-                        return print_pack_object(&hash, &remote, &remote_key);
+                        match crate::commands::push::transfer_objects(
+                            &pack_reader,
+                            &local,
+                            &hash,
+                            remote_key.as_ref(),
+                            true,
+                        ) {
+                            Ok(()) => (hash, None),
+                            Err(Error::ObjectNotFound(_)) => {
+                                return print_pack_object(&hash, &pack_reader, &remote, &remote_key);
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    } else {
+                        // A short prefix is resolved against the remote pack index,
+                        // which only enumerates logical-object entries (blobs, trees,
+                        // chunk manifests) — never pack/index/bloom storage keys, and
+                        // never via LiveFallback (there is no exact key to probe for
+                        // a prefix). So a resolved prefix always names a logical
+                        // object: fetch it via the pack reader (handling inline /
+                        // pack-sliced / standalone / chunked entries) into the local
+                        // cache and fall through to the logical display path below,
+                        // so the user sees the object's content rather than a
+                        // pack-layer summary.
+                        let hash = resolve_prefix_on_remote(&pack_reader, ref_str)?;
+                        crate::commands::push::transfer_objects(
+                            &pack_reader,
+                            &local,
+                            &hash,
+                            remote_key.as_ref(),
+                            true,
+                        )?;
+                        (hash, None)
                     }
-                    // A short prefix is resolved against the remote pack index,
-                    // which only enumerates logical-object entries (blobs, trees,
-                    // chunk manifests) — never pack/index/bloom storage keys. So a
-                    // resolved prefix always names a logical object: fetch it via
-                    // the pack reader (handling inline / pack-sliced / standalone /
-                    // chunked entries) into the local cache and fall through to the
-                    // logical display path below, so the user sees the object's
-                    // content rather than a pack-layer summary.
-                    let hash =
-                        resolve_prefix_on_remote(&repo, &remote, ref_str, &opts.remote_name)?;
-                    let pack_reader = crate::codec::pack::reader::PackReader::new(
-                        Box::new(remote.clone()),
-                        repo.local_store(),
-                        repo.packcache_store(),
-                        repo.objcache_store(),
-                        repo.remote_root_pointer(&opts.remote_name)?,
-                        remote_key.clone(),
-                    );
-                    crate::commands::push::transfer_objects(
-                        &pack_reader,
-                        &local,
-                        &hash,
-                        remote_key.as_ref(),
-                        true,
-                    )?;
-                    (hash, None)
                 }
                 Err(e) => return Err(e),
             }
@@ -200,11 +206,14 @@ fn parse_hash_for_remote(s: &str) -> Result<Hash, Error> {
 /// when the object is not in the local cache, so the user can paste the short
 /// hash that `ls` prints. Errors if the prefix is too short, matches nothing,
 /// or is ambiguous (matches more than one stored object).
+///
+/// Takes an already-constructed `pack_reader` rather than building its own,
+/// so the caller (which needs the same reader for the full-hash SnapshotOnly
+/// attempt too) does not pay for two separate `PackReader`s -- and two
+/// separate INDEX_ROOT reads -- for one `cat` invocation.
 fn resolve_prefix_on_remote(
-    repo: &Repo,
-    remote: &LocalStore,
+    pack_reader: &crate::codec::pack::reader::PackReader,
     prefix: &str,
-    remote_name: &str,
 ) -> Result<Hash, Error> {
     if prefix.len() < MIN_HASH_PREFIX_LEN {
         return Err(Error::Other(format!(
@@ -212,15 +221,6 @@ fn resolve_prefix_on_remote(
             MIN_HASH_PREFIX_LEN
         )));
     }
-    let remote_key = remote.encrypt_key.clone();
-    let pack_reader = crate::codec::pack::reader::PackReader::new(
-        Box::new(remote.clone()),
-        repo.local_store(),
-        repo.packcache_store(),
-        repo.objcache_store(),
-        repo.remote_root_pointer(remote_name)?,
-        remote_key,
-    );
     let mut matches = pack_reader.resolve_prefix(prefix)?;
     match matches.len() {
         0 => Err(Error::ObjectNotFound(prefix.to_string())),
@@ -285,19 +285,33 @@ fn print_index_root_json(ir: &IndexRoot) -> Result<(), Error> {
     println_json(&obj)
 }
 
+/// Render the raw diagnostic view for a hash the caller has already
+/// established is not resolvable through ordinary SnapshotOnly resolution
+/// (the `omemfs cat` full-hash path tries that first — see `run()`). `hash`
+/// here is either:
+///   - a pack-layer artifact (pack file / index file / Bloom filter), which
+///     is never referenced by the logical delta/hot/cold index by design (it
+///     IS that index), so it always ends up here; or
+///   - a genuinely orphaned logical object: physically present on the remote
+///     but referenced by no index entry (e.g. left over from an interrupted
+///     or obsolete write).
+///
+/// `pack_reader.resolve_diagnostic` (LiveFallback) tells these apart from "not
+/// present at all": it re-tries SnapshotOnly resolution and, only on a miss,
+/// probes the remote's raw standalone key directly. The leading bytes of the
+/// result then distinguish a pack-layer artifact (unchanged diagnostic JSON
+/// view, no warning) from a logical object (decoded and displayed exactly
+/// like the local-cache-hit path, with a stderr warning identifying it as
+/// outside the current snapshot).
 fn print_pack_object(
     hash: &Hash,
+    pack_reader: &crate::codec::pack::reader::PackReader,
     remote: &LocalStore,
     remote_key: &Option<EncryptKey>,
 ) -> Result<(), Error> {
     let storage_key = remote.storage_key_of(hash);
 
-    // Read raw (encrypted) bytes from remote objects/.
-    let mut reader = remote
-        .open_read(hash)
-        .map_err(|_| Error::ObjectNotFound(hash.as_str().to_string()))?;
-    let mut raw = Vec::new();
-    reader.read_to_end(&mut raw).map_err(Error::Io)?;
+    let (raw, outside_snapshot) = pack_reader.resolve_diagnostic(hash)?;
 
     // Check leading 2 bytes before decryption: pack files are not encrypted.
     if raw.len() >= 2 && raw[0] == 0xED && raw[1] == 0xE0 {
@@ -321,26 +335,83 @@ fn print_pack_object(
 
     match (plaintext[0], plaintext[1]) {
         (0xED, 0xE2) => {
-            // Index file (hot / delta / cold).
+            // Index file (hot / delta / cold) — never a logical object, so no
+            // "outside the snapshot" warning applies here.
             let idx = IndexFile::deserialise(&plaintext)?;
             print_index_file_json(&idx, hash, &storage_key)
         }
         (0xED, 0xE4) => {
-            // Bloom filter.
+            // Bloom filter — likewise never a logical object.
             let bf = BloomFilter::deserialise(&plaintext)?;
             print_bloom_json(&bf, hash, &storage_key)
         }
         _ => {
-            // Logical object (blob/tree) or other.
-            let mut out = Output::for_stdout();
-            out.writeln(&format!(
-                "this is a logical object; use 'omemfs cat {}' to view its content",
-                hash.as_str()
-            ))
-            .map_err(Error::Io)?;
-            out.finish().map_err(Error::Io)
+            // Logical object (blob/tree/chunk manifest), reached only because
+            // SnapshotOnly resolution already missed it (see `run()`).
+            // Decompress and display it exactly like the local-cache-hit
+            // path, then flag it if LiveFallback is the only reason we have
+            // it at all.
+            let data = crate::codec::compress::decompress(&plaintext)?;
+            if outside_snapshot {
+                eprintln!(
+                    "warning: {} was found outside the current snapshot (no delta/hot/cold index entry references it; likely an orphan from an interrupted or obsolete write) -- it is not reachable from any recorded root",
+                    hash.as_str()
+                );
+            }
+            print_logical_object(&data, pack_reader, remote_key.as_ref())
         }
     }
+}
+
+/// Display already-decoded (decrypted + decompressed) logical-object bytes:
+/// a tree as pretty JSON, a blob (or chunked blob) streamed raw to stdout.
+/// Mirrors the local-cache-hit display in `run()`, but operates on bytes
+/// already fetched via LiveFallback rather than re-reading from a store, and
+/// resolves any chunk hashes of a manifest through `pack_reader` (ordinary
+/// SnapshotOnly resolution — only the manifest itself was found to be an
+/// orphan; its chunks are expected to still be indexed normally).
+fn print_logical_object(
+    data: &[u8],
+    pack_reader: &crate::codec::pack::reader::PackReader,
+    remote_key: Option<&EncryptKey>,
+) -> Result<(), Error> {
+    if let Ok(tree) = Tree::deserialise(data) {
+        let value = serde_json::to_value(&tree).map_err(Error::Json)?;
+        return println_json(&value);
+    }
+
+    crate::progress::freeze_phase_view();
+    let mut out = Output::raw_stdout();
+    let w = out.writer();
+    match crate::object::deserialise_manifest(data) {
+        None => {
+            // Single, unchunked blob.
+            w.write_all(crate::object::deserialise_blob(data))
+                .map_err(Error::Io)?;
+        }
+        Some(chunk_hashes) => {
+            let mut first = true;
+            for chunk_hash in &chunk_hashes {
+                let chunk_tagged = codec::store_read(pack_reader, chunk_hash, remote_key)?;
+                let chunk_bytes = crate::object::deserialise_chunk(&chunk_tagged).ok_or_else(
+                    || {
+                        Error::InvalidObject(format!(
+                            "expected ED F3 chunk tag for hash {}",
+                            chunk_hash
+                        ))
+                    },
+                )?;
+                let payload = if first {
+                    first = false;
+                    crate::object::deserialise_blob(chunk_bytes)
+                } else {
+                    chunk_bytes
+                };
+                w.write_all(payload).map_err(Error::Io)?;
+            }
+        }
+    }
+    out.finish().map_err(Error::Io)
 }
 
 fn print_index_file_json(

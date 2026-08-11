@@ -357,8 +357,9 @@ impl Repo {
     /// -- callers typically need at least one of these independently
     /// afterward (e.g. `LazyTreeStore::new`, `apply_diff`, a direct
     /// `codec::store_read` against the same remote, or `commands::cat`'s
-    /// `print_pack_object`/`resolve_prefix_on_remote`, which take the raw
-    /// store directly rather than going through the `PackReader` wrapper).
+    /// `print_pack_object`, which still needs the raw store for
+    /// `storage_key_of` and to decrypt bytes the `PackReader` already
+    /// resolved -- see `PackReader::resolve_diagnostic`).
     ///
     /// When `io_record` is `Some`, the remote is wrapped in a `StatsStore` so
     /// every GET/HEAD/byte through the `ObjectStore` trait is counted onto
