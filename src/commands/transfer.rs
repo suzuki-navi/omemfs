@@ -53,6 +53,11 @@ use crate::object::{Hash, Tree};
 /// arguments already are).
 pub type NodeFn<'a> = dyn Fn(&Hash) -> Result<Option<Vec<u8>>, Error> + Sync + 'a;
 
+/// Walk a graph in parallel when the caller determines the child hashes. This
+/// is used by read-side planners that must traverse trees without treating all
+/// entries as fetchable content (for example, threshold-stubbed blobs).
+pub type ChildNodeFn<'a> = dyn Fn(&Hash) -> Result<Vec<Hash>, Error> + Sync + 'a;
+
 /// Resolve the worker count for a transfer to/from `store`.
 ///
 /// Order of precedence: the `OMEMFS_TRANSFER_CONCURRENCY` environment variable
@@ -239,6 +244,45 @@ pub fn parallel_bfs(roots: &[Hash], workers: usize, node_fn: &NodeFn<'_>) -> Res
     }
 }
 
+/// Parallel graph walk with caller-defined child discovery.
+pub fn parallel_walk(
+    roots: &[Hash],
+    workers: usize,
+    node_fn: &ChildNodeFn<'_>,
+) -> Result<(), Error> {
+    if roots.is_empty() {
+        return Ok(());
+    }
+    if workers < 2 {
+        let mut queue: VecDeque<Hash> = roots.iter().cloned().collect();
+        let mut visited = HashSet::new();
+        while let Some(hash) = queue.pop_front() {
+            if !visited.insert(hash.clone()) {
+                continue;
+            }
+            queue.extend(node_fn(&hash)?);
+        }
+        return Ok(());
+    }
+    let shared = Shared {
+        queue: Mutex::new(roots.iter().cloned().collect::<VecDeque<Hash>>()),
+        visited: Mutex::new(HashSet::new()),
+        cv: Condvar::new(),
+        outstanding: AtomicUsize::new(roots.len()),
+        failed: AtomicBool::new(false),
+        error: Mutex::new(None),
+    };
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| child_worker_loop(&shared, node_fn));
+        }
+    });
+    match shared.error.into_inner().unwrap() {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
 /// One worker: pull a hash, process it, enqueue children, repeat until the run
 /// is finished or an error is recorded.
 fn worker_loop(shared: &Shared, node_fn: &NodeFn<'_>) {
@@ -294,6 +338,50 @@ fn worker_loop(shared: &Shared, node_fn: &NodeFn<'_>) {
                 shared.record_error(e);
                 // This item is done (failed); keep the counter consistent.
                 decrement_outstanding(shared);
+                return;
+            }
+        }
+    }
+}
+
+fn child_worker_loop(shared: &Shared, node_fn: &ChildNodeFn<'_>) {
+    loop {
+        let hash = {
+            let mut queue = shared.queue.lock().unwrap();
+            loop {
+                if shared.failed.load(Ordering::SeqCst) {
+                    return;
+                }
+                if let Some(h) = queue.pop_front() {
+                    break h;
+                }
+                if shared.outstanding.load(Ordering::SeqCst) == 0 {
+                    return;
+                }
+                queue = shared.cv.wait(queue).unwrap();
+            }
+        };
+        let claimed = shared.visited.lock().unwrap().insert(hash.clone());
+        if !claimed {
+            if shared.outstanding.fetch_sub(1, Ordering::SeqCst) == 1 {
+                shared.cv.notify_all();
+            }
+            continue;
+        }
+        match node_fn(&hash) {
+            Ok(children) => {
+                let count = children.len();
+                if count > 0 {
+                    shared.outstanding.fetch_add(count, Ordering::SeqCst);
+                    shared.queue.lock().unwrap().extend(children);
+                    shared.cv.notify_all();
+                }
+                if shared.outstanding.fetch_sub(1, Ordering::SeqCst) == 1 {
+                    shared.cv.notify_all();
+                }
+            }
+            Err(e) => {
+                shared.record_error(e);
                 return;
             }
         }
@@ -550,7 +638,10 @@ mod tests {
         let mut objects = std::collections::HashMap::new();
         objects.insert(a.as_str().to_string(), a_tree);
         objects.insert(b.as_str().to_string(), b_tree);
-        objects.insert(shared.as_str().to_string(), b"shared-leaf-multi-root".to_vec());
+        objects.insert(
+            shared.as_str().to_string(),
+            b"shared-leaf-multi-root".to_vec(),
+        );
         let store = GraphStore {
             objects,
             written: Mutex::new(HashSet::new()),

@@ -243,6 +243,23 @@ The object-graph transfer loops (`push`'s upload-of-missing and the shared `tran
 
 `parallel_bfs` walks the object graph reachable from a **set** of root hashes, not just one: the shared work queue is seeded with all roots up front and the initial outstanding-work count is `roots.len()`. Everything else — the shared `visited` set for dedup, the outstanding-count termination signal, first-error-wins — is unchanged and already handles roots that share subtrees correctly (a hash claimed via one root is not re-walked via another). `transfer_objects_many` in `src/commands/push.rs` exposes this as a multi-root counterpart to `transfer_objects`, taking a slice of root hashes instead of one.
 
+Read-side commands use an explicit **Plan → Fetch → Apply** split. Planning
+consults only the bare local cache: a hash that is resolvable through a
+read-through remote store is still missing locally and must remain a fetch
+root. Fetch transfers the de-duplicated roots from the snapshot reader into
+that bare local cache in one graph walk. Apply then materialises working-tree
+paths from the local cache, with a read-through fallback only for entries whose
+stub-visibility decision could not safely be made during planning. This keeps
+"cached locally" distinct from "readable remotely" and prevents remote
+membership checks from accidentally emptying a fetch batch.
+
+`pull` plans materialised blobs and eligible added trees as roots. A tree root
+lets the transfer walker discover its child trees, manifests, and chunks.
+`expand` uses a parallel tree-only planner: sibling tree objects are fetched
+and decoded concurrently, while the planner adds only blobs below the configured
+stub threshold to the subsequent multi-root fetch. Entries whose Git visibility
+is only knowable while applying remain on the existing on-demand fallback path.
+
 This matters because per-root granularity, not just per-object granularity, determines how much parallelism is actually available to exploit. A BFS seeded with a single root has no parallel work until that root's own children are discovered — for a root that is itself one leaf blob (any file below the CDC `min_size` threshold of 1 MiB — see "Object routing (write path)" above), the BFS is a walk of exactly one node, so `workers` threads have nothing to divide between them regardless of how high `OMEMFS_TRANSFER_CONCURRENCY` is set. `expand` and `pull` were calling `transfer_objects` once per blob in a sequential loop across sibling files, so a tree of many small files paid for a full worker pool that never had more than one node of real work in flight at a time — the *outer* loop across files, not the *inner* per-object BFS, was the actual bottleneck, and the outer loop had no concurrency at all. Seeding one `transfer_objects_many` call with every blob hash that needs fetching turns that outer loop into work the shared queue can distribute across all `workers` threads from the start, so the existing cloud-backend concurrency default (`8`) is finally exploited across files, not just within one file's chunk graph.
 
 #### Two independent knobs: concurrency and memory
@@ -253,6 +270,11 @@ The two knobs are therefore separated:
 
 - **`OMEMFS_TRANSFER_CONCURRENCY`** — the worker count (request parallelism). Default `1` local, `8` cloud. Tuned for latency hiding.
 - **`OMEMFS_TRANSFER_MEMORY_BUDGET`** — a ceiling, in bytes, on the total size of transfer buffers held resident across all workers at once. Default **64 MiB** (`0`/unset → the default; an explicit value overrides). Tuned for memory safety, independent of the worker count.
+
+The memory-budget size hint is advisory and must never cause a network metadata
+request. A pack or inline entry supplies its stored size from the already-loaded
+index. An entry without a local size hint reserves a conservative bounded
+amount; it does not issue a remote `HEAD` merely to improve scheduling.
 
 The memory budget is a counting semaphore over bytes (a `Mutex<u64>` of remaining budget + a `Condvar`), held in `src/commands/transfer.rs` and shared by all workers of one transfer run. Before a worker reads/buffers an object it acquires `min(size_hint, budget_capacity)` bytes from the semaphore, blocking until that many are free; it releases them (RAII guard) once the object's bytes are no longer resident (after the PUT completes, or after the local write on a download). Acquiring `min(size_hint, capacity)` rather than `size_hint` guarantees forward progress even for a single object larger than the whole budget — that object runs alone rather than deadlocking. With the budget in place, peak transfer-buffer memory is bounded by `budget + (one in-flight oversized object per worker that was admitted under the clamp)`, regardless of the worker count, so raising concurrency for latency no longer raises the memory ceiling.
 
@@ -544,7 +566,66 @@ stream into the logical hasher and `StreamCDC`; after EOF the final logical hash
 addresses the manifest. The manifest is written last, after the handle metadata
 stability check. Tree objects are small enough to fit in memory.
 
-### Read path
+### Snapshot read path
+
+A `PackReader` is a **snapshot reader**. Its first index-root access reads and
+decrypts the index root exactly once; that decoded immutable root defines the
+reader's view for its lifetime. It retains the root, parsed delta and hot
+indexes, loaded cold shards, and Bloom filter in memory. A command that needs a
+newer remote state constructs a new reader; an existing reader is never
+refreshed implicitly.
+
+Normal `pull`, `expand`, clone materialisation, and lazy-tree reads use
+**SnapshotOnly** lookup semantics. They resolve an object only through this
+snapshot's delta/hot/cold indexes and do not issue a per-object remote `HEAD`
+for a standalone fallback. A successful push uploads every referenced object
+and publishes its index entry before the index-root CAS, so all objects
+reachable from the snapshot remote root are resolvable from that snapshot. An
+unindexed standalone object is an orphan from an interrupted or obsolete write
+and is outside normal command semantics.
+
+An explicit diagnostic/raw-hash operation may opt into **LiveFallback** lookup.
+Only that mode may probe the remote standalone key after a SnapshotOnly miss,
+and it must identify such a result as outside the snapshot. This preserves
+repair and diagnosis without adding an S3 round trip to every normal graph
+lookup.
+
+```
+load(target_hash):
+  1. Check local objects/ cache — return immediately on hit.
+  2. locate_snapshot(target_hash) — described below.
+  3. Resolve the classification to bytes per "On index hit" below.
+
+locate_snapshot(target_hash):
+  1. Use the index root retained at reader construction.
+  2. Search in-memory delta indexes newest-first, then the hot index.
+     → found: Entry.
+  3. If the snapshot Bloom filter definitely excludes target_hash: NotFound.
+  4. Compute the covering cold shard. Load it from memory, objcache/, or a
+     single-flight remote GET, then binary-search it.
+     → found: Entry.
+     → not found: NotFound.
+
+On index hit:
+  inline entry     → return data bytes directly (already encrypted; caller decrypts).
+  pack entry       → obtain the pack through pack_hash single-flight, then slice locally.
+  standalone entry → fetch objects/<storage_key> directly from remote.
+```
+
+The pack cache is also single-flight per `pack_hash`: the first caller fetches
+and atomically installs `.omemfs/packcache/<pack_hash>` while concurrent callers
+wait, then all serve their slices from that one file. Slice reads seek directly
+to the indexed offset; they must not read-and-discard preceding bytes. A failed
+fetch wakes waiters with the same error and leaves no completed cache entry.
+
+All normal read-side classifications are derived from one published index root.
+This eliminates the per-object `HEAD` round trip and makes concurrent planning
+deterministic. A Bloom definite miss can skip cold-shard loading because the
+filter and cold shards share one snapshot. A false positive only costs an index
+lookup; it never changes classification. Remote changes after reader
+construction are intentionally invisible until a new reader is opened.
+
+### Legacy read path (superseded)
 
 ```
 stored bytes (after decompress) → inspect first 2 bytes:
@@ -1019,13 +1100,17 @@ Unreferenced objects (left by consolidation, cold-shard splitting, and Bloom-fil
 Index files (delta, hot, cold shards) are content-addressed and immutable: a
 given hash always maps to exactly the same plaintext bytes. Both `PackReader`
 (pull / expand) and `PackWriter` (push) therefore cache every index file they
-load in the local objects cache (`.omemfs/objects/`) as plaintext. The cache
-check happens before the remote fetch; on a cache hit the object is
-deserialized directly from local disk.
+load in `.omemfs/objcache/` as plaintext. The cache check happens before the
+remote fetch; on a cache hit the object is deserialized directly from local
+disk.
 
 **`PackReader::load_index_file`** — used on the read path: check local cache
 first; on miss, fetch from remote → decrypt → write plaintext to local cache →
-deserialize.
+deserialize. Within one reader snapshot it also retains the parsed index in
+memory. Concurrent first loads of the same index hash are single-flight: one
+caller performs the fetch/decode and all other callers wait for, then reuse,
+that result. This prevents duplicate GETs or repeated deserialization when a
+parallel planner reaches the same immutable index file.
 
 **`PackWriter::load_index_file`** — used during the push dedup check
 (`exists()` → `index_contains()`): identical local-first + cache-on-miss

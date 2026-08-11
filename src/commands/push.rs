@@ -839,12 +839,12 @@ pub fn transfer_objects_many(
             let _permit = budget.acquire(hint);
             return Ok(codec::store_read(dst, hash, None).ok());
         }
-        // Reserve budget for the object buffer before reading it; the guard
-        // releases after the write completes. The hint is the source-side
-        // stored size (a cheap stat). Unknown size reserves nothing — no
-        // deadlock.
-        let hint = src.size(hash).unwrap_or(0);
-        let _permit = budget.acquire(hint);
+        // Do not issue a source-side stat merely to obtain a scheduling hint.
+        // For PackReader a logical packed hash has no loose remote object, so
+        // that stat is an S3 HEAD which always 404s. An unknown size has always
+        // been permitted by ByteBudget; preserve that bounded-object behaviour
+        // without adding a network round trip to every download.
+        let _permit = budget.acquire(0);
         let serialised = codec::store_read(src, hash, src_key)?;
         codec::store_write(dst, hash, &serialised, None)?;
         Ok(Some(serialised))
@@ -1345,8 +1345,14 @@ mod tests {
         let dst_dir = TempDir::new().unwrap();
         let dst = LocalStore::for_cache(dst_dir.path());
 
-        transfer_objects_many(&remote, &dst, &[a_hash.clone(), b_hash.clone()], None, false)
-            .unwrap();
+        transfer_objects_many(
+            &remote,
+            &dst,
+            &[a_hash.clone(), b_hash.clone()],
+            None,
+            false,
+        )
+        .unwrap();
 
         assert!(dst.exists(&a_hash).unwrap());
         assert!(dst.exists(&b_hash).unwrap());
@@ -1384,7 +1390,11 @@ mod tests {
         transfer_objects_many(
             &remote,
             &dst,
-            &[shared_hash.clone(), shared_hash.clone(), shared_hash.clone()],
+            &[
+                shared_hash.clone(),
+                shared_hash.clone(),
+                shared_hash.clone(),
+            ],
             None,
             false,
         )

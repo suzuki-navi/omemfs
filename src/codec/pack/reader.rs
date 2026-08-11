@@ -30,7 +30,9 @@
 ///
 /// After fetching from remote, the encrypted bytes are stored in the local
 /// objects/ cache (decrypt happens at the codec layer, not here).
+use std::collections::HashMap;
 use std::io::{self, Cursor, Read};
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::codec::encrypt::EncryptKey;
 use crate::codec::pack::bloom::BloomFilter;
@@ -64,11 +66,7 @@ enum Located {
     /// `resolve_entry` to fetch the actual bytes (inline data is already in
     /// hand; pack/standalone entries need a further fetch).
     Entry(IndexEntry),
-    /// No index entry, but a direct remote HEAD/stat confirmed a standalone
-    /// object at `objects/<hash>`.
-    Standalone,
-    /// An INDEX_ROOT exists but `hash` is not referenced anywhere in it, and
-    /// no standalone object was found either.
+    /// An INDEX_ROOT exists but `hash` is not referenced anywhere in it.
     NotFound,
     /// The remote has no INDEX_ROOT at all (never pushed, or push-in-progress).
     NoIndexRoot,
@@ -93,6 +91,27 @@ pub struct PackReader {
     /// so a cloud backend can be slotted in without filesystem assumptions.
     root_pointer: Box<dyn RootPointer>,
     remote_key: Option<EncryptKey>,
+    /// The published index-root snapshot retained for this reader's lifetime.
+    /// `None` means it has not been loaded yet; the condition variable makes
+    /// the first load single-flight when transfer workers start concurrently.
+    index_root: Mutex<SnapshotState>,
+    index_root_ready: Condvar,
+    /// Parsed immutable indexes avoid an objcache disk read and deserialisation
+    /// on every object lookup. The mutex intentionally serialises first loads;
+    /// subsequent lookups only clone an Arc.
+    indexes: Mutex<HashMap<Hash, Arc<IndexFile>>>,
+    index_load: Mutex<()>,
+    bloom: Mutex<HashMap<Hash, Arc<BloomFilter>>>,
+    bloom_load: Mutex<()>,
+    /// Serialises cache-miss pack installation so concurrent slices of one pack
+    /// cannot download the same body repeatedly.
+    pack_fetch: Mutex<()>,
+}
+
+enum SnapshotState {
+    Empty,
+    Loading,
+    Ready(Option<IndexRoot>),
 }
 
 impl PackReader {
@@ -111,6 +130,13 @@ impl PackReader {
             objcache,
             root_pointer,
             remote_key,
+            index_root: Mutex::new(SnapshotState::Empty),
+            index_root_ready: Condvar::new(),
+            indexes: Mutex::new(HashMap::new()),
+            index_load: Mutex::new(()),
+            bloom: Mutex::new(HashMap::new()),
+            bloom_load: Mutex::new(()),
+            pack_fetch: Mutex::new(()),
         }
     }
 
@@ -133,16 +159,43 @@ impl PackReader {
     }
 
     pub fn read_index_root(&self) -> Result<Option<IndexRoot>, Error> {
+        let mut state = self.index_root.lock().unwrap();
+        loop {
+            match &*state {
+                SnapshotState::Ready(root) => return Ok(root.clone()),
+                SnapshotState::Loading => state = self.index_root_ready.wait(state).unwrap(),
+                SnapshotState::Empty => {
+                    *state = SnapshotState::Loading;
+                    break;
+                }
+            }
+        }
+        drop(state);
         // Route the index-root read through the same backend-pluggable root
         // pointer abstraction used by push (PackWriter) and pack, so all
         // index-root reads resolve the storage path identically.
         // This is a plain read (no CAS), so the version token is discarded.
-        let raw = match self.root_pointer.read()?.0 {
-            Some(b) => b,
-            None => return Ok(None),
-        };
-        let plaintext = self.decrypt_index_root(&raw)?;
-        Ok(Some(IndexRoot::deserialise(&plaintext)?))
+        let loaded = (|| {
+            let raw = match self.root_pointer.read()?.0 {
+                Some(b) => b,
+                None => return Ok(None),
+            };
+            let plaintext = self.decrypt_index_root(&raw)?;
+            Ok(Some(IndexRoot::deserialise(&plaintext)?))
+        })();
+        let mut state = self.index_root.lock().unwrap();
+        match loaded {
+            Ok(root) => {
+                *state = SnapshotState::Ready(root.clone());
+                self.index_root_ready.notify_all();
+                Ok(root)
+            }
+            Err(err) => {
+                *state = SnapshotState::Empty;
+                self.index_root_ready.notify_all();
+                Err(err)
+            }
+        }
     }
 
     /// Resolve a hex `prefix` (4..=64 chars) to the full hashes of all stored
@@ -198,12 +251,21 @@ impl PackReader {
     // -----------------------------------------------------------------------
 
     fn load_index_file(&self, hash: &Hash) -> Result<IndexFile, Error> {
-        crate::codec::pack::load_index_file(
+        if let Some(index) = self.indexes.lock().unwrap().get(hash).cloned() {
+            return Ok((*index).clone());
+        }
+        let _loading = self.index_load.lock().unwrap();
+        if let Some(index) = self.indexes.lock().unwrap().get(hash).cloned() {
+            return Ok((*index).clone());
+        }
+        let index = crate::codec::pack::load_index_file(
             self.remote.as_ref(),
             &self.objcache,
             self.remote_key.as_ref(),
             hash,
-        )
+        )?;
+        let mut cache = self.indexes.lock().unwrap();
+        Ok((**cache.entry(hash.clone()).or_insert_with(|| Arc::new(index))).clone())
     }
 
     // -----------------------------------------------------------------------
@@ -220,8 +282,13 @@ impl PackReader {
         // Pack files hold per-object-encrypted bytes; cache them raw (no decryption).
         // The packcache directory is created lazily by ObjectsDir::write_stream.
         if !self.packcache.exists(pack_hash)? {
-            let mut r = self.remote.open_read(pack_hash)?;
-            self.packcache.write_from(pack_hash, &mut r)?;
+            // Recheck under the installation lock. The lock is held only for
+            // the cache miss, not while serving already-cached slices.
+            let _fetch_guard = self.pack_fetch.lock().unwrap();
+            if !self.packcache.exists(pack_hash)? {
+                let mut r = self.remote.open_read(pack_hash)?;
+                self.packcache.write_from(pack_hash, &mut r)?;
+            }
         }
         // Serve the slice from the local cache.
         let mut reader = self.packcache.open_read(pack_hash)?;
@@ -298,32 +365,16 @@ impl PackReader {
             }
         }
 
-        // 5. Try standalone: check if objects/<hash> exists directly in remote
-        // (a HEAD/stat only -- the body is fetched later, only if the caller
-        // actually wants bytes). This probe is UNCONDITIONAL -- it always
-        // runs, regardless of what the Bloom filter below would say -- because
-        // a standalone object can be written to the remote at any time,
-        // including after the last `omemfs pack` run that built the current
-        // Bloom filter snapshot. Only this probe can observe such an object;
-        // see design/02 "Why the Bloom filter is checked before the
-        // cold-shard fetch, but never before the remote probe".
-        if self.remote.exists(hash)? {
-            return Ok(Located::Standalone);
-        }
-
-        // [C] Consult the Bloom filter, if the index root has one recorded,
+        // Consult the Bloom filter, if the index root has one recorded,
         // to decide whether the cold-shard fetch (step 6) below is worth
         // paying for. A "definitely absent" answer is exact (no false
         // negatives are possible by construction) and is safe to substitute
         // for "not present in any cold shard" -- the Bloom filter and the
         // cold shards are built from the same `omemfs pack` snapshot with no
         // staleness gap between them -- so it short-circuits straight to
-        // NotFound, skipping the cold-shard fetch. This does NOT extend to
-        // the remote probe above: that check already ran unconditionally,
-        // which is exactly why this check is positioned after it rather than
-        // before. "Maybe present", no Bloom filter recorded at all, or the
-        // shard already searched by step [A] above, falls through to step 6
-        // exactly as before this change.
+        // NotFound, skipping the cold-shard fetch. Snapshot readers never
+        // probe unindexed standalone keys: a published snapshot records every
+        // object reachable from its root, including standalone entries.
         if !shard_already_searched {
             if let Some(bloom_hash) = index_root.bloom_hash_opt() {
                 let bloom = self.load_bloom_filter(&bloom_hash)?;
@@ -361,13 +412,22 @@ impl PackReader {
     /// (`codec::pack::load_cached_plaintext`) so the decrypt logic is not
     /// duplicated between index files and the Bloom filter.
     fn load_bloom_filter(&self, hash: &Hash) -> Result<BloomFilter, Error> {
+        if let Some(bloom) = self.bloom.lock().unwrap().get(hash).cloned() {
+            return Ok((*bloom).clone());
+        }
+        let _loading = self.bloom_load.lock().unwrap();
+        if let Some(bloom) = self.bloom.lock().unwrap().get(hash).cloned() {
+            return Ok((*bloom).clone());
+        }
         let plaintext = crate::codec::pack::load_cached_plaintext(
             self.remote.as_ref(),
             &self.objcache,
             self.remote_key.as_ref(),
             hash,
         )?;
-        BloomFilter::deserialise(&plaintext)
+        let bloom = BloomFilter::deserialise(&plaintext)?;
+        let mut cache = self.bloom.lock().unwrap();
+        Ok((**cache.entry(hash.clone()).or_insert_with(|| Arc::new(bloom))).clone())
     }
 
     /// Resolve `hash` to its encrypted bytes, searching the pack index.
@@ -375,15 +435,6 @@ impl PackReader {
     fn resolve(&self, hash: &Hash) -> Result<Vec<u8>, Error> {
         match self.locate(hash)? {
             Located::Entry(entry) => self.resolve_entry(&entry, hash),
-            Located::Standalone => {
-                // Standalone objects may carry the ED E0 escape prefix; strip
-                // it here so this path is consistent with resolve_entry /
-                // fetch_from_remote_direct.
-                let mut r = self.remote.open_read(hash)?;
-                let mut buf = Vec::new();
-                r.read_to_end(&mut buf).map_err(Error::Io)?;
-                Ok(unescape_standalone(buf))
-            }
             Located::NotFound => Err(Error::ObjectNotFound(hash.as_str().to_string())),
             // No INDEX_ROOT — fall through to direct remote lookup.
             Located::NoIndexRoot => self.fetch_from_remote_direct(hash),
@@ -479,10 +530,6 @@ impl ObjectStore for PackReader {
         if self.local_cache.exists(hash)? {
             return Ok(true);
         }
-        // Cheap fast path: a standalone object needs no index lookup at all.
-        if self.remote.exists(hash)? {
-            return Ok(true);
-        }
         // Index-only lookup (delta/hot/cold entries only -- no pack slice or
         // object body is fetched) rather than the old "just try resolve",
         // which downloaded the full object (or a whole pack file, for a
@@ -539,7 +586,7 @@ impl ObjectStore for PackReader {
 mod tests {
     use super::*;
 
-    use crate::codec::pack::root_pointer::LocalRootPointer;
+    use crate::codec::pack::root_pointer::{LocalRootPointer, RootToken};
     use crate::codec::pack::writer::PackWriter;
     use tempfile::TempDir;
 
@@ -654,22 +701,10 @@ mod tests {
     }
 
     #[test]
-    fn read_standalone_step5_unescapes() {
-        // Step 5 of resolve() reads a standalone object found directly in
-        // objects/ that has no matching index entry. If the stored bytes carry
-        // the ED E0 escape prefix, step 5 must strip it just like resolve_entry
-        // and fetch_from_remote_direct do, otherwise the returned bytes are
-        // corrupted by the leading ED E0.
-        //
-        // This test also doubles as the regression guard for the Improvement C
-        // ordering bug: `hash` here is never pushed through PackWriter, so it is
-        // never inserted into the push-generated Bloom filter, yet it IS present
-        // on the remote as a standalone object. Before the fix, the Bloom check
-        // ran BEFORE this probe and short-circuited straight to NotFound on its
-        // "definitely absent" (but stale) answer. See
-        // `definite_absence_short_circuits_via_bloom_filter` and design/02
-        // "Why the Bloom filter is checked before the cold-shard fetch, but
-        // never before the remote probe".
+    fn snapshot_reader_rejects_unindexed_standalone() {
+        // A raw standalone object with no entry in the published index is an
+        // orphan, not part of this reader's snapshot. SnapshotOnly lookup must
+        // reject it rather than paying a remote HEAD for every normal miss.
         use crate::codec::pack::writer::{PackWriter, STANDALONE_ESCAPE_MAGIC};
 
         let tmp = TempDir::new().unwrap();
@@ -727,8 +762,7 @@ mod tests {
             Box::new(LocalRootPointer::new(base.clone(), None)),
             None,
         );
-        let got = reader.resolve(&hash).unwrap();
-        assert_eq!(got, data, "step 5 standalone read must strip ED E0 escape");
+        assert!(reader.resolve(&hash).is_err());
     }
 
     #[test]
@@ -1018,7 +1052,11 @@ mod tests {
     fn make_reader_with_stats(
         base: &std::path::Path,
         tmp: &TempDir,
-    ) -> (PackReader, std::sync::Arc<crate::store::stats::IoRecord>, std::path::PathBuf) {
+    ) -> (
+        PackReader,
+        std::sync::Arc<crate::store::stats::IoRecord>,
+        std::path::PathBuf,
+    ) {
         use crate::store::stats::{IoRecord, StatsStore};
         use std::sync::Arc;
 
@@ -1042,6 +1080,86 @@ mod tests {
             None,
         );
         (reader, record, objcache_dir)
+    }
+
+    struct CountingRootPointer {
+        inner: LocalRootPointer,
+        reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl CountingRootPointer {
+        fn new(base: std::path::PathBuf) -> (Self, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+            let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (
+                CountingRootPointer {
+                    inner: LocalRootPointer::new(base, None),
+                    reads: std::sync::Arc::clone(&reads),
+                },
+                reads,
+            )
+        }
+    }
+
+    impl RootPointer for CountingRootPointer {
+        fn read(&self) -> Result<(Option<Vec<u8>>, RootToken), Error> {
+            self.reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.read()
+        }
+
+        fn cas_write(&self, expected: &RootToken, new: &[u8]) -> Result<(), Error> {
+            self.inner.cas_write(expected, new)
+        }
+    }
+
+    #[test]
+    fn reader_reads_index_root_once_per_snapshot() {
+        use crate::codec::pack::index::InlineEntry;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let tmp = TempDir::new().unwrap();
+        let base = make_remote_base(&tmp);
+        let remote = LocalStore::for_remote(&base);
+        let first = Hash::compute(b"snapshot-first");
+        let second = Hash::compute(b"snapshot-second");
+        let index_hash = write_raw_index(
+            &remote,
+            vec![
+                IndexEntry::Inline(InlineEntry {
+                    hash: first.clone(),
+                    data: b"snapshot-first".to_vec(),
+                }),
+                IndexEntry::Inline(InlineEntry {
+                    hash: second.clone(),
+                    data: b"snapshot-second".to_vec(),
+                }),
+            ],
+        );
+        let mut root = IndexRoot::new_empty();
+        root.delta_hashes = vec![*index_hash.as_bytes_array()];
+        write_raw_index_root(&base, &root);
+        let (pointer, reads) = CountingRootPointer::new(base.clone());
+        let cache = tmp.path().join("snapshot-cache");
+        let packcache = tmp.path().join("snapshot-packcache");
+        let objcache = tmp.path().join("snapshot-objcache");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::create_dir_all(&packcache).unwrap();
+        std::fs::create_dir_all(&objcache).unwrap();
+        let reader = PackReader::new(
+            Box::new(LocalStore::for_remote(&base)),
+            LocalStore::for_cache(&cache),
+            LocalStore::for_cache(&packcache),
+            LocalStore::for_cache(&objcache),
+            Box::new(pointer),
+            None,
+        );
+        let _ = read_all(reader.open_read(&first).unwrap());
+        let _ = read_all(reader.open_read(&second).unwrap());
+        assert_eq!(
+            reads.load(Relaxed),
+            1,
+            "one reader must fetch INDEX_ROOT once"
+        );
     }
 
     /// Read a `Box<dyn Read>` to completion (test helper).
@@ -1094,21 +1212,28 @@ mod tests {
 
         let (reader, record, _objcache_dir) = make_reader_with_stats(&base, &tmp);
 
-        // First resolution: the shard is not yet cached, so this legitimately
-        // costs one remote exists() probe (today's documented cold-start
-        // cost) plus one fetch of the shard itself.
+        // First resolution fetches the shard but SnapshotOnly lookup never
+        // probes a loose standalone key.
         let got1 = read_all(reader.open_read(&hash1).unwrap());
-        assert_eq!(got1, data1, "first object's bytes must round-trip correctly");
-        let exists_after_first = record.exists_found.load(Relaxed) + record.exists_miss.load(Relaxed);
         assert_eq!(
-            exists_after_first, 1,
-            "first (cold-start) lookup must cost exactly one exists() probe"
+            got1, data1,
+            "first object's bytes must round-trip correctly"
+        );
+        let exists_after_first =
+            record.exists_found.load(Relaxed) + record.exists_miss.load(Relaxed);
+        assert_eq!(
+            exists_after_first, 0,
+            "SnapshotOnly lookup must not issue an exists() probe"
         );
 
         // Second resolution: a DIFFERENT hash from the SAME now-cached shard.
         let got2 = read_all(reader.open_read(&hash2).unwrap());
-        assert_eq!(got2, data2, "second object's bytes must round-trip correctly");
-        let exists_after_second = record.exists_found.load(Relaxed) + record.exists_miss.load(Relaxed);
+        assert_eq!(
+            got2, data2,
+            "second object's bytes must round-trip correctly"
+        );
+        let exists_after_second =
+            record.exists_found.load(Relaxed) + record.exists_miss.load(Relaxed);
         assert_eq!(
             exists_after_second, exists_after_first,
             "resolving a second hash from an already-cached cold shard must not \
@@ -1123,7 +1248,7 @@ mod tests {
     /// remote probe when already cached"). This must hold both before and
     /// after Improvement A is implemented.
     #[test]
-    fn cold_shard_first_lookup_cost_is_unchanged() {
+    fn cold_shard_first_lookup_avoids_standalone_probe() {
         use crate::codec::pack::index::InlineEntry;
         use std::sync::atomic::Ordering::Relaxed;
 
@@ -1159,9 +1284,8 @@ mod tests {
 
         let exists_calls = record.exists_found.load(Relaxed) + record.exists_miss.load(Relaxed);
         assert_eq!(
-            exists_calls, 1,
-            "first (cold-start) lookup of an uncached shard must cost exactly \
-             one exists() probe"
+            exists_calls, 0,
+            "snapshot lookup must not issue a standalone exists() probe"
         );
         assert!(
             LocalStore::for_cache(&objcache_dir)
@@ -1224,15 +1348,15 @@ mod tests {
         let (reader, record, objcache_dir) = make_reader_with_stats(&base, &tmp);
 
         let result = reader.open_read(&absent_hash);
-        assert!(result.is_err(), "a genuinely absent hash must resolve to an error");
+        assert!(
+            result.is_err(),
+            "a genuinely absent hash must resolve to an error"
+        );
 
         let exists_calls = record.exists_found.load(Relaxed) + record.exists_miss.load(Relaxed);
         assert_eq!(
-            exists_calls, 1,
-            "a Bloom-filter-confirmed absent hash must still cost exactly one \
-             remote exists() probe (step 5 is unconditional -- only a \
-             standalone object written after the Bloom filter's snapshot can \
-             be found there, and only the probe can observe it)"
+            exists_calls, 0,
+            "a SnapshotOnly Bloom miss must not probe a standalone key"
         );
         assert!(
             !LocalStore::for_cache(&objcache_dir)
@@ -1283,8 +1407,8 @@ mod tests {
 
         let exists_calls = record.exists_found.load(Relaxed) + record.exists_miss.load(Relaxed);
         assert_eq!(
-            exists_calls, 1,
-            "with no Bloom filter recorded, the remote exists() probe must still run"
+            exists_calls, 0,
+            "SnapshotOnly lookup must not probe a standalone key"
         );
         assert!(
             LocalStore::for_cache(&objcache_dir)
@@ -1317,8 +1441,6 @@ mod tests {
         let hot_hash_val = Hash::compute(&hot_data);
         let cold_data = vec![0xE3u8; 10];
         let cold_hash = Hash::compute(&cold_data);
-        let standalone_data = vec![0xE4u8; 10];
-        let standalone_hash = Hash::compute(&standalone_data);
         let notfound_hash = Hash::compute(b"nowhere-to-be-found");
 
         let delta_index_hash = write_raw_index(
@@ -1342,20 +1464,9 @@ mod tests {
                 data: cold_data.clone(),
             })],
         );
-        // Standalone: written directly to objects/, with NO index entry at all
-        // -- found only via the direct remote presence check (locate step 5).
-        remote_for_setup
-            .write_from(&standalone_hash, &mut io::Cursor::new(&standalone_data))
-            .unwrap();
-
         let bloom_hash = write_raw_bloom(
             &remote_for_setup,
-            &[
-                delta_hash.clone(),
-                hot_hash_val.clone(),
-                cold_hash.clone(),
-                standalone_hash.clone(),
-            ],
+            &[delta_hash.clone(), hot_hash_val.clone(), cold_hash.clone()],
         );
 
         let mut root = IndexRoot::new_empty();
@@ -1371,25 +1482,28 @@ mod tests {
         let d1 = read_all(reader.open_read(&delta_hash).unwrap());
         let d2 = read_all(reader.open_read(&delta_hash).unwrap());
         assert_eq!(d1, delta_data);
-        assert_eq!(d1, d2, "delta-index classification must be identical cold and warm");
+        assert_eq!(
+            d1, d2,
+            "delta-index classification must be identical cold and warm"
+        );
 
         // Entry via hot.
         let h1 = read_all(reader.open_read(&hot_hash_val).unwrap());
         let h2 = read_all(reader.open_read(&hot_hash_val).unwrap());
         assert_eq!(h1, hot_data);
-        assert_eq!(h1, h2, "hot-index classification must be identical cold and warm");
+        assert_eq!(
+            h1, h2,
+            "hot-index classification must be identical cold and warm"
+        );
 
         // Entry via cold shard.
         let c1 = read_all(reader.open_read(&cold_hash).unwrap());
         let c2 = read_all(reader.open_read(&cold_hash).unwrap());
         assert_eq!(c1, cold_data);
-        assert_eq!(c1, c2, "cold-shard classification must be identical cold and warm");
-
-        // Standalone.
-        let s1 = read_all(reader.open_read(&standalone_hash).unwrap());
-        let s2 = read_all(reader.open_read(&standalone_hash).unwrap());
-        assert_eq!(s1, standalone_data);
-        assert_eq!(s1, s2, "standalone classification must be identical cold and warm");
+        assert_eq!(
+            c1, c2,
+            "cold-shard classification must be identical cold and warm"
+        );
 
         // NotFound.
         assert!(

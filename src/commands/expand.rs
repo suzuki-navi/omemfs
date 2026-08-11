@@ -1,6 +1,7 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use filetime::FileTime;
 
@@ -302,29 +303,38 @@ fn collect_tree_fetches(
     stub_threshold: u64,
     out: &mut Vec<crate::object::Hash>,
 ) -> Result<(), Error> {
-    let data = codec::ensure_local_then_read(remote, local, tree_hash, remote_key)?;
-    let Tree::Normal { entries } = Tree::deserialise(&data)?;
-
-    for entry in &entries {
-        match entry {
-            TreeEntry::Blob { hash, size, .. } => {
-                if stub_threshold > 0 && *size >= stub_threshold {
-                    continue;
+    // Tree discovery used to be a recursive DFS, so one remote tree lookup
+    // had to finish before even a sibling tree could start. Walk tree nodes
+    // through the shared worker engine instead; blobs are collected as roots
+    // for the following content transfer, not traversed here.
+    let pending = Mutex::new(HashSet::<crate::object::Hash>::new());
+    let discover = |hash: &crate::object::Hash| -> Result<Vec<crate::object::Hash>, Error> {
+        let data = codec::ensure_local_then_read(remote, local, hash, remote_key)?;
+        let Tree::Normal { entries } = Tree::deserialise(&data)?;
+        let mut child_trees = Vec::new();
+        for entry in entries {
+            match entry {
+                TreeEntry::Blob { hash, size, .. } => {
+                    if (stub_threshold == 0 || size < stub_threshold) && !local.exists(&hash)? {
+                        pending.lock().unwrap().insert(hash);
+                    }
                 }
-                if !local.exists(hash)? {
-                    out.push(hash.clone());
+                TreeEntry::Tree { hash, size, .. } => {
+                    if stub_threshold == 0 || size < stub_threshold {
+                        child_trees.push(hash);
+                    }
                 }
+                TreeEntry::Symlink { .. } => {}
             }
-            TreeEntry::Tree { hash, size, .. } => {
-                if stub_threshold > 0 && *size >= stub_threshold {
-                    continue;
-                }
-                collect_tree_fetches(hash, local, remote, remote_key, stub_threshold, out)?;
-            }
-            // Symlinks carry their target inline — nothing to fetch.
-            TreeEntry::Symlink { .. } => {}
         }
-    }
+        Ok(child_trees)
+    };
+    crate::commands::transfer::parallel_walk(
+        std::slice::from_ref(tree_hash),
+        crate::commands::transfer::resolve_concurrency(remote),
+        &discover,
+    )?;
+    out.extend(pending.into_inner().unwrap());
     Ok(())
 }
 

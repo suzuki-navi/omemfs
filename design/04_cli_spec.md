@@ -54,7 +54,16 @@ Concurrency (request count) and peak transfer memory are separate knobs. The env
 
 Scope: the knob parallelises the two object-store breadth-first transfer loops — `push`'s upload of missing objects and the shared `transfer_objects`/`transfer_objects_many` copy (which also serves `clone`'s per-file content fetch, `cat`'s single-object fetch, and `expand`'s/`pull`'s blob fetches). These are pure content-addressed object copies with no inter-object ordering. The working-tree materialisation phases of `clone` and `pull` (directory creation, stub writing, file writes, depth-ordered cleanup) remain serial because they carry parent-before-child filesystem ordering; their *remote object fetches* still run through the parallel transfer path.
 
-`expand` and `pull` collect every blob hash that needs fetching (across all stubs / diff entries being processed) and issue a **single** `transfer_objects_many` call with all of them as roots, rather than one `transfer_objects` call per blob. Per-blob calls previously defeated this concurrency knob for trees with many small files: a lone blob has no children to discover, so a single-root BFS over it has nothing to divide across workers, and the *outer* loop across sibling files was a plain sequential Rust loop with no parallelism of its own — so raising `OMEMFS_TRANSFER_CONCURRENCY` had no effect on a tree of many sub-chunking-threshold files. Seeding one multi-root call with the whole batch of blobs lets the shared worker pool (default `8` on cloud backends) pull them concurrently instead. `clone` and `cat` still fetch via single-root `transfer_objects` (clone already recurses through directories one blob at a time as it materialises them; batching that call site was out of scope for this change). See `02_storage_format.md`, "Multi-root batching (Improvement B)".
+`expand` and `pull` use a Plan → Fetch → Apply sequence. Planning tests only
+whether an object is in the local cache; it never treats remote readability as
+a local hit. The de-duplicated plan is fetched through one concurrent
+`transfer_objects_many` walk into that cache before working-tree materialisation
+starts. A planned tree root recursively covers its child trees, manifests, and
+chunks. `expand` discovers tree structure with parallel sibling traversal, but
+leaves entries whose Git stub-visibility decision depends on apply-time state
+to the on-demand fallback. This preserves stub-threshold semantics while
+providing concurrency for the common many-small-files case. See
+`02_storage_format.md`, "Multi-root batching (Improvement B)".
 
 ## Commands
 

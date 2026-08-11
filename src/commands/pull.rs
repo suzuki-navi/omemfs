@@ -200,6 +200,7 @@ fn pull_full(
     let changed = apply_diff(
         &clean_diff,
         &repo.work_dir,
+        &local,
         &lazy,
         &repo.work_dir,
         stub_threshold,
@@ -495,6 +496,7 @@ fn pull_scoped(
             total_changed += apply_diff(
                 &pd_clean[i],
                 &scoped_abs,
+                &local,
                 &lazy,
                 &repo.work_dir,
                 stub_threshold,
@@ -844,6 +846,7 @@ fn same_content(a: &DiffEntry, b: &DiffEntry) -> bool {
 fn apply_diff(
     diff: &HashMap<String, DiffEntry>,
     base_dir: &std::path::Path,
+    local: &LocalStore,
     store: &dyn ObjectStore,
     work_dir: &std::path::Path,
     stub_threshold: u64,
@@ -883,7 +886,7 @@ fn apply_diff(
             match change {
                 DiffEntry::Added { hash, size, .. } => {
                     let may_be_stubbed = stub_threshold > 0 && *size >= stub_threshold;
-                    if !may_be_stubbed && !store.exists(hash)? {
+                    if !may_be_stubbed && !local.exists(hash)? {
                         pending.push(hash.clone());
                     }
                 }
@@ -893,17 +896,25 @@ fn apply_diff(
                         .map(|p| p.to_string_lossy().replace('\\', "/"))
                         .unwrap_or_else(|_| rel_path.to_string());
                     let updates_stub_only = stub::exists(work_dir, &work_rel) && !abs_path.exists();
-                    if !updates_stub_only && !store.exists(hash)? {
+                    if !updates_stub_only && !local.exists(hash)? {
                         pending.push(hash.clone());
                     }
                 }
-                DiffEntry::Deleted
-                | DiffEntry::AddedEmptyDir
-                | DiffEntry::AddedTree { .. }
-                | DiffEntry::Symlink { .. } => {}
+                DiffEntry::AddedTree { hash, .. } => {
+                    let dir_stub_path = abs_path.join(stub::DIR_STUB_NAME);
+                    let visible_to_git = abs_path.join(".git").exists()
+                        || stub::stub_would_be_visible_to_git(&dir_stub_path, work_dir);
+                    if visible_to_git && !local.exists(hash)? {
+                        // A materialised directory needs its whole reachable
+                        // graph. Supplying the tree root lets the shared BFS
+                        // fetch child trees, manifests, and chunks in parallel.
+                        pending.push(hash.clone());
+                    }
+                }
+                DiffEntry::Deleted | DiffEntry::AddedEmptyDir | DiffEntry::Symlink { .. } => {}
             }
         }
-        crate::commands::push::transfer_objects_many(remote, store, &pending, remote_key, true)?;
+        crate::commands::push::transfer_objects_many(remote, local, &pending, remote_key, true)?;
     }
 
     // Directories touched by deletions, for dir-stub / empty-parent cleanup.
@@ -2004,9 +2015,17 @@ mod tests {
         let store = LocalStore::for_cache(store_dir.path());
         let work_dir = TempDir::new().unwrap();
 
-        let changed =
-            apply_diff(&diff, work_dir.path(), &store, work_dir.path(), 0, &remote, None)
-                .unwrap();
+        let changed = apply_diff(
+            &diff,
+            work_dir.path(),
+            &store,
+            &store,
+            work_dir.path(),
+            0,
+            &remote,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(changed, files.len());
         for (rel, content) in &files {
@@ -2047,9 +2066,17 @@ mod tests {
         let store = LocalStore::for_cache(store_dir.path());
         let work_dir = TempDir::new().unwrap();
 
-        let changed =
-            apply_diff(&diff, work_dir.path(), &store, work_dir.path(), 0, &remote, None)
-                .unwrap();
+        let changed = apply_diff(
+            &diff,
+            work_dir.path(),
+            &store,
+            &store,
+            work_dir.path(),
+            0,
+            &remote,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(changed, files.len());
         assert!(
