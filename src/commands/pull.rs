@@ -10,7 +10,9 @@ use filetime::FileTime;
 use crate::codec;
 use crate::codec::pack::reader::PackReader;
 use crate::error::Error;
+use crate::filter::FilterSet;
 use crate::io_stats;
+use crate::line_merge::{self, MergeOutcome};
 use crate::object::{Hash, Tree, TreeEntry};
 use crate::repo::Repo;
 use crate::scan::{refresh_stat_cache, scan_and_store_with_cache};
@@ -152,7 +154,7 @@ fn pull_full(
     let local_diff = diff_trees(clone_root.as_ref(), Some(&working_hash), &lazy, 0)?;
 
     // Classify conflicts and build a clean (non-conflicting) diff.
-    let (clean_diff, conflicts) = classify_conflicts(&remote_diff, &local_diff);
+    let (clean_diff, mut conflicts) = classify_conflicts(&remote_diff, &local_diff);
 
     if dry_run {
         let mut out = Output::for_stdout();
@@ -170,6 +172,27 @@ fn pull_full(
         out.finish()?;
         return Ok(());
     }
+
+    // [line_merge] auto-merge pass (design/15_line_history_merge.md, "`pull`
+    // integration point"): resolve (but do not yet write) a merge for
+    // remaining conflicts on paths matching `[line_merge]`, before the
+    // conflict-abort check below. A resolved path is removed from
+    // `conflicts` here, but its bytes are deliberately not written to the
+    // working tree until after the abort check confirms the pull is going
+    // to proceed -- the atomic-abort policy below requires that NOTHING is
+    // applied to the working tree while any conflict (line-merge or not)
+    // remains, and this path's own merge is not exempt from that.
+    let filter_set = FilterSet::load(&repo.work_dir);
+    let resolved_line_merges = resolve_line_merges(
+        &mut conflicts,
+        &remote_diff,
+        &local_diff,
+        &filter_set,
+        &repo.work_dir,
+        clone_root.as_ref(),
+        &lazy,
+        |p| p.to_string(),
+    );
 
     // Atomic-abort policy (design/03, design/04): if ANY conflict is detected,
     // NOTHING is applied to the working tree. Write the conflict helper files,
@@ -208,6 +231,9 @@ fn pull_full(
         &pack_reader,
         remote_key.as_ref(),
     )?;
+    // Every remaining conflict has already been ruled out above, so it is now
+    // safe to write the resolved line-merges directly to the working tree.
+    let merged_paths = write_resolved_line_merges(&resolved_line_merges, &repo.work_dir)?;
     phase_apply.complete(format!("{} paths", changed));
 
     repo.write_clone_root(&remote_root)?;
@@ -227,6 +253,7 @@ fn pull_full(
             ))?;
         }
         out.writeln(&format!("{} path(s) updated.", changed))?;
+        print_merged_block(&mut out, colored, &styles, &merged_paths)?;
 
         let preserved: Vec<&String> = local_diff
             .keys()
@@ -298,6 +325,11 @@ fn pull_scoped(
         remote_diff: HashMap<String, DiffEntry>,
         local_diff: HashMap<String, DiffEntry>,
         remote_scoped_hash: Option<Hash>,
+        /// The clone-side hash at this scoped subtree root -- the base root
+        /// a [line_merge] merge resolves each path's base blob against (see
+        /// `resolve_line_merges`). Already computed above; stored here so
+        /// the merge pass does not need to re-navigate `clone_root`.
+        clone_scoped_hash: Option<Hash>,
     }
 
     // Clone_root tree objects of stubbed subtrees are not in the local cache
@@ -404,6 +436,7 @@ fn pull_scoped(
             remote_diff,
             local_diff,
             remote_scoped_hash,
+            clone_scoped_hash,
         });
     }
     refresh_stat_cache(stat_cache, &scanned_files, &omemfs_dir);
@@ -439,10 +472,40 @@ fn pull_scoped(
     let mut pd_clean: Vec<HashMap<String, DiffEntry>> = vec![HashMap::new(); path_diffs.len()];
     let mut all_conflicts: Vec<String> = Vec::new();
     let mut conflict_owner: HashMap<String, usize> = HashMap::new();
+    // resolved_by_pd[i] holds the [line_merge] merges resolved for path_diffs[i]
+    // (not yet written to disk -- see resolve_line_merges's doc comment).
+    let mut resolved_by_pd: Vec<Vec<ResolvedLineMerge>> =
+        (0..path_diffs.len()).map(|_| Vec::new()).collect();
+    let filter_set = FilterSet::load(&repo.work_dir);
 
     for (i, pd) in path_diffs.iter().enumerate() {
-        let (clean, conflicts) = classify_conflicts(&pd.remote_diff, &pd.local_diff);
+        let (clean, mut conflicts) = classify_conflicts(&pd.remote_diff, &pd.local_diff);
         pd_clean[i].extend(clean);
+
+        // [line_merge] auto-merge pass (design/15_line_history_merge.md,
+        // "`pull` integration point"), scoped to this pd's subtree. `path`
+        // (a key in pd.remote_diff/pd.local_diff) is relative to the scoped
+        // subtree root (pd.rel), not the repo root, so the repo-root-relative
+        // path for the FilterSet lookup is `pd.rel` joined with `path`.
+        let scoped_abs = repo.work_dir.join(&pd.rel);
+        let rel_prefix = pd.rel.clone();
+        resolved_by_pd[i] = resolve_line_merges(
+            &mut conflicts,
+            &pd.remote_diff,
+            &pd.local_diff,
+            &filter_set,
+            &scoped_abs,
+            pd.clone_scoped_hash.as_ref(),
+            &lazy,
+            move |p| {
+                if p.is_empty() {
+                    rel_prefix.clone()
+                } else {
+                    format!("{}/{}", rel_prefix, p)
+                }
+            },
+        );
+
         for path in conflicts {
             conflict_owner.insert(path.clone(), i);
             all_conflicts.push(path);
@@ -490,6 +553,7 @@ fn pull_scoped(
 
     // Apply all clean changes.
     let mut total_changed = 0;
+    let mut merged_paths: Vec<String> = Vec::new();
     {
         let phase = crate::progress::begin_phase("Apply changes");
         for (i, pd) in path_diffs.iter().enumerate() {
@@ -504,6 +568,11 @@ fn pull_scoped(
                 &pack_reader,
                 remote_key.as_ref(),
             )?;
+            // Every remaining conflict has already been ruled out above (the
+            // abort check returned early otherwise), so it is now safe to
+            // write this pd's resolved line-merges directly to the working
+            // tree.
+            merged_paths.extend(write_resolved_line_merges(&resolved_by_pd[i], &scoped_abs)?);
         }
         phase.complete(format!("{} paths", total_changed));
     }
@@ -551,6 +620,7 @@ fn pull_scoped(
             }
         }
         out.writeln(&format!("{} path(s) updated.", total_changed))?;
+        print_merged_block(&mut out, colored, &styles, &merged_paths)?;
         out.finish()?;
     }
     Ok(())
@@ -842,6 +912,199 @@ fn same_content(a: &DiffEntry, b: &DiffEntry) -> bool {
         (DiffEntry::Symlink { target: ta, .. }, DiffEntry::Symlink { target: tb, .. }) => ta == tb,
         _ => false,
     }
+}
+
+// ---------------------------------------------------------------------------
+// [line_merge] auto-merge (design/15_line_history_merge.md, "`pull`
+// integration point")
+// ---------------------------------------------------------------------------
+
+/// True for a diff entry shape that carries an actual blob (`Added` or
+/// `Modified`) -- the only shape a line-merge attempt is considered for.
+fn is_blob_change(entry: &DiffEntry) -> bool {
+    matches!(entry, DiffEntry::Added { .. } | DiffEntry::Modified { .. })
+}
+
+/// Read the full content of blob `hash` into memory via `store`, stripping
+/// the `ED F0` blob-escape (handled internally by `for_each_blob_chunk`, see
+/// `object::deserialise_blob`). Used only for line-merge inputs, which are
+/// expected to be small, line-based log files -- not a general-purpose blob
+/// reader for arbitrary-size content.
+fn read_blob_bytes(store: &dyn ObjectStore, hash: &Hash) -> Result<Vec<u8>, Error> {
+    let mut buf = Vec::new();
+    codec::chunk::for_each_blob_chunk(store, hash, None, |chunk| {
+        buf.extend_from_slice(chunk);
+        Ok(())
+    })?;
+    Ok(buf)
+}
+
+/// Attempt a three-way line merge for one path already known to have a
+/// blob-bearing (`Added`/`Modified`) entry on both the remote and local
+/// side. Returns `Some(merged_bytes)` on a clean merge; `None` if the merge
+/// should not be (or could not be) attempted -- including a genuine
+/// `MergeOutcome::Conflict`, a non-regular-file working-tree entry, or any
+/// I/O error while resolving base/local/remote bytes. In every `None` case
+/// the caller leaves the path in `conflicts` untouched: a line-merge attempt
+/// must never turn an otherwise-successful pull into a hard failure.
+fn try_line_merge_one(
+    path: &str,
+    remote_entry: &DiffEntry,
+    working_path: &std::path::Path,
+    base_root: Option<&Hash>,
+    lazy: &LazyTreeStore,
+) -> Option<Vec<u8>> {
+    // Local side: only a regular file is eligible (reject missing paths,
+    // directories, symlinks -- same is-a-regular-file check style as
+    // `working_file_source`).
+    let meta = fs::symlink_metadata(working_path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let local_bytes = fs::read(working_path).ok()?;
+
+    let remote_hash = match remote_entry {
+        DiffEntry::Added { hash, .. } | DiffEntry::Modified { hash, .. } => hash,
+        _ => return None,
+    };
+    let remote_bytes = read_blob_bytes(lazy, remote_hash).ok()?;
+
+    // Base side: the blob at `base_root` (clone_root, or the scoped
+    // subtree's clone-side hash), or empty bytes if the path had no base
+    // entry (e.g. it was added on both sides independently).
+    let base_bytes = match base_root {
+        None => Vec::new(),
+        Some(root) => {
+            let components: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+            match tree_ops::navigate(root, &components, lazy) {
+                Ok(Some(base_hash)) => read_blob_bytes(lazy, &base_hash).ok()?,
+                Ok(None) => Vec::new(),
+                Err(_) => return None,
+            }
+        }
+    };
+
+    match line_merge::merge(&base_bytes, &local_bytes, &remote_bytes) {
+        MergeOutcome::Clean(bytes) => Some(bytes),
+        MergeOutcome::Conflict => None,
+    }
+}
+
+/// One path resolved to a clean line-merge, pending being written to the
+/// working tree. See `resolve_line_merges`.
+struct ResolvedLineMerge {
+    /// The diff-map key: relative to the repo root for a full pull, or
+    /// relative to the scoped subtree root for a scoped pull.
+    key: String,
+    /// The full repo-root-relative path, for the "Line-merged" report block.
+    repo_rel: String,
+    /// The merged file content.
+    bytes: Vec<u8>,
+}
+
+/// Resolve (but do NOT write to disk) a `[line_merge]` auto-merge for every
+/// path still in `conflicts` after `classify_conflicts`
+/// (design/15_line_history_merge.md, "`pull` integration point"). Removes
+/// each successfully-merged path from `conflicts`; every path left in
+/// `conflicts` afterwards proceeds through the existing conflict-helper flow
+/// exactly as before.
+///
+/// Deliberately does not touch the filesystem: pull's atomic-abort policy
+/// (design/03, design/04) requires that nothing is applied to the working
+/// tree while ANY conflict remains, including a path resolved here -- if some
+/// other, unrelated path still conflicts, the whole pull aborts and this
+/// path's merge must not have been written either. The caller must call
+/// `write_resolved_line_merges` only after confirming `conflicts` is empty.
+///
+/// `base_dir` is the directory a diff-map key is joined onto to reach the
+/// working-tree file (`repo.work_dir` for a full pull, `work_dir/pd.rel` for
+/// a scoped pull). `base_root` is the base tree root to resolve a path's
+/// base blob against (`clone_root`, or the scoped subtree's clone-side
+/// hash). `to_repo_rel` converts a diff-map key to a full repo-root-relative
+/// path for the `FilterSet::is_line_merge` lookup and for reporting.
+fn resolve_line_merges(
+    conflicts: &mut Vec<String>,
+    remote_diff: &HashMap<String, DiffEntry>,
+    local_diff: &HashMap<String, DiffEntry>,
+    filter_set: &FilterSet,
+    base_dir: &std::path::Path,
+    base_root: Option<&Hash>,
+    lazy: &LazyTreeStore,
+    to_repo_rel: impl Fn(&str) -> String,
+) -> Vec<ResolvedLineMerge> {
+    let mut resolved = Vec::new();
+    let mut remaining = Vec::with_capacity(conflicts.len());
+
+    for path in conflicts.drain(..) {
+        let candidate = match (remote_diff.get(&path), local_diff.get(&path)) {
+            (Some(r), Some(l)) => is_blob_change(r) && is_blob_change(l),
+            _ => false,
+        };
+        if !candidate {
+            remaining.push(path);
+            continue;
+        }
+
+        let repo_rel = to_repo_rel(&path);
+        if !filter_set.is_line_merge(&repo_rel) {
+            remaining.push(path);
+            continue;
+        }
+
+        let remote_entry = remote_diff.get(&path).expect("checked above");
+        let abs = base_dir.join(&path);
+        match try_line_merge_one(&path, remote_entry, &abs, base_root, lazy) {
+            Some(bytes) => resolved.push(ResolvedLineMerge {
+                key: path,
+                repo_rel,
+                bytes,
+            }),
+            None => remaining.push(path),
+        }
+    }
+
+    *conflicts = remaining;
+    resolved
+}
+
+/// Write every resolved line-merge's content directly to the working tree
+/// (atomically), bypassing `apply_diff`/`clean_diff` entirely for these
+/// paths. Only call once the pull has passed the conflict-abort check (i.e.
+/// `conflicts` is empty) -- see `resolve_line_merges`. Returns the
+/// repo-root-relative paths written, for the "Line-merged" report block.
+fn write_resolved_line_merges(
+    resolved: &[ResolvedLineMerge],
+    base_dir: &std::path::Path,
+) -> Result<Vec<String>, Error> {
+    let mut merged_paths = Vec::with_capacity(resolved.len());
+    for r in resolved {
+        let abs = base_dir.join(&r.key);
+        crate::store::local::atomic_write_with_no_fsync(&abs, |w| {
+            w.write_all(&r.bytes).map_err(Error::Io)
+        })?;
+        merged_paths.push(r.repo_rel.clone());
+    }
+    Ok(merged_paths)
+}
+
+/// Print the "Line-merged the following paths:" block for `merged`, matching
+/// the style of the "preserved" block printed a few lines below it. Does
+/// nothing when `merged` is empty.
+fn print_merged_block(
+    out: &mut Output,
+    colored: bool,
+    styles: &Styles,
+    merged: &[String],
+) -> Result<(), Error> {
+    if merged.is_empty() {
+        return Ok(());
+    }
+    out.writeln("Line-merged the following paths:")?;
+    for p in merged {
+        let p_str = paint(colored, styles.modified, p);
+        out.writeln(&format!("  merged: {}", p_str))?;
+    }
+    Ok(())
 }
 
 fn apply_diff(

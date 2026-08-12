@@ -431,6 +431,16 @@ Pulled remote changes. Your local modifications to the following paths were pres
 
 ## Conflict handling
 
+A path matching `[line_merge]` (see `design/15_line_history_merge.md`) that is
+modified on both sides is merged automatically instead of following the
+conflict handling below: `pull` runs a three-way line merge and, on success,
+writes the merged content directly to the working tree. The conflict handling
+below is the fallback for such a path, used only when the merge detects a
+genuine overlapping edit (design/15, "Conflict-fallback trigger") or a
+precondition is not met (e.g. the path is not a plain-file modification on
+both sides) — in either case the path is treated exactly like any other
+conflicting path.
+
 A conflict occurs when the same path is modified both locally (working tree vs. clone root) and remotely (remote root vs. clone root).
 
 An executable-bit-only (chmod) change counts as a modification on either side. For example, a local `chmod +x` overlapping with a remote content change to the same path is a conflict. The one exception: when both sides hold the **same content hash**, the overlap is resolved without conflict by applying the remote metadata (mtime/mode).

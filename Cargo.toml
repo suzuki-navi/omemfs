@@ -85,6 +85,9 @@ bytes = "1"
 futures = "0.3"
 unicode-width = { version = "0.2", features = ["cjk"] }
 
+# Line-level diff for the [line_merge] pull fast path (design/15)
+similar = "2"
+
 
 [build-dependencies]
 zstd = { version = "0.13", features = ["zdict_builder"] }

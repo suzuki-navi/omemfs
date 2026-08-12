@@ -920,3 +920,177 @@ setup_two_clones() {
     [ -f src/main.rs ]
     [ -f docs/README.md ]
 }
+
+# ---------------------------------------------------------------------------
+# [line_merge] auto-merge (design/15_line_history_merge.md)
+#
+# `omemfs clone --new`'s default .omemfs-filter template already lists
+# `.zsh_history` under [line_merge] (src/filter.rs DEFAULT_FILTER_TEMPLATE),
+# so these tests use it directly with no manual .omemfs-filter edits.
+#
+# Note: the regression guard for a plain file NOT matching [line_merge]
+# (e.g. file.txt) still conflicting exactly as before is already covered by
+# "pull: aborts on conflict and writes helper files" above -- that test
+# passes unchanged with the merge pass wired in, so it is not duplicated here.
+# ---------------------------------------------------------------------------
+
+@test "pull: line-merges independently appended .zsh_history and does not conflict" {
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone1
+    [ "$status" -eq 0 ]
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone2
+    [ "$status" -eq 0 ]
+
+    # clone1: establish a shared base .zsh_history and push it.
+    cd clone1
+    printf ': 100:0;cmd_100\n' > .zsh_history
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    # clone2: pull the base so both clones share the same clone_root for it,
+    # then append a local-only line.
+    cd ../clone2
+    run "$OMEMFS" pull
+    [ "$status" -eq 0 ]
+    [ "$(cat .zsh_history)" = ": 100:0;cmd_100" ]
+    printf ': 200:0;cmd_local\n' >> .zsh_history
+
+    # clone1: append a remote-only line and push.
+    cd ../clone1
+    printf ': 300:0;cmd_remote\n' >> .zsh_history
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    # clone2: pull should merge cleanly instead of conflicting.
+    cd ../clone2
+    run "$OMEMFS" pull
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"erged"* ]]
+    [ ! -f .zsh_history.omemfs-conflict-base ]
+    [ ! -f .zsh_history.omemfs-conflict-local ]
+    [ ! -f .zsh_history.omemfs-conflict-remote ]
+    grep -q "cmd_100" .zsh_history
+    grep -q "cmd_local" .zsh_history
+    grep -q "cmd_remote" .zsh_history
+
+    # A subsequent push must succeed (the merged file is dirty relative to
+    # the new clone_root, matching the "Dirty pull (no conflict)" semantics).
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+}
+
+@test "pull: line-merges .zsh_history via a scoped pull" {
+    # Scoped to a subdirectory (not the bare filename) so this exercises the
+    # pd.rel-prefixed diff-map-key join that pull_scoped's per-path loop uses
+    # for nested paths (see src/commands/pull.rs pull_scoped, `format!("{}/{}",
+    # pd.rel, path)`). A bare leaf-file scope target (e.g. `pull .zsh_history`
+    # at the repo root) hits a separate, pre-existing limitation in
+    # pull_scoped/diff_trees/splice_into_clone_root (they assume the scoped
+    # path resolves to a tree hash) that is unrelated to line_merge and out of
+    # scope for this change.
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone1
+    [ "$status" -eq 0 ]
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone2
+    [ "$status" -eq 0 ]
+
+    cd clone1
+    mkdir -p logs
+    printf ': 100:0;cmd_100\n' > logs/.zsh_history
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    cd ../clone2
+    run "$OMEMFS" pull logs
+    [ "$status" -eq 0 ]
+    [ "$(cat logs/.zsh_history)" = ": 100:0;cmd_100" ]
+    printf ': 200:0;cmd_local\n' >> logs/.zsh_history
+
+    cd ../clone1
+    printf ': 300:0;cmd_remote\n' >> logs/.zsh_history
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    # clone2: scoped pull (not a full pull) should merge cleanly.
+    cd ../clone2
+    run "$OMEMFS" pull logs
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"erged"* ]]
+    [ ! -f logs/.zsh_history.omemfs-conflict-base ]
+    [ ! -f logs/.zsh_history.omemfs-conflict-local ]
+    [ ! -f logs/.zsh_history.omemfs-conflict-remote ]
+    grep -q "cmd_100" logs/.zsh_history
+    grep -q "cmd_local" logs/.zsh_history
+    grep -q "cmd_remote" logs/.zsh_history
+
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+}
+
+@test "pull: .zsh_history with overlapping same-line edits still conflicts" {
+    # An in-place edit of the same base line on both sides (no untouched line
+    # to fall back on) cannot be reconciled by the line-level algorithm, so
+    # line_merge::merge returns Conflict and the usual helper-file flow runs.
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone1
+    [ "$status" -eq 0 ]
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone2
+    [ "$status" -eq 0 ]
+
+    cd clone1
+    printf 'orig_line\n' > .zsh_history
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    cd ../clone2
+    run "$OMEMFS" pull
+    [ "$status" -eq 0 ]
+    printf 'local_edit\n' > .zsh_history
+
+    cd ../clone1
+    printf 'remote_edit\n' > .zsh_history
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    cd ../clone2
+    run "$OMEMFS" pull
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"onflict"* ]]
+    [ "$(cat .zsh_history)" = "local_edit" ]
+    [ -f .zsh_history.omemfs-conflict-base ]
+    [ -f .zsh_history.omemfs-conflict-local ]
+    [ -f .zsh_history.omemfs-conflict-remote ]
+    [ "$(cat .zsh_history.omemfs-conflict-base)" = "orig_line" ]
+    [ "$(cat .zsh_history.omemfs-conflict-local)" = "local_edit" ]
+    [ "$(cat .zsh_history.omemfs-conflict-remote)" = "remote_edit" ]
+}
+
+@test "pull: .zsh_history deleted on one side and modified on the other still conflicts" {
+    # The merge pass only applies to an Added/Modified shape on both sides; a
+    # delete on one side falls through to the normal conflict flow untouched.
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone1
+    [ "$status" -eq 0 ]
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone2
+    [ "$status" -eq 0 ]
+
+    cd clone1
+    printf ': 100:0;cmd_100\n' > .zsh_history
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    cd ../clone2
+    run "$OMEMFS" pull
+    [ "$status" -eq 0 ]
+    rm .zsh_history
+
+    cd ../clone1
+    printf ': 200:0;cmd_local\n' >> .zsh_history
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    cd ../clone2
+    run "$OMEMFS" pull
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"onflict"* ]]
+    [ ! -f .zsh_history ]
+    [ -f .zsh_history.omemfs-conflict-base ]
+    [ -f .zsh_history.omemfs-conflict-remote ]
+    [ ! -f .zsh_history.omemfs-conflict-local ]
+}

@@ -6,8 +6,9 @@
 
 - **ignore** — exclude paths from working tree scans. Excluded paths are never uploaded to the remote.
 - **aggregate** — collapse directories into a single display entry in `omemfs ls`. Display-only; has no effect on sync behaviour.
+- **line_merge** — mark line-based, append-only log files for automatic merging during `pull` (see `design/15_line_history_merge.md`; not yet implemented).
 
-The file uses `.gitignore`-compatible pattern syntax in two named sections: `[ignore]` and `[aggregate]`.
+The file uses `.gitignore`-compatible pattern syntax in three named sections: `[ignore]`, `[aggregate]`, and `[line_merge]`.
 
 ---
 
@@ -37,13 +38,20 @@ node_modules/
 .git
 target/
 node_modules/
+
+[line_merge]
+# Patterns here mark line-based, append-only log files that a future `pull`
+# auto-merges instead of raising a conflict (see design/15_line_history_merge.md).
+# Same syntax as [ignore].
+.zsh_history
+.bash_history
 ```
 
 ### Section rules
 
-- A line of the form `[ignore]` or `[aggregate]` (case-sensitive, no leading/trailing space) begins a new section.
+- A line of the form `[ignore]`, `[aggregate]`, or `[line_merge]` (case-sensitive, no leading/trailing space) begins a new section.
 - Lines before the first section header belong to `[ignore]` (the default section). This allows the file to look like a plain `.gitignore` when only ignore patterns are needed.
-- A file may contain multiple `[ignore]` sections and multiple `[aggregate]` sections, in any order. Patterns from all sections of the same kind are concatenated (merged).
+- A file may contain multiple `[ignore]` sections, multiple `[aggregate]` sections, and multiple `[line_merge]` sections, in any order. Patterns from all sections of the same kind are concatenated (merged).
 - A path that matches patterns in **both** sections gets both behaviours: excluded from push **and** collapsed in `ls`.
 
 ### Pattern syntax
@@ -147,6 +155,22 @@ Ignored directories are shown as a single line even with `-r`; their contents ar
 
 Nested aggregated directories are collapsed into the nearest aggregated ancestor.
 
+### `[line_merge]` section
+
+*Not yet implemented.* The `[line_merge]` section is parsed from
+`.omemfs-filter` and the `omemfs clone` default template lists common
+history-file patterns, but no command currently consumes it. The table below
+notes today's behaviour; the intended final behaviour (an automatic merge
+fast path in `pull`) is documented in `design/15_line_history_merge.md`.
+
+| Command | Behaviour |
+|---------|-----------|
+| `push` | Not affected; matching files are scanned and uploaded normally |
+| `pull` | Not affected; a matching path modified on both sides follows the normal conflict handling (`03_sync_model.md`, "Conflict handling") |
+| `ls` | Not affected |
+| `restore` | Not affected |
+| `cat` | Not affected |
+
 ---
 
 ## Aggregate metadata computation
@@ -218,6 +242,15 @@ __pycache__/
 target/
 node_modules/
 __pycache__/
+
+[line_merge]
+# Line-based, append-only log files listed here are auto-merged by a future
+# `pull` instead of producing a conflict (see design/15_line_history_merge.md).
+
+# Shell and REPL history files
+.zsh_history
+.bash_history
+.python_history
 ```
 
 Patterns intentionally omitted from the default (add manually if needed):

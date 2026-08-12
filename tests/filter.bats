@@ -28,6 +28,11 @@ teardown() {
     grep -q '\[aggregate\]' .omemfs-filter
 }
 
+@test "clone: .omemfs-filter contains [line_merge] section" {
+    grep -q '\[line_merge\]' .omemfs-filter
+    grep -q '\.zsh_history' .omemfs-filter
+}
+
 @test "clone: does not overwrite existing .omemfs-filter" {
     echo "custom content" > .omemfs-filter
     run "$OMEMFS" clone --new --url "$REMOTE_DIR" newdir

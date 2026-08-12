@@ -8,6 +8,7 @@ mod error;
 mod filter;
 mod fsmeta;
 mod io_stats;
+mod line_merge;
 mod lock;
 mod log_parser;
 mod object;
