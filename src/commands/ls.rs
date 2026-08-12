@@ -42,6 +42,10 @@ pub struct LsOptions {
 // ---------------------------------------------------------------------------
 
 struct Row {
+    /// Local status (`X` column): `M`/`A`/`D`/` ` (see `status_char`), or
+    /// [`STATUS_UNKNOWN`] (`?`) when a clone-root tree object needed to
+    /// determine this path's status was unreadable (design/04_cli_spec.md
+    /// "Local diff self-healing").
     status: char,
     /// Remote status: `M` (modified), `A` (added on remote), `D` (deleted on remote), or ` ` (in sync).
     remote_status: char,
@@ -169,7 +173,14 @@ pub fn run(mut opts: LsOptions) -> Result<(), Error> {
             })
             .collect();
         let scope_dirty = ScopeFilter::new(&scoped_prefixes_dirty);
-        let diff = diff_trees(clone_root.as_ref(), working_hash, &local, &scope_dirty)?;
+        let (diff, unknown_dirty) = diff_trees_with_heal(
+            &repo,
+            clone_root.as_ref(),
+            working_hash,
+            &local,
+            &scope_dirty,
+            &scoped_prefixes_dirty,
+        )?;
         let mut paths: Vec<&String> = diff.keys().collect();
         paths.sort();
         let mut rows: Vec<Row> = Vec::new();
@@ -218,6 +229,27 @@ pub fn run(mut opts: LsOptions) -> Result<(), Error> {
             };
             rows.push(row);
         }
+        // A subtree whose diff could not be resolved (see diff_trees_with_heal)
+        // has no entry in `diff`, so it would otherwise be silently absent from
+        // `--dirty` output even though its dirty status is genuinely unknown.
+        // Synthesize a row for it with STATUS_UNKNOWN rather than omitting it.
+        for up in &unknown_dirty {
+            rows.push(Row {
+                status: STATUS_UNKNOWN,
+                remote_status: ' ',
+                z: ' ',
+                hash_str: "-".to_string(),
+                size: None,
+                blob_count: 0,
+                mtime: None,
+                path: if up == "." {
+                    ".".to_string()
+                } else {
+                    format!("{}/", up)
+                },
+            });
+        }
+        rows.sort_by(|a, b| a.path.cmp(&b.path));
         let count = rows.len();
         print_rows(&rows)?;
         phase.complete(format!("{} entries", count));
@@ -323,11 +355,19 @@ pub fn run(mut opts: LsOptions) -> Result<(), Error> {
         ScopeFilter::unscoped()
     };
 
-    let diff_map: HashMap<String, DiffRow> = if clone_root.as_ref() != Some(&working_hash) {
-        diff_trees(clone_root.as_ref(), working_hash.clone(), &local, &scope)?
-    } else {
-        HashMap::new()
-    };
+    let (diff_map, unknown_paths): (HashMap<String, DiffRow>, HashSet<String>) =
+        if clone_root.as_ref() != Some(&working_hash) {
+            diff_trees_with_heal(
+                &repo,
+                clone_root.as_ref(),
+                working_hash.clone(),
+                &local,
+                &scope,
+                &scoped_prefixes,
+            )?
+        } else {
+            (HashMap::new(), HashSet::new())
+        };
 
     // The no-clone-root top-level listing applies only to an unscoped ls. With a
     // path scope, fall through to the scoped branch using the working_hash
@@ -1067,6 +1107,50 @@ pub fn run(mut opts: LsOptions) -> Result<(), Error> {
         }
     }
 
+    // A subtree whose local diff could not be resolved (see
+    // diff_trees_with_heal) is not recorded as Added/Modified/Deleted in
+    // diff_map, so the normal status_char/force_status logic above leaves its
+    // row (and any listed ancestor directory row) at ' ' -- misreporting it as
+    // "in sync" when its status is actually unknown. Override those rows'
+    // status to STATUS_UNKNOWN here, after every other status/force_status
+    // assignment above, so nothing later overwrites it back to ' '.
+    if !unknown_paths.is_empty() {
+        // Bare directory path (no trailing slash; "." for the root) -> row
+        // index, for O(1) lookups while walking each unknown path's ancestors.
+        // Owned `String` keys (not borrowed from `rows`) so `rows` can still
+        // be mutated below while this map is in scope.
+        let dir_idx: HashMap<String, usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.path.ends_with('/') || r.path == ".")
+            .map(|(i, r)| (r.path.trim_end_matches('/').to_string(), i))
+            .collect();
+        for up in &unknown_paths {
+            // The unresolvable subtree's own row, if it is listed.
+            if let Some(&idx) = dir_idx.get(up.as_str()) {
+                rows[idx].status = STATUS_UNKNOWN;
+            }
+            // Ancestors: a listed ancestor directory cannot vouch for a
+            // descendant it could not resolve, so an ancestor otherwise
+            // reported "in sync" (' ') is upgraded to the same marker. An
+            // ancestor already showing a genuinely detected M/A/D change
+            // elsewhere keeps that (more specific) status.
+            let mut cur = up.as_str();
+            while cur != "." {
+                let anc = match cur.rfind('/') {
+                    Some(pos) => &cur[..pos],
+                    None => ".",
+                };
+                if let Some(&idx) = dir_idx.get(anc) {
+                    if rows[idx].status == ' ' {
+                        rows[idx].status = STATUS_UNKNOWN;
+                    }
+                }
+                cur = anc;
+            }
+        }
+    }
+
     let count = rows.len();
     print_rows(&rows)?;
     phase.complete(format!("{} entries", count));
@@ -1406,6 +1490,7 @@ fn paint_status(colored: bool, status: char, styles: &Styles) -> String {
         'A' => paint(true, styles.added, &status.to_string()),
         'M' => paint(true, styles.modified, &status.to_string()),
         'D' => paint(true, styles.deleted, &status.to_string()),
+        STATUS_UNKNOWN => paint(true, styles.conflict, &status.to_string()),
         c => c.to_string(),
     }
 }
@@ -1705,6 +1790,7 @@ fn format_hash(h: &Hash, full: bool) -> String {
 // Diff for --dirty
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 enum DiffRow {
     Added { working_hash: Hash },
     AddedEmptyDir { hash: Hash },
@@ -1712,18 +1798,63 @@ enum DiffRow {
     Deleted,
 }
 
+/// Status shown in the `X` column when a path's local status could not be
+/// determined: a clone-root tree object the diff needed was missing from the
+/// local cache and could not be resolved (fetched from the remote and
+/// healed, or otherwise proven absent) either — see `diff_trees_with_heal`
+/// and design/04_cli_spec.md "Local diff self-healing". Distinct from `' '`
+/// ("in sync") so an unresolvable path is never misreported as unchanged.
+/// This is a different column from the `Z` column's own `?` ("unrecognised
+/// reserved `.omemfs-` file"), so the two do not collide in meaning.
+const STATUS_UNKNOWN: char = '?';
+
+/// Compute the local (`X` column) diff between `base` (clone root) and
+/// `target` (working tree), tolerating a per-subtree object miss instead of
+/// aborting the whole walk (see `diff_recursive`/`mark_deleted`). Returns the
+/// normal diff map plus the set of subtree paths (bare, no trailing slash;
+/// `"."` for the root) whose status could not be determined at all because a
+/// tree object needed to diff them was unreadable through `store`.
 fn diff_trees(
     base: Option<&Hash>,
     target: Hash,
     store: &dyn ObjectStore,
     scope: &ScopeFilter,
-) -> Result<HashMap<String, DiffRow>, Error> {
+) -> Result<(HashMap<String, DiffRow>, HashSet<String>), Error> {
     let _t = dtimer_l1!("diff_trees");
     let mut result = HashMap::new();
-    diff_recursive(base, &target, store, scope, &mut String::new(), &mut result)?;
-    Ok(result)
+    let mut unknown = HashSet::new();
+    match diff_recursive(
+        base,
+        &target,
+        store,
+        scope,
+        &mut String::new(),
+        &mut result,
+        &mut unknown,
+    ) {
+        Ok(()) => {}
+        Err(Error::ObjectNotFound(_)) => {
+            // The root tree object itself (base or target) could not be
+            // resolved. Extremely unusual (this should always be readable),
+            // but degrade gracefully rather than aborting `ls` entirely.
+            unknown.insert(".".to_string());
+        }
+        Err(e) => return Err(e),
+    }
+    Ok((result, unknown))
 }
 
+/// `unknown` accumulates the bare path of every subtree whose diff could not
+/// be computed because a tree object it needed (`target`'s own object, or a
+/// `base` subtree reached while iterating it) raised `ObjectNotFound`
+/// through `store`. Each recursive descent into a child subtree is caught
+/// individually (mirroring `remote_diff_recursive`'s per-subtree isolation,
+/// which already discards errors from a single recursive call rather than
+/// aborting the whole remote diff): a miss there is recorded and the walk
+/// continues with the next sibling, so one unresolvable subtree never blanks
+/// out or crashes unrelated, resolvable parts of the tree. Any error other
+/// than `ObjectNotFound` still propagates immediately (`?`) -- only an object
+/// miss is treated as tolerable/self-healable; other failures are real.
 fn diff_recursive(
     base: Option<&Hash>,
     target: &Hash,
@@ -1731,6 +1862,7 @@ fn diff_recursive(
     scope: &ScopeFilter,
     prefix: &mut String,
     result: &mut HashMap<String, DiffRow>,
+    unknown: &mut HashSet<String>,
 ) -> Result<(), Error> {
     if base == Some(target) {
         return Ok(());
@@ -1808,14 +1940,30 @@ fn diff_recursive(
                 // ancestors of it.
                 if scope.should_descend(prefix) {
                     let before = result.len();
-                    diff_recursive(base_tree, hash, store, scope, prefix, result)?;
-                    // If the tree is new and nothing was inserted beneath it, it is
-                    // an empty directory — record it explicitly so `ls` shows it.
-                    if base_tree.is_none() && result.len() == before && scope.in_scope(prefix) {
-                        result.insert(
-                            prefix.clone(),
-                            DiffRow::AddedEmptyDir { hash: hash.clone() },
-                        );
+                    match diff_recursive(base_tree, hash, store, scope, prefix, result, unknown) {
+                        Ok(()) => {
+                            // If the tree is new and nothing was inserted beneath it, it is
+                            // an empty directory — record it explicitly so `ls` shows it.
+                            if base_tree.is_none()
+                                && result.len() == before
+                                && scope.in_scope(prefix)
+                            {
+                                result.insert(
+                                    prefix.clone(),
+                                    DiffRow::AddedEmptyDir { hash: hash.clone() },
+                                );
+                            }
+                        }
+                        Err(Error::ObjectNotFound(_)) => {
+                            // This subtree's own diff could not be computed (its
+                            // target or base tree object was unreadable). Record it
+                            // as unknown and keep walking siblings -- do not abort
+                            // the rest of the walk over one unresolvable subtree.
+                            if scope.in_scope(prefix) {
+                                unknown.insert(prefix.clone());
+                            }
+                        }
+                        Err(e) => return Err(e),
                     }
                 }
                 prefix.truncate(prev);
@@ -1841,7 +1989,15 @@ fn diff_recursive(
             match base_entry {
                 TreeEntry::Tree { hash, .. } => {
                     if scope.should_descend(&path) {
-                        mark_deleted(hash, store, scope, &path, result)?;
+                        match mark_deleted(hash, store, scope, &path, result, unknown) {
+                            Ok(()) => {}
+                            Err(Error::ObjectNotFound(_)) => {
+                                if scope.in_scope(&path) {
+                                    unknown.insert(path.clone());
+                                }
+                            }
+                            Err(e) => return Err(e),
+                        }
                     }
                 }
                 TreeEntry::Blob { .. } | TreeEntry::Symlink { .. } => {
@@ -1863,12 +2019,20 @@ fn join_path(prefix: &str, name: &str) -> String {
     }
 }
 
+/// Recursively record every entry under a base-only (deleted-in-target)
+/// subtree as `DiffRow::Deleted`. `unknown` is threaded through for the same
+/// reason as in `diff_recursive`: a nested subtree here can independently
+/// fail to resolve (e.g. a deleted, never-locally-fetched sub-subtree), and
+/// each recursive descent is caught individually by its own caller (see the
+/// `Tree` arm below and `diff_recursive`'s deleted-entries loop) so a miss
+/// there does not abort marking the rest of this subtree's siblings deleted.
 fn mark_deleted(
     hash: &Hash,
     store: &dyn ObjectStore,
     scope: &ScopeFilter,
     prefix: &str,
     result: &mut HashMap<String, DiffRow>,
+    unknown: &mut HashSet<String>,
 ) -> Result<(), Error> {
     for entry in crate::tree_ops::load_all_entries(hash, store)? {
         let path = format!("{}/{}", prefix, entry.name());
@@ -1880,12 +2044,97 @@ fn mark_deleted(
             }
             TreeEntry::Tree { hash, .. } => {
                 if scope.should_descend(&path) {
-                    mark_deleted(&hash, store, scope, &path, result)?;
+                    match mark_deleted(&hash, store, scope, &path, result, unknown) {
+                        Ok(()) => {}
+                        Err(Error::ObjectNotFound(_)) => {
+                            if scope.in_scope(&path) {
+                                unknown.insert(path.clone());
+                            }
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
             }
         }
     }
     Ok(())
+}
+
+/// Maximum time budget for the `LazyTreeStore`-backed local diff walk in
+/// [`diff_trees_with_heal`]. Unlike [`REMOTE_LOOKUP_TIMEOUT`] (below, which
+/// bounds a single `INDEX_ROOT` read), this bounds the *whole* recursive
+/// local diff walk, which may issue one remote fetch per differing or
+/// missing subtree rather than a single round trip. A longer budget avoids
+/// spuriously falling back to the degraded local-only pass just because a
+/// healthy remote takes longer than a single lookup would for a walk that
+/// touches several subtrees.
+const LOCAL_DIFF_HEAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Compute the local (`X` column) diff for `ls`: `base` (clone root, or its
+/// scoped equivalent) vs `target` (the working tree), self-healing a local
+/// cache miss on a `base` tree object by fetching it from the `origin`
+/// remote -- the same [`crate::tree_ops::LazyTreeStore`] `pull` uses (see its
+/// doc comment and design/03_sync_model.md "Lazy tree reads") -- bounded by
+/// [`LOCAL_DIFF_HEAL_TIMEOUT`] so `ls` never blocks on a slow or unreachable
+/// remote (design/04_cli_spec.md "Local diff self-healing").
+///
+/// - When `base` is `None` (no clone root yet), `diff_recursive` never reads
+///   a base tree object at all (there is nothing to heal), so the
+///   thread/timeout machinery is skipped entirely and the diff runs directly
+///   against `local`.
+/// - Otherwise, the diff is attempted through a `LazyTreeStore` on a
+///   detached worker thread bounded by the timeout, mirroring
+///   `read_root_with_timeout`'s pattern: the thread owns clones of
+///   everything it touches, so it is safe for it to outlive the wait if the
+///   timeout fires. On success within budget, the (possibly self-healed)
+///   result is used exactly as-is.
+/// - On timeout, or if the walk returns an error other than a per-subtree
+///   object miss (`diff_recursive`/`mark_deleted` already tolerate that
+///   class internally -- see their doc comments -- so only a genuinely
+///   unrecoverable error, e.g. the remote being completely unreachable,
+///   reaches here), the attempt is abandoned and a local-only pass is run
+///   instead. That pass is itself tolerant of a per-subtree miss (see
+///   `diff_trees`), so `ls` still succeeds -- with the affected path(s)
+///   marked [`STATUS_UNKNOWN`] -- even when the remote cannot be reached at
+///   all within the budget.
+fn diff_trees_with_heal(
+    repo: &Repo,
+    base: Option<&Hash>,
+    target: Hash,
+    local: &crate::store::local::LocalStore,
+    scope: &ScopeFilter,
+    scoped_prefixes: &[String],
+) -> Result<(HashMap<String, DiffRow>, HashSet<String>), Error> {
+    let Some(base_hash) = base else {
+        return diff_trees(None, target, local, scope);
+    };
+
+    if let Ok((pack_reader, _remote, remote_key)) = repo.pack_reader("origin", None) {
+        let base_owned = base_hash.clone();
+        let target_owned = target.clone();
+        let local_owned = local.clone();
+        let prefixes_owned = scoped_prefixes.to_vec();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let lazy =
+                crate::tree_ops::LazyTreeStore::new(&local_owned, &pack_reader, remote_key.as_ref());
+            let heal_scope = ScopeFilter::new(&prefixes_owned);
+            let result = diff_trees(Some(&base_owned), target_owned, &lazy, &heal_scope);
+            // The receiver may already be gone (timeout fired); ignore send errors.
+            let _ = tx.send(result);
+        });
+        if let Ok(result) = rx.recv_timeout(LOCAL_DIFF_HEAL_TIMEOUT) {
+            if result.is_ok() {
+                return result;
+            }
+            // A non-tolerated error surfaced from the healed attempt: fall
+            // through to the local-only pass below.
+        }
+        // Timeout (or the worker's send failed, e.g. it panicked): fall
+        // through to the local-only pass below.
+    }
+
+    diff_trees(Some(base_hash), target, local, scope)
 }
 
 /// Returns true when `path` is a direct child of `prefix`.
@@ -2266,3 +2515,175 @@ fn remote_diff_recursive(
 // ---------------------------------------------------------------------------
 // STAT_CACHE refresh
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::local::LocalStore;
+    use tempfile::TempDir;
+
+    fn blob_entry(name: &str, content: &[u8]) -> TreeEntry {
+        TreeEntry::Blob {
+            name: name.to_string(),
+            hash: Hash::compute(content),
+            mtime: None,
+            size: content.len() as u64,
+            mode: None,
+        }
+    }
+
+    fn tree_entry(name: &str, hash: Hash) -> TreeEntry {
+        TreeEntry::Tree {
+            name: name.to_string(),
+            hash,
+            mtime: None,
+            size: 0,
+            blob_count: 0,
+        }
+    }
+
+    /// Build and store a tree object from `entries`, returning its hash.
+    fn store_tree(entries: Vec<TreeEntry>, store: &LocalStore) -> Hash {
+        crate::tree_ops::build_and_store(entries, store).unwrap()
+    }
+
+    /// This is the crux of the fix: a `base` (clone-root) subtree whose own
+    /// tree object is missing from `store` must not abort the whole diff.
+    /// `diff_recursive`/`mark_deleted` catch `Error::ObjectNotFound` at each
+    /// recursive descent and record the unresolved subtree in `unknown`
+    /// instead of propagating the error, so a sibling subtree that IS
+    /// resolvable is still diffed correctly.
+    #[test]
+    fn diff_trees_tolerates_missing_base_subtree_and_diffs_siblings() {
+        let dir = TempDir::new().unwrap();
+        let store = LocalStore::for_cache(dir.path());
+
+        // "a": present only as a dangling hash reference in the base root --
+        // its own tree object is deliberately never written (simulating an
+        // unresolvable local cache miss with no remote to heal from).
+        let a_base_hash = Hash::compute(b"a-base-never-written");
+
+        // "b": a normal, fully-resolvable subtree on both sides, with a
+        // blob whose content differs (base "old" vs target "new").
+        let b_base_hash = store_tree(vec![blob_entry("file.txt", b"old")], &store);
+        let b_target_hash = store_tree(vec![blob_entry("file.txt", b"new")], &store);
+
+        let base_root = store_tree(
+            vec![
+                tree_entry("a", a_base_hash),
+                tree_entry("b", b_base_hash.clone()),
+            ],
+            &store,
+        );
+
+        // "a"'s target-side tree object (the working tree always has a real,
+        // freshly-written object here -- it is the base side that is missing).
+        let a_target_hash = store_tree(vec![blob_entry("x.txt", b"x")], &store);
+        let target_root = store_tree(
+            vec![
+                tree_entry("a", a_target_hash),
+                tree_entry("b", b_target_hash),
+            ],
+            &store,
+        );
+
+        let (diff_map, unknown) = diff_trees(
+            Some(&base_root),
+            target_root,
+            &store,
+            &ScopeFilter::unscoped(),
+        )
+        .expect("a missing base subtree must not abort the whole diff");
+
+        assert_eq!(
+            unknown,
+            std::collections::HashSet::from(["a".to_string()]),
+            "the unresolvable subtree must be recorded as unknown, by its bare path"
+        );
+        assert!(
+            !diff_map.contains_key("a"),
+            "an unresolvable subtree must not be reported as a normal Added/Modified/Deleted entry"
+        );
+        assert!(
+            matches!(diff_map.get("b/file.txt"), Some(DiffRow::Modified { .. })),
+            "the sibling subtree 'b' must still be diffed correctly \
+             (expected b/file.txt: Modified), got {:?}",
+            diff_map.get("b/file.txt")
+        );
+    }
+
+    /// A non-`ObjectNotFound` error must still propagate (not be swallowed):
+    /// only an object-miss is tolerated. There is no store-level way to
+    /// inject an arbitrary I/O error here without a custom `ObjectStore`, so
+    /// this instead exercises the sibling-independence guarantee at a deeper
+    /// nesting level, complementing the shallow case above.
+    #[test]
+    fn diff_trees_tolerates_missing_base_subtree_at_nested_depth() {
+        let dir = TempDir::new().unwrap();
+        let store = LocalStore::for_cache(dir.path());
+
+        // base: root -> "src" -> "sub" (never written) and "src" -> "lib.rs" (blob).
+        let sub_base_hash = Hash::compute(b"sub-base-never-written");
+        let src_base_hash = store_tree(
+            vec![
+                tree_entry("sub", sub_base_hash),
+                blob_entry("lib.rs", b"old lib"),
+            ],
+            &store,
+        );
+        let base_root = store_tree(vec![tree_entry("src", src_base_hash)], &store);
+
+        // target: root -> "src" -> "sub" (freshly written, different content)
+        // and "src" -> "lib.rs" (changed content).
+        let sub_target_hash = store_tree(vec![blob_entry("inner.txt", b"inner")], &store);
+        let src_target_hash = store_tree(
+            vec![
+                tree_entry("sub", sub_target_hash),
+                blob_entry("lib.rs", b"new lib"),
+            ],
+            &store,
+        );
+        let target_root = store_tree(vec![tree_entry("src", src_target_hash)], &store);
+
+        let (diff_map, unknown) = diff_trees(
+            Some(&base_root),
+            target_root,
+            &store,
+            &ScopeFilter::unscoped(),
+        )
+        .expect("a missing base subtree at any depth must not abort the whole diff");
+
+        assert_eq!(
+            unknown,
+            std::collections::HashSet::from(["src/sub".to_string()]),
+        );
+        assert!(
+            matches!(diff_map.get("src/lib.rs"), Some(DiffRow::Modified { .. })),
+            "the sibling blob 'src/lib.rs' must still be diffed correctly, got {:?}",
+            diff_map.get("src/lib.rs")
+        );
+    }
+
+    /// A root whose own base tree object is unreadable must not crash `ls`
+    /// either: `diff_trees` wraps the top-level `diff_recursive` call the
+    /// same way each recursive descent wraps its children.
+    #[test]
+    fn diff_trees_tolerates_missing_root_base() {
+        let dir = TempDir::new().unwrap();
+        let store = LocalStore::for_cache(dir.path());
+
+        let base_root = Hash::compute(b"root-base-never-written");
+        let target_root = store_tree(vec![blob_entry("file.txt", b"content")], &store);
+
+        let (diff_map, unknown) = diff_trees(
+            Some(&base_root),
+            target_root,
+            &store,
+            &ScopeFilter::unscoped(),
+        )
+        .expect("an unreadable root base must not abort ls");
+
+        assert_eq!(unknown, std::collections::HashSet::from([".".to_string()]));
+        assert!(diff_map.is_empty());
+    }
+}

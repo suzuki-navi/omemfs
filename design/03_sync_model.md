@@ -380,7 +380,18 @@ The same lazy tree store backs:
 - `navigate` along a scoped pull's path components into **both** the clone root
   and the remote root,
 - `mark_deleted_tree` over a clone-root subtree deleted on the remote,
-- the conflict-helper "base" side, which resolves a single clone-root blob hash.
+- the conflict-helper "base" side, which resolves a single clone-root blob hash,
+- `ls`'s local (clone-root vs working-tree) diff (see `04_cli_spec.md`, "Local
+  diff self-healing") — the one other command that reads clone-root tree
+  objects the same way pull does.
+
+This is a shared abstraction (`tree_ops::LazyTreeStore`, `pub(crate)`), not
+pull-exclusive: pull's own uses above are unbounded (pull's entire purpose is
+to talk to the remote, so it always waits out a fetch), while `ls` wraps its
+use in an overall timeout and falls back to a local-only, per-subtree-tolerant
+diff on timeout or an unrecoverable remote error, since `ls` is meant to stay
+responsive rather than block on, or abort because of, a slow or unreachable
+remote.
 
 The bounded memory guarantee is preserved: the lazy store never holds a whole
 skeleton in memory — each fetched object is cached to the local store as

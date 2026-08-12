@@ -21,6 +21,7 @@ use crate::store::stats::IoRecord;
 use crate::stub::{self, StubRecord};
 use crate::term::{Output, Styles, paint};
 use crate::tree_ops;
+use crate::tree_ops::LazyTreeStore;
 
 pub struct PullOptions {
     pub work_dir: PathBuf,
@@ -1209,82 +1210,6 @@ fn splice_into_clone_root(
             };
             tree_ops::splice_entry(base_root, components, entry, store)
         }
-    }
-}
-
-/// A read-through object store over the local cache that fetches a single
-/// missing object from the remote (via the pack reader) on a local miss.
-///
-/// After a lazy, stub-aware clone the local cache does not contain the
-/// clone_root tree objects of stubbed subtrees. Pull reads clone_root tree
-/// objects in the diff, in `navigate`, in `mark_deleted_tree`, and when
-/// resolving a conflict base. Routing those reads through this store fetches
-/// only the tree objects actually traversed: the diff compares two subtree
-/// hashes before reading either tree and skips equal-hash subtrees, so a
-/// clone_root read served here fetches only the subtrees that differ from the
-/// remote root. This replaces the previous eager full-skeleton pre-download.
-///
-/// The pack reader returns still-encrypted bytes on a remote hit, so a miss is
-/// decoded with `remote_key` and re-stored in the local cache as plaintext
-/// (the local cache is never encrypted). All subsequent reads of the object are
-/// served locally. Reads are routed through `codec::store_read(.., None)` by
-/// callers, which is correct for both the local-hit (plaintext) path and the
-/// freshly-cached plaintext returned here.
-struct LazyTreeStore<'a> {
-    local: &'a LocalStore,
-    pack_reader: &'a PackReader,
-    remote_key: Option<&'a crate::codec::encrypt::EncryptKey>,
-}
-
-impl<'a> LazyTreeStore<'a> {
-    fn new(
-        local: &'a LocalStore,
-        pack_reader: &'a PackReader,
-        remote_key: Option<&'a crate::codec::encrypt::EncryptKey>,
-    ) -> Self {
-        LazyTreeStore {
-            local,
-            pack_reader,
-            remote_key,
-        }
-    }
-
-    /// Ensure `hash` is present in the local cache as plaintext, fetching it
-    /// from the remote (decoding with `remote_key`) on a miss.
-    fn ensure_local(&self, hash: &Hash) -> Result<(), Error> {
-        if self.local.exists(hash)? {
-            return Ok(());
-        }
-        let plaintext = codec::store_read(self.pack_reader, hash, self.remote_key)?;
-        codec::store_write(self.local, hash, &plaintext, None)?;
-        Ok(())
-    }
-}
-
-impl ObjectStore for LazyTreeStore<'_> {
-    fn exists(&self, hash: &Hash) -> Result<bool, Error> {
-        if self.local.exists(hash)? {
-            return Ok(true);
-        }
-        self.pack_reader.exists(hash)
-    }
-
-    fn size(&self, hash: &Hash) -> Result<u64, Error> {
-        self.ensure_local(hash)?;
-        self.local.size(hash)
-    }
-
-    fn list_with_sizes(&self) -> Result<Vec<(String, u64)>, Error> {
-        self.local.list_with_sizes()
-    }
-
-    fn open_read(&self, hash: &Hash) -> Result<Box<dyn std::io::Read>, Error> {
-        self.ensure_local(hash)?;
-        self.local.open_read(hash)
-    }
-
-    fn write_from(&self, hash: &Hash, reader: &mut dyn std::io::Read) -> Result<(), Error> {
-        self.local.write_from(hash, reader)
     }
 }
 

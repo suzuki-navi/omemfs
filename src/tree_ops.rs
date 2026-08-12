@@ -11,9 +11,11 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::codec;
+use crate::codec::pack::reader::PackReader;
 use crate::dtimer_l1;
 use crate::error::Error;
 use crate::object::{Hash, Tree, TreeEntry};
+use crate::store::local::LocalStore;
 use crate::store::ObjectStore;
 
 thread_local! {
@@ -524,6 +526,95 @@ fn flatten_local_into(
 }
 
 // ---------------------------------------------------------------------------
+// Lazy tree store
+// ---------------------------------------------------------------------------
+
+/// A read-through object store over the local cache that fetches a single
+/// missing object from the remote (via the pack reader) on a local miss.
+///
+/// After a lazy, stub-aware clone the local cache does not contain the
+/// clone_root tree objects of stubbed subtrees. `pull` reads clone_root tree
+/// objects in the diff, in `navigate`, in `mark_deleted_tree`, and when
+/// resolving a conflict base. `ls` reads clone_root tree objects in its local
+/// (working-tree-vs-clone-root) diff. Routing those reads through this store
+/// fetches only the tree objects actually traversed: the diff compares two
+/// subtree hashes before reading either tree and skips equal-hash subtrees,
+/// so a clone_root read served here fetches only the subtrees that differ
+/// from the remote root (for `pull`) or from the working tree (for `ls`).
+/// This replaces an eager full-skeleton pre-download.
+///
+/// The pack reader returns still-encrypted bytes on a remote hit, so a miss is
+/// decoded with `remote_key` and re-stored in the local cache as plaintext
+/// (the local cache is never encrypted). All subsequent reads of the object are
+/// served locally. Reads are routed through `codec::store_read(.., None)` by
+/// callers, which is correct for both the local-hit (plaintext) path and the
+/// freshly-cached plaintext returned here.
+///
+/// Shared by `pull` (unbounded — pull's whole purpose is to talk to the
+/// remote, so it always waits for a fetch to finish) and `ls` (bounded by a
+/// timeout in the caller — see `commands::ls::LOCAL_DIFF_HEAL_TIMEOUT` — since
+/// `ls` is meant to stay responsive against a slow or unreachable remote and
+/// falls back to a local-only, per-subtree-tolerant diff instead of blocking
+/// or aborting; design/04_cli_spec.md "Local diff self-healing").
+pub(crate) struct LazyTreeStore<'a> {
+    local: &'a LocalStore,
+    pack_reader: &'a PackReader,
+    remote_key: Option<&'a crate::codec::encrypt::EncryptKey>,
+}
+
+impl<'a> LazyTreeStore<'a> {
+    pub(crate) fn new(
+        local: &'a LocalStore,
+        pack_reader: &'a PackReader,
+        remote_key: Option<&'a crate::codec::encrypt::EncryptKey>,
+    ) -> Self {
+        LazyTreeStore {
+            local,
+            pack_reader,
+            remote_key,
+        }
+    }
+
+    /// Ensure `hash` is present in the local cache as plaintext, fetching it
+    /// from the remote (decoding with `remote_key`) on a miss.
+    fn ensure_local(&self, hash: &Hash) -> Result<(), Error> {
+        if self.local.exists(hash)? {
+            return Ok(());
+        }
+        let plaintext = codec::store_read(self.pack_reader, hash, self.remote_key)?;
+        codec::store_write(self.local, hash, &plaintext, None)?;
+        Ok(())
+    }
+}
+
+impl ObjectStore for LazyTreeStore<'_> {
+    fn exists(&self, hash: &Hash) -> Result<bool, Error> {
+        if self.local.exists(hash)? {
+            return Ok(true);
+        }
+        self.pack_reader.exists(hash)
+    }
+
+    fn size(&self, hash: &Hash) -> Result<u64, Error> {
+        self.ensure_local(hash)?;
+        self.local.size(hash)
+    }
+
+    fn list_with_sizes(&self) -> Result<Vec<(String, u64)>, Error> {
+        self.local.list_with_sizes()
+    }
+
+    fn open_read(&self, hash: &Hash) -> Result<Box<dyn std::io::Read>, Error> {
+        self.ensure_local(hash)?;
+        self.local.open_read(hash)
+    }
+
+    fn write_from(&self, hash: &Hash, reader: &mut dyn std::io::Read) -> Result<(), Error> {
+        self.local.write_from(hash, reader)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -532,6 +623,7 @@ mod tests {
     use super::*;
     use crate::store::ObjectStore;
     use std::collections::HashMap;
+    use std::io::Read;
     use std::sync::{Arc, Mutex};
 
     struct MemStore {
@@ -949,6 +1041,123 @@ mod tests {
             reads_after - reads_before,
             3,
             "must read only root, a, and b -- never the sibling subtrees"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // LazyTreeStore
+    // -----------------------------------------------------------------------
+
+    /// Build a `(PackWriter, PackReader)` pair over a fresh temp-dir "remote",
+    /// mirroring `codec::pack::reader::tests::setup` -- the writer publishes
+    /// objects into the same on-disk remote the reader (and, through it, a
+    /// `LazyTreeStore`) reads from.
+    fn setup_pack(
+        tmp: &std::path::Path,
+    ) -> (
+        crate::codec::pack::writer::PackWriter,
+        PackReader,
+        LocalStore,
+    ) {
+        use crate::codec::pack::root_pointer::LocalRootPointer;
+        use crate::codec::pack::writer::PackWriter;
+
+        let base = tmp.to_path_buf();
+        std::fs::create_dir_all(base.join("objects")).unwrap();
+        std::fs::create_dir_all(base.join("tmp")).unwrap();
+
+        let local_cache_dir = base.join("local_cache");
+        std::fs::create_dir_all(&local_cache_dir).unwrap();
+        let packcache_dir = base.join("packcache");
+        std::fs::create_dir_all(&packcache_dir).unwrap();
+        let objcache_dir = base.join("objcache");
+        std::fs::create_dir_all(&objcache_dir).unwrap();
+        let writer_objcache_dir = base.join("writer_objcache");
+        std::fs::create_dir_all(&writer_objcache_dir).unwrap();
+
+        let writer = PackWriter::new(
+            Box::new(LocalStore::for_remote(&base)),
+            Box::new(LocalRootPointer::new(base.clone(), None)),
+            LocalStore::for_cache(&writer_objcache_dir),
+            None,
+        )
+        .unwrap();
+
+        let local_cache = LocalStore::for_cache(&local_cache_dir);
+        let reader = PackReader::new(
+            Box::new(LocalStore::for_remote(&base)),
+            local_cache.clone(),
+            LocalStore::for_cache(&packcache_dir),
+            LocalStore::for_cache(&objcache_dir),
+            Box::new(LocalRootPointer::new(base.clone(), None)),
+            None,
+        );
+
+        (writer, reader, local_cache)
+    }
+
+    #[test]
+    fn lazy_tree_store_heals_local_miss_and_caches_locally() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (mut writer, reader, local) = setup_pack(tmp.path());
+
+        // Publish an object on the "remote" only -- the local cache never
+        // sees it directly, mirroring a clone-root tree object a lazy clone
+        // never fetched.
+        let content = b"remote-only tree object content".to_vec();
+        let hash = Hash::compute(&content);
+        writer
+            .write_from(&hash, &mut std::io::Cursor::new(&content))
+            .unwrap();
+        writer.finish(&Hash::compute(b"root")).unwrap();
+
+        assert!(
+            !local.exists(&hash).unwrap(),
+            "object must be absent from the local cache before healing"
+        );
+
+        let lazy = LazyTreeStore::new(&local, &reader, None);
+        assert!(
+            lazy.exists(&hash).unwrap(),
+            "LazyTreeStore.exists must see the remote-only object"
+        );
+        let mut got = Vec::new();
+        lazy.open_read(&hash).unwrap().read_to_end(&mut got).unwrap();
+        assert_eq!(got, content, "must read back byte-identical content");
+
+        // The read-through fetch must have cached the plaintext locally, so a
+        // subsequent read (from `ls`, `pull`, or anything else) is local.
+        assert!(
+            local.exists(&hash).unwrap(),
+            "a local miss healed through LazyTreeStore must be cached locally afterward"
+        );
+        let cached = codec::store_read(&local, &hash, None).unwrap();
+        assert_eq!(cached, content);
+    }
+
+    #[test]
+    fn lazy_tree_store_reports_object_not_found_when_absent_everywhere() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (_writer, reader, local) = setup_pack(tmp.path());
+
+        // Nothing was ever published to the remote or the local cache for
+        // this hash.
+        let hash = Hash::compute(b"never written anywhere");
+        assert!(!local.exists(&hash).unwrap());
+        assert!(!reader.exists(&hash).unwrap());
+
+        let lazy = LazyTreeStore::new(&local, &reader, None);
+        // `Box<dyn Read>` (the `Ok` side) does not implement `Debug`, so
+        // `Result::unwrap_err` (which requires `T: Debug`) cannot be used here.
+        let err = match lazy.open_read(&hash) {
+            Err(e) => e,
+            Ok(_) => panic!("expected an error, got Ok"),
+        };
+        assert!(
+            matches!(err, Error::ObjectNotFound(_)),
+            "a miss on both sides must surface as Error::ObjectNotFound (not panic, \
+             not some other error variant), so callers can tolerate it per-subtree; got {:?}",
+            err
         );
     }
 }

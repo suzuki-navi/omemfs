@@ -546,6 +546,16 @@ By default, `omemfs ls` attempts to read the index root from the origin remote a
 
 The remote check reads only tree objects reachable from the displayed paths (short-circuit: subtrees whose hash matches between `clone_root` and `remote_root` are skipped). Blob content is never downloaded.
 
+**Local diff self-healing**
+
+The local (`X` column) diff compares `clone_root` against the working tree, which requires reading `clone_root`'s own tree objects. After a lazy, stub-aware clone the local `objects/` cache does not hold the clone-root tree objects of stubbed subtrees (see `03_sync_model.md`, "Lazy tree reads"); it can also be missing a clone-root tree object for other reasons, e.g. a subtree the local cache never received during a prior partial/interrupted sync.
+
+When the local diff needs a clone-root tree object that is missing from the local cache, `ls` transparently fetches that single object from the `origin` remote — the same lazy tree store `pull` uses — decodes it, and writes it into the local cache as plaintext before continuing the diff. Because the fetched object lands in the local cache, a subsequent `ls`, `pull`, etc. reads it locally with no further fetch.
+
+This self-healing is bounded by an overall timeout that covers the **whole** local diff walk, not just one object: an unclean local cache can require one remote fetch per differing/missing subtree, not a single round trip, so the budget (currently 15 seconds) is longer than the 5-second `R`-column lookup above. If the walk does not finish within the timeout, or if it fails with an error other than "this particular tree object could not be resolved" (e.g. the remote is unreachable outright, not merely slow), `ls` abandons the remote-backed attempt and falls back to a local-only diff.
+
+Either way — the remote-backed attempt or the local-only fallback — a clone-root tree object that still cannot be resolved (locally, and, when attempted, from the remote) does not abort `ls`: only the affected subtree's own status is left undetermined, shown as `?` in the `X` column (see below) instead of a status derived from the diff — never silently reported as unchanged (` `), which would misleadingly claim the path is in sync. Every other, resolvable part of the tree is diffed and shown normally; a listed ancestor directory of the affected subtree also shows `?` in place of an otherwise-unchanged ` `, since it cannot vouch for a descendant it could not resolve either (unless that ancestor already shows a genuinely detected `M`/`A`/`D` from an unrelated change, which is left as-is).
+
 **Scoped working-tree scan**
 
 When one or more `<path>` arguments are given, `ls` scans **only the working-tree subtrees under those paths**, not the whole working tree. This mirrors the scoped scan that `push <path>` already performs: the per-path subtree is scanned (its files are lstat'd and, on a cache miss, hashed) and the resulting subtree hash is spliced onto the clone root at the path's position to reconstruct a full working-tree root hash. The diff against the clone root then operates on this reconstructed root exactly as in the unscoped case, so all downstream behaviour (`X`/`R`/`Z` columns, `--working`, `-r`) is unchanged.
@@ -583,6 +593,7 @@ Status column `X` (working tree vs clone root):
   `chmod +x` / `chmod -x` with unchanged content). This matches push's notion of
   a dirty tree: the tree hash includes `mode`, so a mode-only change is pushed.
 - `D`: deleted in working tree (in clone root but absent locally)
+- `?`: local status could not be determined for this path. A clone-root tree object needed to diff this path (or a listed ancestor directory's descendant) was missing from the local cache and could not be resolved from the remote either — because the remote genuinely does not have it, the healing fetch timed out, or the remote is unreachable (see "Local diff self-healing" above). Not to be confused with the `Z` column's own `?` (an unrecognised reserved `.omemfs-` file), which is a different column with a different meaning.
 - ` ` (space): unchanged
 
 Stub/conflict column `Z`:
@@ -646,6 +657,17 @@ For a directory, `!` is shown when any descendant has unresolved conflict helper
 ```
 
 Here `src/` shows `!` because `src/main.rs.omemfs-conflict-{base,local,remote}` files exist beneath it.
+
+The `X` column shows `?` when a subtree's local status could not be determined, and propagates to a listed ancestor directory that would otherwise show ` `:
+
+```
+ ?  a3f89b2c     4096 3 2026-05-10          - .
+    a5f89b2c     2048 2 2026-05-10          - other/
+ ?  b4c9852d     1024 2 2026-05-23 09:00     - archive/
+  M c3d4e5f6      512 1 05-15 09:30 05-17 14:22 other/lib.rs
+```
+
+Here `archive/`'s own clone-root tree object could not be read locally and could not be healed from the remote either, so its status is `?` rather than a guess; the root `.` self-row also shows `?` because it cannot vouch for that unresolved descendant. `other/` and `other/lib.rs` are unaffected and show their normal, correctly-resolved status.
 
 ---
 

@@ -1717,3 +1717,120 @@ setup_two_clones_for_ls() {
     [[ -n "$b_line" ]]
     [[ "${b_line:1:1}" == "M" ]]
 }
+
+# ---------------------------------------------------------------------------
+# Local diff self-healing (design/04 "Local diff self-healing")
+#
+# `ls`'s local (X column) diff reads clone-root tree objects. These fixtures
+# simulate a local cache gap on a clone-root tree object directly (deleting
+# the object file from `.omemfs/objects/`) rather than via `omemfs expand`,
+# because a normal stub's clone-root object is never actually read by the
+# diff (an untouched stub's working-tree hash matches its clone-root hash
+# exactly, short-circuiting the diff before any read) -- so `expand`/stub
+# tooling cannot reproduce the gap this feature heals/degrades against.
+# ---------------------------------------------------------------------------
+
+@test "ls: self-heals a local cache miss on a clone-root tree object from the remote" {
+    mkdir -p sub/inner
+    echo "one" > sub/inner/file.txt
+    echo "untouched" > top.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    # Locate sub/inner's clone-root tree hash. It is present both locally and
+    # on the remote (already pushed above).
+    run "$OMEMFS" ls -r --full-hash
+    [ "$status" -eq 0 ]
+    inner_line=$(echo "$output" | grep 'sub/inner/$')
+    [[ -n "$inner_line" ]]
+    inner_hash=$(echo "$inner_line" | grep -oE '[0-9a-f]{64}')
+    [[ -n "$inner_hash" ]]
+
+    # Delete that specific tree object from the LOCAL cache only, simulating a
+    # local cache gap on a non-stub, already-materialised subtree (e.g. a
+    # transient gap from a prior interrupted sync). It remains on the remote.
+    #
+    # The local cache uses an adaptive-depth shard layout (src/store/
+    # objects_dir.rs), unlike the remote's fixed 3-level sharding, so the
+    # object's filename is a variable-length SUFFIX of its hash rather than a
+    # fixed "<2>/<2>/<2>/<rest>" split. Locate it by matching that suffix.
+    obj_path=$(find .omemfs/objects -type f -name "*${inner_hash: -40}" | head -1)
+    [ -n "$obj_path" ]
+    [ -f "$obj_path" ]
+    rm -f "$obj_path"
+
+    # Modify the file so the diff must read sub/inner's (now locally missing)
+    # clone-root tree object to compute its status -- this is the exact gap
+    # `diff_trees_with_heal` self-heals from the remote.
+    echo "one changed" > sub/inner/file.txt
+
+    run "$OMEMFS" ls -r
+    [ "$status" -eq 0 ]
+    # Self-healed: sub/inner/file.txt shows M, not the STATUS_UNKNOWN '?' marker.
+    file_line=$(echo "$output" | grep 'sub/inner/file\.txt$')
+    [[ -n "$file_line" ]]
+    [[ "${file_line:1:1}" == "M" ]]
+    # An unrelated, untouched sibling still shows its correct, unaffected status.
+    top_line=$(echo "$output" | grep ' top\.txt$')
+    [[ -n "$top_line" ]]
+    [[ "${top_line:1:1}" == " " ]]
+
+    # The healed object must now be cached locally again (side effect of
+    # LazyTreeStore), so a later command reads it without another fetch.
+    [ -f "$obj_path" ]
+}
+
+@test "ls: degrades gracefully with '?' when a clone-root tree object is unresolvable" {
+    mkdir -p sub/inner
+    echo "one" > sub/inner/file.txt
+    echo "untouched" > top.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    run "$OMEMFS" ls -r --full-hash
+    [ "$status" -eq 0 ]
+    inner_line=$(echo "$output" | grep 'sub/inner/$')
+    [[ -n "$inner_line" ]]
+    inner_hash=$(echo "$inner_line" | grep -oE '[0-9a-f]{64}')
+    [[ -n "$inner_hash" ]]
+
+    # The local cache uses an adaptive-depth shard layout (src/store/
+    # objects_dir.rs), unlike the remote's fixed 3-level sharding, so the
+    # object's filename is a variable-length SUFFIX of its hash rather than a
+    # fixed "<2>/<2>/<2>/<rest>" split. Locate it by matching that suffix.
+    obj_path=$(find .omemfs/objects -type f -name "*${inner_hash: -40}" | head -1)
+    [ -n "$obj_path" ]
+    [ -f "$obj_path" ]
+    rm -f "$obj_path"
+
+    # Make the remote unreachable too (established pattern in tests/stub.bats
+    # "expand --dry-run does not download"), so the object is unresolvable on
+    # both sides -- exactly the "absent from both" degrade scenario.
+    rm -rf "$REMOTE_DIR"
+
+    echo "one changed" > sub/inner/file.txt
+
+    run "$OMEMFS" ls -r
+    [ "$status" -eq 0 ]
+    # Degraded: sub/inner/ shows the STATUS_UNKNOWN '?' marker, never the
+    # blank ' ' ("in sync") that would misreport it.
+    dir_line=$(echo "$output" | grep 'sub/inner/$')
+    [[ -n "$dir_line" ]]
+    [[ "${dir_line:1:1}" == "?" ]]
+    # `-r` recursion into a directory's children is itself gated on being
+    # able to read that directory's clone-root tree object (ls.rs
+    # `collect_tree_rows`, pre-existing behaviour shared with the stub case:
+    # a stub's clone-root tree object is likewise absent by design, and its
+    # children are never listed either). Since sub/inner's clone-root tree
+    # object is unresolvable here, its child file.txt has no row at all --
+    # it is not shown as STATUS_UNKNOWN, it is simply not listed. The parent
+    # directory's own '?' is what tells the user something under it could
+    # not be determined.
+    ! echo "$output" | grep -q 'sub/inner/file\.txt$'
+    # An unrelated sibling elsewhere in the tree is unaffected and still shows
+    # its correct status -- the command must not abort or blank out the rest
+    # of the tree over one unresolvable subtree.
+    top_line=$(echo "$output" | grep ' top\.txt$')
+    [[ -n "$top_line" ]]
+    [[ "${top_line:1:1}" == " " ]]
+}
