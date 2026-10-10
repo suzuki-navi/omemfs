@@ -234,3 +234,89 @@ teardown() {
     [ -L link ]
     [ "$(readlink link)" = "a.txt" ]
 }
+
+# ---------------------------------------------------------------------------
+# Write-side symlink escape (design/03_sync_model.md, "Write safety: the
+# working-tree write boundary"). The tests above ("Symlink traversal
+# safety" elsewhere in the suite, e.g. conflict.bats / restore.bats) already
+# cover the read/delete side, which is safe because it uses lstat-based
+# `file_type()` and never recurses into a symlinked directory. These tests
+# cover the write side: a directory that the *incoming* tree needs to create
+# or fill in, but that has been replaced on disk by a symlink pointing
+# outside the working tree, must never have content written through it.
+# ---------------------------------------------------------------------------
+
+@test "symlink: pull refuses to materialise a blob through a directory symlink" {
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone1
+    [ "$status" -eq 0 ]
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone2
+    [ "$status" -eq 0 ]
+
+    cd clone1
+    mkdir sub
+    echo "secret content" > sub/child.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    local outside
+    outside="$(mktemp -d)"
+
+    # clone2 has never pulled "sub" -- on disk, it is a symlink pointing
+    # outside the working tree, standing in for the directory the incoming
+    # tree wants to create.
+    cd clone2
+    ln -s "$outside" sub
+    run "$OMEMFS" pull
+    cd ..
+
+    # The write must never follow the symlink into $outside: no file leaks
+    # out, and the symlink itself is left exactly as it was (not silently
+    # replaced by a real directory).
+    [ ! -e "$outside/child.txt" ]
+    [ -L clone2/sub ]
+    [ "$(readlink clone2/sub)" = "$outside" ]
+
+    rm -rf "$outside"
+}
+
+@test "symlink: expand refuses to materialise a stubbed directory through a directory symlink" {
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" src
+    [ "$status" -eq 0 ]
+
+    cd src
+    mkdir sub
+    echo "secret content" > sub/child.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    # A small stub threshold turns "sub" into a single unexpanded directory
+    # stub: dest/sub exists on disk as a real (empty) directory containing
+    # only the `.omemfs-stub` marker -- nothing below it is materialised yet.
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" --stub-threshold 1 dest
+    [ "$status" -eq 0 ]
+    [ -f dest/sub/.omemfs-stub ]
+    [ ! -e dest/sub/child.txt ]
+
+    local outside
+    outside="$(mktemp -d)"
+    # Simulate the directory having been swapped for a symlink after clone:
+    # carry the stub marker over to $outside so `expand`'s stub-record read
+    # (which follows the symlink) still succeeds and proceeds to try to
+    # materialise "child.txt" there.
+    cp dest/sub/.omemfs-stub "$outside/.omemfs-stub"
+    rm -rf dest/sub
+    ln -s "$outside" dest/sub
+
+    cd dest
+    run "$OMEMFS" expand sub
+    cd ..
+
+    # The write must never follow the symlink into $outside.
+    [ ! -e "$outside/child.txt" ]
+    [ -L dest/sub ]
+    [ "$(readlink dest/sub)" = "$outside" ]
+
+    rm -rf "$outside"
+}

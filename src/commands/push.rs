@@ -111,6 +111,7 @@ fn push_full(
     if clone_root.as_ref() == Some(&new_root_hash) {
         colored_println("Nothing to push.", None);
         report_unstable_paths(&unstable_paths);
+        maybe_backup_push_on_no_op(repo, local, clone_root.as_ref(), with_backup, dry_run);
         return Ok(());
     }
 
@@ -131,10 +132,20 @@ fn push_full(
     // the snapshot at start (here, via construction) even though it does not
     // splice onto it.
     let (mut writer, remote_key) = repo.pack_writer(remote_name, &io_record)?;
-    let _ = writer.remote_root_snapshot()?; // touch the snapshot at push start
+    let remote_root_snapshot = writer.remote_root_snapshot()?;
     // Post-clone sync guard (origin only): an absent index root with a synced
     // clone_root is a hard error (design/03).
     post_clone_sync_guard(clone_root.as_ref(), writer.index_root_present())?;
+    // Lost-update precheck (design/03 "Push → Steps" step 4b): reject up
+    // front if the remote has already advanced past clone_root, before
+    // uploading anything. The CAS at finish() only guards divergence during
+    // this push's own window, not divergence that already happened before
+    // this push started.
+    require_remote_not_advanced(
+        clone_root.as_ref(),
+        remote_root_snapshot.as_ref(),
+        &new_root_hash,
+    )?;
     upload_and_finalize(
         local,
         &mut writer,
@@ -431,6 +442,7 @@ fn push_scoped(
     if scoped_results.is_empty() {
         colored_println("Nothing to push.", None);
         report_unstable_paths(&unstable_paths);
+        maybe_backup_push_on_no_op(repo, local, clone_root.as_ref(), with_backup, dry_run);
         return Ok(());
     }
 
@@ -453,16 +465,54 @@ fn push_scoped(
         return Ok(());
     }
 
-    // Ensure intermediate tree objects from remote_root are in local cache for each path.
-    if let Some(ref rr) = remote_root {
-        for sr in &scoped_results {
-            let comps: Vec<&str> = sr.components.iter().map(|s| s.as_str()).collect();
-            tree_ops::ensure_path_in_store(
-                writer.as_remote_store(),
-                local,
-                rr,
-                &comps[..comps.len().saturating_sub(1)],
-            )?;
+    // Pack-aware read-through store over the remote root: the remote's tree
+    // objects (including the root itself) may live inline in another push's
+    // delta index rather than as loose objects, so a raw, non-pack-aware
+    // store (as `writer.as_remote_store()` used to be used here) cannot
+    // resolve them -- see design/03_sync_model.md, "Path-scoped push". This
+    // mirrors how `pull` reads the remote root (`PackReader` /
+    // `LazyTreeStore`), and serves both the per-path divergence check below
+    // and the splice loop further down, which no longer needs a separate
+    // `ensure_path_in_store` pre-fetch: reads and writes through this store
+    // fetch missing objects from the remote on demand and cache them into
+    // `local` (the same underlying `.omemfs/objects/` directory).
+    let (pack_reader, _remote_raw, _remote_key_reader) =
+        repo.pack_reader(remote_name, Some(&io_record))?;
+    let local_concrete = repo.local_store();
+    let lazy = tree_ops::LazyTreeStore::new(&local_concrete, &pack_reader, remote_key.as_ref());
+
+    // Per-path divergence check (design/03 "Path-scoped push" step 2b): a
+    // scoped push must reject only when one of ITS OWN pushed paths has
+    // diverged remotely since this clone's last sync. Remote changes outside
+    // every pushed path are preserved by the splice loop below and must not
+    // block this push. Checked against `remote_root`, the snapshot captured
+    // at push start (not a fresh read), so it observes exactly what the
+    // final CAS is conditioned on.
+    for sr in &scoped_results {
+        let comps: Vec<&str> = sr.components.iter().map(|s| s.as_str()).collect();
+        let remote_at_path = navigate_opt(remote_root.as_ref(), &comps, &lazy)?;
+
+        if sr.is_delete {
+            // Deleting a path already absent on the remote can never lose an
+            // update -- it is the documented no-op case handled later in the
+            // splice loop ("already absent on remote"), regardless of how
+            // stale clone_root is for this path.
+            if remote_at_path.is_none() {
+                continue;
+            }
+        } else if remote_at_path.as_ref() == Some(&sr.scoped_hash) {
+            // This path's own new content already matches what's on the
+            // remote: pushing it changes nothing there, so it cannot lose
+            // anyone's update no matter how stale clone_root is for this
+            // path. This is what makes a scoped push right after `omemfs
+            // conflict accept-remote <path>` a safe no-op even though a
+            // conflicting pull never advanced clone_root for that path.
+            continue;
+        }
+
+        let clone_at_path = navigate_opt(clone_root.as_ref(), &comps, local)?;
+        if remote_at_path != clone_at_path {
+            return Err(Error::CasFailed);
         }
     }
 
@@ -490,7 +540,7 @@ fn push_scoped(
             //   Ok(Some(hash))  → entry removed (the resulting tree may legitimately
             //                     be empty, but it is still a real tree hash).
             let removed_from_remote = match current_remote {
-                Some(ref rr) => match tree_ops::remove_entry(rr, &comps, local)? {
+                Some(ref rr) => match tree_ops::remove_entry(rr, &comps, &lazy)? {
                     Some(new_hash) => {
                         current_remote = Some(new_hash);
                         true
@@ -525,7 +575,7 @@ fn push_scoped(
                 current_remote.as_ref(),
                 &comps,
                 new_entry.clone(),
-                local,
+                &lazy,
             )?);
             current_clone = Some(tree_ops::splice_entry(
                 current_clone.as_ref(),
@@ -558,7 +608,7 @@ fn push_scoped(
                 current_remote.as_ref(),
                 &comps,
                 new_entry.clone(),
-                local,
+                &lazy,
             )?);
             current_clone = Some(tree_ops::splice_entry(
                 current_clone.as_ref(),
@@ -574,7 +624,9 @@ fn push_scoped(
         // remote), possibly with no remote root at all -- nothing to
         // upload/write. Each no-op already printed its own "already absent"
         // note above; matches the pre-merge single-path push_scoped_delete's
-        // no-op return.
+        // no-op return. dry_run is always false here (the dry_run branch
+        // above already returned), but the guard is harmless.
+        maybe_backup_push_on_no_op(repo, local, current_clone.as_ref(), with_backup, dry_run);
         return Ok(());
     }
 
@@ -691,9 +743,8 @@ fn report_unresolved_conflicts<'a>(paths: impl IntoIterator<Item = &'a String>) 
 
 /// L3 upload-failure recovery, the final backstop of design/07 "Seal
 /// invalidation": if an upload step still finds a referenced local blob
-/// missing (`Error::ObjectNotFound` while reading it out of
-/// `.omemfs/objects/` to transfer it), push must not fail silently or upload a
-/// tree that references a missing object. Instead:
+/// unreadable when it tries to transfer it, push must not fail silently or
+/// upload a tree that references a missing object. Instead:
 ///
 /// 1. Clear the `SEALED` bit on every STAT_CACHE entry and write the cache
 ///    back (hashes are untouched — nothing needs to be re-hashed).
@@ -701,11 +752,20 @@ fn report_unresolved_conflicts<'a>(paths: impl IntoIterator<Item = &'a String>) 
 ///    behaves exactly like today's push (every entry re-verified via
 ///    `store.exists()`, missing blobs recaptured from the working tree).
 ///
-/// Any other error is passed through unchanged.
+/// This backstop is gated on `Error::LocalObjectMissing` specifically (design/07
+/// "The governing invariant", point 4) -- the variant `upload_missing_with_progress`
+/// produces exactly when a *local* read out of `.omemfs/objects/` fails while
+/// transferring an object. Any other error, including a plain
+/// `Error::ObjectNotFound` surfaced by some other step of the upload walk
+/// (e.g. a remote-side `remote.exists()` failure), is passed through
+/// unchanged: it says nothing about whether the local SEALED bits are wrong,
+/// so clearing them would not fix it and would only cost every future push a
+/// wasted full `store.exists()` pass.
 fn recover_from_missing_object_if_applicable(omemfs_dir: &std::path::Path, err: Error) -> Error {
-    if !matches!(err, Error::ObjectNotFound(_)) {
-        return err;
-    }
+    let hash = match &err {
+        Error::LocalObjectMissing(h) => h.clone(),
+        _ => return err,
+    };
     let mut cache = StatCache::read(omemfs_dir);
     cache.clear_all_sealed();
     // STAT_CACHE is a pure acceleration cache (design/07): a write failure
@@ -720,8 +780,11 @@ fn recover_from_missing_object_if_applicable(omemfs_dir: &std::path::Path, err: 
     }
     Error::Other(format!(
         "upload failed: a referenced local object is missing ({}).\n\
-         STAT_CACHE seal state has been cleared; run 'omemfs push' again to recapture and retry.",
-        err
+         STAT_CACHE seal state has been cleared; run 'omemfs push' again to recapture and retry.\n\
+         Note: some objects (e.g. tree objects) cannot be regenerated from the working\n\
+         tree alone; if the retry still fails, the local object cache may need to be\n\
+         rebuilt from a fresh scan or a clone.",
+        hash
     ))
 }
 
@@ -738,6 +801,31 @@ fn report_unstable_paths(paths: &std::collections::HashSet<String>) {
     );
     for path in sorted {
         eprintln!("  {}", path);
+    }
+}
+
+/// Attempt a backup push from one of the "nothing changed on origin" early
+/// returns in `push_full` / `push_scoped` (design/07 "Upload-failure
+/// recovery" backup paragraph; design/04 "Backup push behaviour", defect
+/// 7ii). Origin having nothing new to send does not mean backup has caught
+/// up -- in particular, this is the only way a backup push that previously
+/// failed and cleared STAT_CACHE's seals (see `push_to_backup`'s L3 recovery)
+/// ever gets retried while the working tree itself stays unchanged. A
+/// `--dry-run` must never perform any remote write, backup included, so it
+/// is excluded here regardless of `with_backup`. A `None` `clone_root` means
+/// nothing has ever been synced, so there is nothing to back up.
+fn maybe_backup_push_on_no_op(
+    repo: &Repo,
+    local: &dyn ObjectStore,
+    clone_root: Option<&Hash>,
+    with_backup: bool,
+    dry_run: bool,
+) {
+    if !with_backup || dry_run {
+        return;
+    }
+    if let Some(clone_root) = clone_root {
+        push_to_backup(repo, local, clone_root);
     }
 }
 
@@ -790,8 +878,35 @@ fn push_to_backup(repo: &Repo, local: &dyn ObjectStore, clone_root_hash: &Hash) 
             return;
         }
     };
+
+    // Early "already up to date" check (design/04 "Backup push behaviour",
+    // step 0; design/07 "Upload-failure recovery" backup paragraph): avoid a
+    // redundant remote read/write once backup has caught up. This matters
+    // now that a backup push is attempted even when origin had nothing to
+    // send (defect 7ii's convergence fix below), which would otherwise
+    // re-probe an already-current backup on every single push.
+    match writer.remote_root_snapshot() {
+        Ok(Some(ref backup_root)) if backup_root == clone_root_hash => {
+            colored_println("Backup already up to date.", None);
+            return;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("warning: could not read backup remote root: {e}");
+            return;
+        }
+    }
+
     if let Err(e) = upload_missing(local, &writer, clone_root_hash, backup_key.as_ref()) {
-        eprintln!("warning: backup upload failed: {e}");
+        // Reuse the exact same L3 recovery function origin's upload path
+        // uses (design/07 "Upload-failure recovery", backup paragraph): on
+        // `Error::LocalObjectMissing` this clears every SEALED bit and
+        // returns a message describing the recovery; any other error passes
+        // through unchanged. Either way this is a warning only -- backup
+        // failure never affects the exit code (design/04).
+        let omemfs_dir = repo.work_dir.join(".omemfs");
+        let reported = recover_from_missing_object_if_applicable(&omemfs_dir, e);
+        eprintln!("warning: backup upload failed: {reported}");
         return;
     }
     if let Err(e) = writer.finish(clone_root_hash) {
@@ -1043,7 +1158,20 @@ pub fn upload_missing_with_progress(
         let _permit = budget.acquire(hint);
         // Push scanning seals every referenced blob in the local store. Never
         // re-read the live working tree after the root hash has been built.
-        let serialised = codec::store_read(local, hash, None)?;
+        //
+        // Map a local-read `ObjectNotFound` into the dedicated
+        // `LocalObjectMissing` variant (design/07 "The governing invariant",
+        // point 4; "Upload-failure recovery (final backstop)"): this is the
+        // ONLY site that produces it, so the L3 backstop below can trigger on
+        // exactly this failure shape -- a blob this process itself believed
+        // was staged locally turning out not to be readable -- and never on
+        // a remote-side `ObjectNotFound` (e.g. from `remote.exists()` just
+        // above), which means something unrelated to STAT_CACHE's SEALED
+        // bits.
+        let serialised = codec::store_read(local, hash, None).map_err(|e| match e {
+            Error::ObjectNotFound(h) => Error::LocalObjectMissing(h),
+            other => other,
+        })?;
         codec::store_write(remote, hash, &serialised, remote_key)?;
         let u = uploaded.fetch_add(1, Relaxed) + 1;
         if let Some(ph) = phase {
@@ -1176,6 +1304,73 @@ pub fn post_clone_sync_guard(
     }
 }
 
+/// `None` (no root recorded) and `Some(empty_tree_hash)` both mean "nothing
+/// has been pushed to this remote yet" — equivalent states for the lost-
+/// update precheck below (design/03 "Push → Steps" step 4b).
+fn is_empty_root(h: Option<&Hash>) -> bool {
+    match h {
+        None => true,
+        Some(hash) => *hash == crate::object::Tree::empty_tree_hash(),
+    }
+}
+
+/// Whole-root push precheck (design/03 "Push → Steps", step 4b): reject a
+/// push whose remote root (as observed in THIS push's own snapshot, never a
+/// fresh read) has advanced past `clone_root`, before any object is
+/// built/uploaded. This is the primary defense against a lost update: the
+/// CAS at finish time alone cannot catch divergence that already existed
+/// before this push started, because in that case the CAS's own
+/// precondition (the token read at push start still matching at finish) is
+/// trivially satisfied -- nothing changed *during* this push's own window.
+///
+/// `new_root_hash` is the tree this push is actually about to write (already
+/// scanned before this check runs). If it already equals `remote_root`, this
+/// push cannot lose anyone's update no matter how stale `clone_root` is: the
+/// remote's content would be unchanged by it. This is what makes a push
+/// immediately after `omemfs conflict accept-remote` a safe no-op even though
+/// pull's conflict-abort left `clone_root` pinned at the pre-conflict base
+/// (design/03_sync_model.md, "Conflict handling": a conflicting pull never
+/// updates `clone_root`) -- the resolved working tree already matches the
+/// remote exactly (same content, and `accept-remote` restores the remote's
+/// tracked mtime/mode too), so its scanned hash equals `remote_root`.
+///
+/// Both `clone_root`/`remote_root` sides are also normalized so a fresh
+/// remote and a clone that has never synced are treated as equivalent,
+/// allowing the very first push (and a push right after
+/// `clone --new`/`clone --existing`) to proceed.
+fn require_remote_not_advanced(
+    clone_root: Option<&Hash>,
+    remote_root: Option<&Hash>,
+    new_root_hash: &Hash,
+) -> Result<(), Error> {
+    if remote_root == Some(new_root_hash) {
+        return Ok(());
+    }
+    if is_empty_root(clone_root) && is_empty_root(remote_root) {
+        return Ok(());
+    }
+    if clone_root == remote_root {
+        return Ok(());
+    }
+    Err(Error::CasFailed)
+}
+
+/// `tree_ops::navigate`, tolerating a missing root (`None` means "nothing at
+/// this path" without even touching `store`). Used by the per-path
+/// divergence precheck in `push_scoped`, where either side's root may
+/// legitimately be absent (a fresh remote, or a clone that has never
+/// synced).
+fn navigate_opt(
+    root: Option<&Hash>,
+    components: &[&str],
+    store: &dyn ObjectStore,
+) -> Result<Option<Hash>, Error> {
+    match root {
+        None => Ok(None),
+        Some(h) => tree_ops::navigate(h, components, store),
+    }
+}
+
 /// Returns true if `rel` refers to an internal system path that must never be pushed.
 fn is_system_path(rel: &str) -> bool {
     let first = rel.split('/').next().unwrap_or("");
@@ -1215,8 +1410,9 @@ fn colored_println(msg: &str, style: Option<anstyle::Style>) {
 mod tests {
     use super::*;
     use crate::store::local::LocalStore;
+    use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime};
     use tempfile::TempDir;
 
     /// A read-side `ObjectStore` wrapper around a `LocalStore` that:
@@ -1509,6 +1705,128 @@ mod tests {
              should let the worker pool overlap requests (max observed: {})",
             N,
             remote.max_in_flight.load(Ordering::SeqCst)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // L3 trigger precision (design/07 "Upload-failure recovery", defect 5):
+    // only a confirmed *local* read failure (`Error::LocalObjectMissing`) may
+    // trigger the seal-clearing backstop; any other error -- in particular a
+    // remote-side `Error::ObjectNotFound` -- must propagate unchanged and
+    // must not rewrite STAT_CACHE.
+    // -----------------------------------------------------------------------
+
+    /// A store whose `exists()` (and every other call) always fails with a
+    /// fixed `ObjectNotFound`, simulating a remote backend that cannot answer
+    /// an existence probe -- unrelated to whether the *local* copy is
+    /// present.
+    struct AlwaysErrsOnExists {
+        err_msg: String,
+    }
+
+    impl ObjectStore for AlwaysErrsOnExists {
+        fn exists(&self, _hash: &Hash) -> Result<bool, Error> {
+            Err(Error::ObjectNotFound(self.err_msg.clone()))
+        }
+        fn size(&self, _hash: &Hash) -> Result<u64, Error> {
+            Err(Error::ObjectNotFound(self.err_msg.clone()))
+        }
+        fn list_with_sizes(&self) -> Result<Vec<(String, u64)>, Error> {
+            Ok(Vec::new())
+        }
+        fn open_read(&self, _hash: &Hash) -> Result<Box<dyn std::io::Read>, Error> {
+            Err(Error::ObjectNotFound(self.err_msg.clone()))
+        }
+        fn write_from(&self, _hash: &Hash, _reader: &mut dyn std::io::Read) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn upload_missing_local_read_failure_maps_to_local_object_missing() {
+        // A hash that is referenced but never actually stored locally: the
+        // process closure's `codec::store_read(local, hash, None)` call fails
+        // with `ObjectNotFound`, which must be mapped to `LocalObjectMissing`.
+        let local_dir = TempDir::new().unwrap();
+        let local = LocalStore::for_cache(local_dir.path());
+        let remote_dir = TempDir::new().unwrap();
+        let remote = LocalStore::for_remote(remote_dir.path());
+        let hash = crate::object::blob_hash(b"never stored locally");
+
+        let err = upload_missing_with_progress(&local, &remote, &hash, None, None).unwrap_err();
+        assert!(
+            matches!(err, Error::LocalObjectMissing(_)),
+            "a local read failure while uploading must map to Error::LocalObjectMissing, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn upload_missing_propagates_remote_side_object_not_found_unchanged() {
+        // remote.exists() fails with ObjectNotFound (a remote-side probe
+        // failure) BEFORE the local read is ever attempted: this must
+        // propagate as a plain ObjectNotFound, never LocalObjectMissing.
+        let local_dir = TempDir::new().unwrap();
+        let local = LocalStore::for_cache(local_dir.path());
+        let remote = AlwaysErrsOnExists {
+            err_msg: "remote-side probe failure".to_string(),
+        };
+        let hash = crate::object::blob_hash(b"irrelevant content");
+
+        let err = upload_missing_with_progress(&local, &remote, &hash, None, None).unwrap_err();
+        match err {
+            Error::ObjectNotFound(ref m) => assert_eq!(m, "remote-side probe failure"),
+            other => panic!(
+                "a remote-side ObjectNotFound must propagate unchanged, not become \
+                 LocalObjectMissing, got: {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn recover_from_missing_object_only_fires_on_local_object_missing() {
+        let tmp = TempDir::new().unwrap();
+        let omemfs_dir = tmp.path().join(".omemfs");
+        fs::create_dir_all(omemfs_dir.join("objects")).unwrap();
+        let mut cache = StatCache::default();
+        let old_mtime = SystemTime::now() - Duration::from_secs(1000);
+        cache.update(
+            "a.txt".to_string(),
+            old_mtime,
+            10,
+            crate::object::blob_hash(b"a"),
+            true,
+        );
+        cache.write(&omemfs_dir).unwrap();
+        let before = fs::read(omemfs_dir.join("STAT_CACHE")).unwrap();
+
+        // A remote-side ObjectNotFound must NOT clear seals or rewrite
+        // STAT_CACHE at all.
+        let err = recover_from_missing_object_if_applicable(
+            &omemfs_dir,
+            Error::ObjectNotFound("remote object".to_string()),
+        );
+        assert!(
+            matches!(err, Error::ObjectNotFound(_)),
+            "a non-LocalObjectMissing error must pass through unchanged"
+        );
+        let after = fs::read(omemfs_dir.join("STAT_CACHE")).unwrap();
+        assert_eq!(
+            before, after,
+            "STAT_CACHE must not be rewritten for a non-L3-triggering error"
+        );
+
+        // A LocalObjectMissing error MUST clear seals and rewrite STAT_CACHE.
+        let err = recover_from_missing_object_if_applicable(
+            &omemfs_dir,
+            Error::LocalObjectMissing("a".repeat(64)),
+        );
+        assert!(matches!(err, Error::Other(_)));
+        let reloaded = StatCache::read(&omemfs_dir);
+        assert!(
+            !reloaded.is_sealed("a.txt"),
+            "L3 must have cleared every SEALED bit"
         );
     }
 

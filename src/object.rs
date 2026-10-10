@@ -282,6 +282,49 @@ pub fn blob_hash(content: &[u8]) -> Hash {
     Hash::compute(&data)
 }
 
+/// Validate a single tree-entry name before it is ever joined onto a
+/// filesystem path (e.g. `base_dir.join(entry.name())` in `pull`/`tree_ops`).
+///
+/// Rejects:
+/// - the empty string
+/// - `.` or `..` (the reserved "self" / "parent" names)
+/// - any name containing `/` (hierarchy is already encoded by the tree
+///   structure itself; a single entry name must never smuggle in a path
+///   separator, absolute or relative)
+/// - any name containing a NUL byte (not a valid filesystem name component)
+///
+/// `\` (backslash) is deliberately **allowed**: this project targets Linux
+/// (see `CLAUDE.md`), where `\` is not a path separator but an ordinary,
+/// completely legal filename byte. It must be stored and restored verbatim.
+/// Correspondingly, no path-string normalisation anywhere in this codebase
+/// may treat `\` as a separator (e.g. rewrite it to `/`) — doing so would
+/// silently turn a single legitimate entry name into a multi-component path.
+///
+/// See design/01_object_model.md, "Invariants" #5.
+fn validate_entry_name(name: &str) -> Result<(), Error> {
+    if name.is_empty() {
+        return Err(Error::InvalidObject(
+            "tree entry name must not be empty".to_string(),
+        ));
+    }
+    if name == "." || name == ".." {
+        return Err(Error::InvalidObject(format!(
+            "tree entry name must not be {name:?}"
+        )));
+    }
+    if name.contains('/') {
+        return Err(Error::InvalidObject(format!(
+            "tree entry name must not contain a path separator: {name:?}"
+        )));
+    }
+    if name.contains('\0') {
+        return Err(Error::InvalidObject(format!(
+            "tree entry name must not contain a NUL byte: {name:?}"
+        )));
+    }
+    Ok(())
+}
+
 impl Tree {
     /// Hash of the empty tree (`Tree::Normal { entries: [] }`). This is the
     /// value `clone_root` holds when a clone has never successfully synced any
@@ -312,13 +355,28 @@ impl Tree {
     }
 
     /// Deserialise from stored bytes (with or without ED F1 prefix).
+    ///
+    /// Validates every entry name (see [`validate_entry_name`]) before
+    /// returning. This is the single point every tree-reading command goes
+    /// through (`pull`, `expand`, `clone`, `restore`, `ls`, `stats`, `pack`,
+    /// `cat`, and the shared helpers in `tree_ops.rs`), so the check protects
+    /// all of them without any command-specific validation (design/01
+    /// "Invariants" #5).
     pub fn deserialise(data: &[u8]) -> Result<Self, Error> {
         let json = if data.starts_with(&TYPE_TAG_TREE) {
             &data[2..]
         } else {
             data
         };
-        Ok(serde_json::from_slice(json)?)
+        let tree: Tree = serde_json::from_slice(json)?;
+        match &tree {
+            Tree::Normal { entries } => {
+                for entry in entries {
+                    validate_entry_name(entry.name())?;
+                }
+            }
+        }
+        Ok(tree)
     }
 
     /// Compute the object hash: SHA256(ED F1 | tree JSON bytes).
@@ -400,5 +458,131 @@ mod tests {
         let t1 = Tree::Normal { entries: vec![] };
         let t2 = Tree::Normal { entries: vec![] };
         assert_eq!(t1.hash(), t2.hash());
+    }
+
+    // -----------------------------------------------------------------------
+    // Entry name validation (design/01_object_model.md, Invariants #5).
+    //
+    // A hand-built tree with an unsafe entry name is fed straight into
+    // `Tree::deserialise`'s JSON parser, bypassing the normal
+    // `TreeEntry::Blob { name, .. }` construction path entirely -- this is the
+    // only way to exercise validation of an adversarial/corrupted object
+    // (real construction sites always derive `name` from a real filesystem
+    // entry, which can never be empty, "..", or contain '/').
+    // -----------------------------------------------------------------------
+
+    fn tree_json_with_entry_name(name: &str) -> Vec<u8> {
+        // Minimal well-formed blob entry, only `name` varies.
+        let json = format!(
+            r#"{{"kind":"normal","entries":[{{"kind":"blob","name":{},"hash":"{}","mtime":null,"size":0}}]}}"#,
+            serde_json::to_string(name).unwrap(),
+            "a".repeat(64),
+        );
+        json.into_bytes()
+    }
+
+    fn assert_rejected(name: &str) {
+        let data = tree_json_with_entry_name(name);
+        let result = Tree::deserialise(&data);
+        assert!(
+            matches!(result, Err(Error::InvalidObject(_))),
+            "entry name {name:?} should be rejected as InvalidObject, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn deserialise_rejects_empty_entry_name() {
+        assert_rejected("");
+    }
+
+    #[test]
+    fn deserialise_rejects_dot_entry_name() {
+        assert_rejected(".");
+    }
+
+    #[test]
+    fn deserialise_rejects_dotdot_entry_name() {
+        assert_rejected("..");
+    }
+
+    #[test]
+    fn deserialise_rejects_path_traversal_entry_name() {
+        assert_rejected("../../etc/passwd");
+    }
+
+    #[test]
+    fn deserialise_rejects_absolute_path_entry_name() {
+        assert_rejected("/etc/cron.d/x");
+    }
+
+    #[test]
+    fn deserialise_accepts_backslash_in_entry_name() {
+        // `\` is an ordinary Linux filename byte, not a path separator; it
+        // must be stored and restored verbatim (design/01 "Invariants" #5).
+        let data = tree_json_with_entry_name("a\\b");
+        let tree = Tree::deserialise(&data).unwrap();
+        let Tree::Normal { entries } = tree;
+        assert_eq!(entries[0].name(), "a\\b");
+    }
+
+    #[test]
+    fn deserialise_rejects_nul_byte_in_entry_name() {
+        assert_rejected("a\0b");
+    }
+
+    // -------------------------------------------------------------------
+    // Direct `validate_entry_name` unit tests (the function itself, not
+    // just its effect through `Tree::deserialise`).
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn validate_entry_name_accepts_backslash() {
+        assert!(validate_entry_name("a\\b").is_ok());
+    }
+
+    #[test]
+    fn validate_entry_name_rejects_empty() {
+        assert!(validate_entry_name("").is_err());
+    }
+
+    #[test]
+    fn validate_entry_name_rejects_dot() {
+        assert!(validate_entry_name(".").is_err());
+    }
+
+    #[test]
+    fn validate_entry_name_rejects_dotdot() {
+        assert!(validate_entry_name("..").is_err());
+    }
+
+    #[test]
+    fn validate_entry_name_rejects_slash() {
+        assert!(validate_entry_name("a/b").is_err());
+    }
+
+    #[test]
+    fn validate_entry_name_rejects_nul_byte() {
+        assert!(validate_entry_name("a\0b").is_err());
+    }
+
+    #[test]
+    fn deserialise_accepts_ordinary_entry_name() {
+        let data = tree_json_with_entry_name("normal-file.txt");
+        let tree = Tree::deserialise(&data).unwrap();
+        let Tree::Normal { entries } = tree;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name(), "normal-file.txt");
+    }
+
+    #[test]
+    fn deserialise_rejects_bad_name_on_any_entry_not_just_the_first() {
+        // A tree with one valid entry followed by one invalid entry must
+        // still be rejected -- validation must not stop at the first entry.
+        let json = format!(
+            r#"{{"kind":"normal","entries":[{{"kind":"blob","name":"ok.txt","hash":"{}","mtime":null,"size":0}},{{"kind":"symlink","name":"..","target":"x","mtime":null}}]}}"#,
+            "b".repeat(64),
+        );
+        let result = Tree::deserialise(json.as_bytes());
+        assert!(matches!(result, Err(Error::InvalidObject(_))));
     }
 }

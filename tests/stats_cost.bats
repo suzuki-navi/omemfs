@@ -277,3 +277,61 @@ push_some_blobs() {
     orphan_count=$(echo "$output" | grep -A1 '"orphans"' | grep -oE '"count": [0-9]+' | grep -oE '[0-9]+$' | head -1)
     [ "$orphan_count" = "0" ]
 }
+
+# ---------------------------------------------------------------------------
+# Test 7: A pack_detail record written before `bloom_num_bits` existed (the
+# key is absent, so serde's `#[serde(default)]` fills it with 0) must NOT be
+# shown as a healthy bloom filter with "designed capacity 0" and a 100%
+# false-positive rate. `sized_for` (src/codec/pack/bloom.rs) guarantees a real
+# filter always has num_bits >= 1, so 0 unambiguously means "not recorded by
+# this legacy record" -- `omemfs stats` must omit the capacity/FP-rate figures
+# entirely rather than compute and print misleading zero/worst-case numbers,
+# in both the text and --json output.
+# ---------------------------------------------------------------------------
+
+# Append a synthetic legacy pack_detail record (no bloom_num_bits key) to
+# io_stats.jsonl, so it becomes the most recent record carrying pack_detail.
+append_legacy_pack_detail_record() {
+    local jsonl=".omemfs/io_stats.jsonl"
+    printf '%s\n' '{"ts":"2020-01-01T00:00:00Z","cmd":"pack","remote":"origin","exists_found":0,"exists_miss":0,"writes":0,"write_bytes":0,"reads":0,"read_bytes":0,"pack_files_written":0,"pack_sizes_bytes":[],"duration_ms":0,"pack_detail":{"deltas_merged":1,"packs_before":2,"packs_after":1,"consolidated_bytes_in":1000,"consolidated_bytes_out":900,"cold_splits":0,"hot_index_entries":42,"bloom_elements":123,"pack_sizes_after":[900],"orphaned_bytes":500}}' >> "$jsonl"
+}
+
+@test "stats_cost: legacy pack_detail without bloom_num_bits omits capacity/FP-rate in text output" {
+    # A real push gives io_stats.jsonl a first record so the file exists.
+    echo "one" > file1.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    append_legacy_pack_detail_record
+
+    run "$OMEMFS" stats
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Pack effectiveness"* ]]
+    # Still shows the entry/element counts...
+    [[ "$output" == *"hot index"* ]]
+    [[ "$output" == *"42"* ]]
+    [[ "$output" == *"bloom"* ]]
+    [[ "$output" == *"123"* ]]
+    # ...but must NOT compute/display a designed capacity or FP rate for a
+    # record whose bloom_num_bits was never recorded.
+    [[ "$output" != *"designed capacity"* ]]
+    [[ "$output" != *"est. FP rate"* ]]
+}
+
+@test "stats_cost: legacy pack_detail without bloom_num_bits omits capacity/FP-rate keys in --json output" {
+    echo "one" > file1.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    append_legacy_pack_detail_record
+
+    run "$OMEMFS" stats --json
+    [ "$status" -eq 0 ]
+    [[ "$output" == *'"pack_effectiveness"'* ]]
+    [[ "$output" == *'"bloom_elements": 123'* ]]
+    [[ "$output" == *'"hot_index_entries": 42'* ]]
+    # ...but must NOT emit the derived-capacity keys when bloom_num_bits is
+    # unrecorded (0).
+    [[ "$output" != *'"bloom_designed_capacity"'* ]]
+    [[ "$output" != *'"bloom_estimated_fp_rate"'* ]]
+}

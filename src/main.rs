@@ -6,6 +6,7 @@ mod commands;
 pub mod debug;
 mod error;
 mod filter;
+mod fsguard;
 mod fsmeta;
 mod io_stats;
 mod line_merge;

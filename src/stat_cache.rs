@@ -89,6 +89,17 @@ pub struct StatCache {
     /// [`finalize_seal_epoch`](Self::finalize_seal_epoch), which then
     /// generates and persists a fresh marker ID (design/07 "Seal epoch").
     needs_new_epoch: bool,
+    /// Set by `compute_seals_trusted` whenever trust was withheld for this
+    /// scan — an epoch mismatch OR a sampling miss — meaning this scan cannot
+    /// vouch for any SEALED bit it did not itself just (re-)verify (design/07
+    /// "The governing invariant", point 3; "Scoped scans and rotation").
+    /// `compute_seals_trusted` already clears every SEALED bit it can see
+    /// directly (`self.entries`) when this is set; the flag itself is
+    /// consumed by whichever writeback path applies afterwards
+    /// (`write_scoped_merge`) to additionally clear out-of-scope entries
+    /// this scan never loaded. Never set by a read-only scan, which never
+    /// calls `compute_seals_trusted` at all.
+    seals_invalidated: bool,
 }
 
 impl StatCache {
@@ -175,10 +186,22 @@ impl StatCache {
     /// scan) back into the full on-disk cache, then write the merged result.
     ///
     /// The full file is re-read fresh so that out-of-scope entries survive
-    /// byte-for-byte. The in-scope entries from `self` overlay the freshly read
-    /// ones. The write is skipped entirely when `self` is clean (no in-scope
-    /// change since the scoped load), preserving the no-change-scan optimisation
-    /// (design/07).
+    /// byte-for-byte — **except** when `self.seals_invalidated` is set
+    /// (design/07 "Scoped scans and rotation"): this scan's own seal
+    /// verification failed (an epoch mismatch or a sampling miss), so it
+    /// cannot vouch for any SEALED bit it did not itself just verify,
+    /// including the out-of-scope entries it never even loaded. In that case,
+    /// EVERY SEALED bit in the freshly re-read full cache is cleared and the
+    /// new epoch is adopted for the whole cache before the in-scope entries
+    /// are overlaid. When `self.seals_invalidated` is not set (the common
+    /// case: trust held, or this is a read-only writeback that never computed
+    /// trust at all), neither the out-of-scope SEALED bits nor the on-disk
+    /// `seal_epoch` are touched — this also means a read-only scoped
+    /// writeback (`ls`) can never revert a concurrent push's epoch rotation.
+    ///
+    /// The write is skipped entirely when `self` is clean (no in-scope change
+    /// and no seal invalidation since the scoped load), preserving the
+    /// no-change-scan optimisation (design/07).
     ///
     /// `scope_prefix` must be the same prefix passed to `read_scoped`.
     pub fn write_scoped_merge(
@@ -195,18 +218,21 @@ impl StatCache {
             return Ok(false);
         }
         // Reload the full file fresh and overlay the in-scope entries. Any
-        // out-of-scope entry is left exactly as it was on disk.
+        // out-of-scope entry is left exactly as it was on disk, UNLESS this
+        // scan's own seal verification failed (see doc comment above).
         let mut full = Self::read(omemfs_dir);
+        if self.seals_invalidated {
+            // This scan cannot vouch for any SEALED bit it did not itself
+            // just (re-)verify -- clear every entry currently on disk
+            // (in scope or not) and adopt the new epoch for the whole cache
+            // before overlaying the in-scope results (design/07 "Scoped
+            // scans and rotation").
+            full.clear_all_sealed();
+            full.seal_epoch = self.seal_epoch;
+        }
         for (path, entry) in &self.entries {
             full.entries.insert(path.clone(), entry.clone());
         }
-        // Carry `self`'s seal_epoch forward, not the freshly re-read one: a
-        // blob-writing scoped scan may have just rotated it via
-        // `finalize_seal_epoch`, and that rotation must win over the (now
-        // stale) on-disk value (design/07 "Seal epoch"). For every other
-        // caller (no rotation happened) the two values are already identical,
-        // so this is a no-op overwrite.
-        full.seal_epoch = self.seal_epoch;
         full.dirty = true;
         full.write(omemfs_dir)?;
         self.dirty = false;
@@ -343,19 +369,36 @@ impl StatCache {
     ///    generate and persist a fresh marker at the end of the scan.
     /// 2. **Sampling**: when the epoch matches, a fixed-stride sample of up to
     ///    `OMEMFS_SEAL_SAMPLE` (default 256; `0` disables sampling) `sealed`
-    ///    entries is checked against `store.exists()`. Any single miss
-    ///    downgrades trust to `false` for this scan (but does not trigger an
-    ///    epoch rotation — see design/07 "Sampling verification").
+    ///    entries is checked against `blob_fully_cached`. Any single miss
+    ///    downgrades trust to `false` for this scan (but does not, by itself,
+    ///    request a new epoch ID — see design/07 "Sampling verification").
+    ///
+    /// Whichever way trust is withheld, `seals_invalidated` is set and every
+    /// SEALED bit visible in `self.entries` is cleared **immediately** — but
+    /// only after sampling has run, since sampling itself needs to read the
+    /// (not-yet-cleared) `sealed` bits it is checking (design/07 "Rotation's
+    /// invariant and definition"). For a cache loaded via `read_scoped`,
+    /// `self.entries` is only the in-scope slice; clearing out-of-scope
+    /// entries this call cannot see is `write_scoped_merge`'s job, gated on
+    /// `seals_invalidated` (design/07 "Scoped scans and rotation").
     pub fn compute_seals_trusted(&mut self, omemfs_dir: &Path, store: &dyn ObjectStore) {
         let marker = read_seal_epoch_marker(omemfs_dir);
         let epoch_matches = self.seal_epoch != NO_SEAL_EPOCH && marker == Some(self.seal_epoch);
         if !epoch_matches {
             self.seals_trusted = false;
             self.needs_new_epoch = true;
+            self.seals_invalidated = true;
+            self.clear_all_sealed();
             return;
         }
         self.needs_new_epoch = false;
-        self.seals_trusted = self.sample_verify(store);
+        // sample_verify reads `sealed` bits, so it must run BEFORE any clear.
+        let trusted = self.sample_verify(store);
+        self.seals_trusted = trusted;
+        if !trusted {
+            self.seals_invalidated = true;
+            self.clear_all_sealed();
+        }
     }
 
     /// Result of the most recent [`compute_seals_trusted`] call. Defaults to
@@ -365,11 +408,31 @@ impl StatCache {
         self.seals_trusted
     }
 
-    /// Deterministic fixed-stride sample of up to `OMEMFS_SEAL_SAMPLE` sealed
+    /// Deterministic evenly-spaced sample of up to `OMEMFS_SEAL_SAMPLE` sealed
     /// entries (sorted by path, so the check is reproducible in tests — no
-    /// RNG). Returns `false` on the first sampled object found missing;
-    /// `true` if every sampled object exists (including the vacuous case of
-    /// no sealed entries, or sampling disabled via `OMEMFS_SEAL_SAMPLE=0`).
+    /// RNG), each verified via `blob_fully_cached` (design/07 "Depth of the
+    /// local-existence check" — never a bare `store.exists()`, since that
+    /// alone cannot see a missing chunk behind a present manifest). Returns
+    /// `false` on the first sampled blob found not fully cached; `true` if
+    /// every sampled blob is fully cached (including the vacuous case of no
+    /// sealed entries, or sampling disabled via `OMEMFS_SEAL_SAMPLE=0`).
+    ///
+    /// Sample index `k` (`k` in `0..sample_n`) is
+    /// `idx(k) = k * (n - 1) / (sample_n - 1)` (design/07 "Sampling
+    /// verification": evenly-spaced indexing) — not a fixed stride
+    /// `n / sample_n`, which floor-divides the stride itself and can leave
+    /// the back of the sorted list entirely unsampled. This formula always
+    /// includes both `idx(0) = 0` and `idx(sample_n - 1) = n - 1` exactly.
+    ///
+    /// A cumulative **probe budget** of `8 * OMEMFS_SEAL_SAMPLE`
+    /// `store.exists()` calls (counted across every sample's own
+    /// `blob_fully_cached` walk, via `ProbeCounter` below) bounds sampling's
+    /// total cost now that a single sampled blob's depth check can itself
+    /// issue many `exists()` calls (one per chunk). Once the budget is
+    /// exhausted, remaining samples are skipped and treated as trusted rather
+    /// than checked; the first sample is always checked in full regardless of
+    /// budget, so a single pathologically large manifest cannot make sampling
+    /// a complete no-op.
     fn sample_verify(&self, store: &dyn ObjectStore) -> bool {
         let sample_max = seal_sample_size();
         if sample_max == 0 {
@@ -388,11 +451,26 @@ impl StatCache {
 
         let n = sealed_paths.len();
         let sample_n = sample_max.min(n);
-        let stride = n / sample_n; // >= 1, since sample_n <= n
+        let probe_budget: u64 = 8 * sample_max as u64;
+        let mut probes_spent: u64 = 0;
         for k in 0..sample_n {
-            let path = sealed_paths[k * stride];
+            // Evenly-spaced indexing: see doc comment above.
+            let idx = if sample_n == 1 {
+                0
+            } else {
+                k * (n - 1) / (sample_n - 1)
+            };
+            // Probe budget: skip (treat as trusted) once exhausted, but never
+            // skip the very first sample.
+            if k > 0 && probes_spent >= probe_budget {
+                continue;
+            }
+            let path = sealed_paths[idx];
             let entry = &self.entries[path];
-            match store.exists(&entry.hash) {
+            let counter = ProbeCounter::new(store);
+            let result = crate::codec::chunk::blob_fully_cached(&counter, &entry.hash);
+            probes_spent += counter.count();
+            match result {
                 Ok(true) => {}
                 _ => return false,
             }
@@ -420,6 +498,58 @@ impl StatCache {
         self.seal_epoch = new_epoch;
         self.dirty = true;
         self.needs_new_epoch = false;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Probe counter (design/07 "Sampling verification": probe budget)
+// ---------------------------------------------------------------------------
+
+/// Thin `ObjectStore` wrapper that counts `exists()` calls made through it,
+/// used only by [`StatCache::sample_verify`] to measure how many local-
+/// existence probes a single sampled blob's `blob_fully_cached` walk actually
+/// consumes (one per chunk, plus one for the manifest object itself), so the
+/// cumulative probe budget can be enforced across samples without changing
+/// `blob_fully_cached`'s own signature or behaviour for any other caller.
+///
+/// Uses `AtomicU64` rather than `Cell<u64>` for the counter: `ObjectStore`
+/// requires `Send + Sync` (so it can be shared with the scan's worker
+/// threads), and `Cell` is `Send` but not `Sync`, which would make this type
+/// unable to implement `ObjectStore` at all.
+struct ProbeCounter<'a> {
+    inner: &'a dyn ObjectStore,
+    count: std::sync::atomic::AtomicU64,
+}
+
+impl<'a> ProbeCounter<'a> {
+    fn new(inner: &'a dyn ObjectStore) -> Self {
+        ProbeCounter {
+            inner,
+            count: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn count(&self) -> u64 {
+        self.count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl ObjectStore for ProbeCounter<'_> {
+    fn exists(&self, hash: &Hash) -> Result<bool, Error> {
+        self.count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.exists(hash)
+    }
+    fn size(&self, hash: &Hash) -> Result<u64, Error> {
+        self.inner.size(hash)
+    }
+    fn list_with_sizes(&self) -> Result<Vec<(String, u64)>, Error> {
+        self.inner.list_with_sizes()
+    }
+    fn open_read(&self, hash: &Hash) -> Result<Box<dyn std::io::Read>, Error> {
+        self.inner.open_read(hash)
+    }
+    fn write_from(&self, hash: &Hash, reader: &mut dyn std::io::Read) -> Result<(), Error> {
+        self.inner.write_from(hash, reader)
     }
 }
 
@@ -631,6 +761,7 @@ fn parse_v1(bytes: &[u8]) -> Option<StatCache> {
         seal_epoch,
         seals_trusted: false,
         needs_new_epoch: false,
+        seals_invalidated: false,
     })
 }
 
@@ -761,9 +892,10 @@ fn parse_v1_scoped(bytes: &[u8], scope_prefix: &str) -> Option<StatCache> {
         );
     }
 
-    // TRAILER: a scoped read must still carry `seal_epoch` forward correctly
-    // (design/07 "read_scoped/write_scoped_merge でも seal_epoch を正しく
-    // 引き継ぐこと") even though only a slice of entries was decoded above.
+    // TRAILER: a scoped read must still decode `seal_epoch` correctly so it
+    // can be carried forward by the caller (design/07 "Seal epoch (whole-
+    // directory loss)"), even though only a slice of entries was decoded
+    // above.
     let seal_epoch: [u8; SEAL_EPOCH_LEN] = bytes[body_end..body_end + SEAL_EPOCH_LEN]
         .try_into()
         .ok()?;
@@ -774,6 +906,7 @@ fn parse_v1_scoped(bytes: &[u8], scope_prefix: &str) -> Option<StatCache> {
         seal_epoch,
         seals_trusted: false,
         needs_new_epoch: false,
+        seals_invalidated: false,
     })
 }
 
@@ -1416,6 +1549,11 @@ mod tests {
         // stale on-disk value that write_scoped_merge will re-read into `full`).
         scoped.seal_epoch = [0x99; SEAL_EPOCH_LEN];
         scoped.dirty = true;
+        // (defect 3, test d) The new gate on write_scoped_merge's epoch
+        // overwrite is `seals_invalidated`, not just "dirty" -- a real
+        // rotation always sets it via compute_seals_trusted, so this
+        // simulation must set it too.
+        scoped.seals_invalidated = true;
         assert!(scoped.write_scoped_merge(tmp.path(), "dirA").unwrap());
 
         let after = StatCache::read(tmp.path());
@@ -1423,6 +1561,135 @@ mod tests {
             after.seal_epoch,
             [0x99; SEAL_EPOCH_LEN],
             "the rotated epoch must win over the stale re-read value"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Scoped scans and rotation (design/07 "Scoped scans and rotation",
+    // defect 3): a scoped scan whose seal verification failed must clear
+    // every SEALED bit it did not itself re-verify -- including out-of-scope
+    // entries it never even loaded -- and only then adopt the new epoch.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn write_scoped_merge_clears_out_of_scope_sealed_on_epoch_rotation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mtime = mtime_at(1_000_000_000, 0);
+
+        // A full on-disk cache with two directories' worth of sealed entries,
+        // recording an epoch for which NO marker file exists on disk (a
+        // whole-epoch mismatch, e.g. `.seal_epoch` was deleted).
+        let mut full = StatCache::default();
+        full.seal_epoch = [0x11; SEAL_EPOCH_LEN];
+        full.update("dirA/a.rs".to_string(), mtime, 100, fake_hash(0x01), true);
+        full.update("dirB/b.rs".to_string(), mtime, 100, fake_hash(0x02), true);
+        full.write(tmp.path()).unwrap();
+
+        let store = LocalStore::for_cache(tmp.path().join("objects"));
+
+        // A scoped push of dirA ONLY: load scoped, compute trust (must
+        // mismatch: no marker), scan (simulated: re-seal the in-scope
+        // entry), rotate, and write back.
+        let mut scoped = StatCache::read_scoped(tmp.path(), "dirA");
+        scoped.compute_seals_trusted(tmp.path(), &store);
+        assert!(!scoped.seals_trusted());
+        assert!(scoped.needs_new_epoch);
+        assert!(
+            scoped.seals_invalidated,
+            "an epoch mismatch must set seals_invalidated"
+        );
+        assert!(
+            !scoped.is_sealed("dirA/a.rs"),
+            "compute_seals_trusted must have cleared the in-scope entry directly"
+        );
+
+        // The scoped scan re-verifies and re-seals dirA/a.rs (what a real
+        // push_scoped scan does via apply_scanned/mark_sealed).
+        scoped.mark_sealed("dirA/a.rs");
+        scoped.finalize_seal_epoch(tmp.path());
+        assert!(scoped.write_scoped_merge(tmp.path(), "dirA").unwrap());
+
+        let after = StatCache::read(tmp.path());
+        assert!(
+            after.entries["dirA/a.rs"].sealed,
+            "the in-scope entry this scan verified must be sealed again"
+        );
+        assert!(
+            !after.entries["dirB/b.rs"].sealed,
+            "the out-of-scope entry, never verified under the new epoch, must \
+             lose its SEALED bit"
+        );
+        assert_ne!(
+            after.seal_epoch, [0x11; SEAL_EPOCH_LEN],
+            "the epoch must have been rotated"
+        );
+    }
+
+    #[test]
+    fn compute_seals_trusted_full_read_clears_all_sealed_on_mismatch() {
+        // (defect 3, test b) Multi-path / full-read scoped push (or a full
+        // push) loads the WHOLE cache via StatCache::read, so
+        // compute_seals_trusted's own clear_all_sealed already covers every
+        // entry directly -- no separate write_scoped_merge step is needed.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mtime = mtime_at(1_000_000_000, 0);
+        let mut cache = StatCache::default();
+        cache.seal_epoch = [0x22; SEAL_EPOCH_LEN];
+        cache.update("dirA/a.rs".to_string(), mtime, 100, fake_hash(0x01), true);
+        cache.update("dirB/b.rs".to_string(), mtime, 100, fake_hash(0x02), true);
+        // No marker on disk: epoch mismatch.
+        let store = LocalStore::for_cache(tmp.path().join("objects"));
+        cache.compute_seals_trusted(tmp.path(), &store);
+        assert!(
+            !cache.is_sealed("dirA/a.rs"),
+            "full-cache clear must cover every entry, not just an in-scope slice"
+        );
+        assert!(!cache.is_sealed("dirB/b.rs"));
+        assert!(cache.seals_invalidated);
+    }
+
+    #[test]
+    fn write_scoped_merge_readonly_preserves_out_of_scope_sealed_and_epoch() {
+        // (defect 3, test c) A read-only scoped writeback (`ls`) never calls
+        // compute_seals_trusted, so seals_invalidated stays false: it must
+        // not clear any out-of-scope SEALED bit, and it must not revert a
+        // concurrent push's epoch rotation that happened between `ls`'s load
+        // and its writeback.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mtime = mtime_at(1_000_000_000, 0);
+        let mut full = StatCache::default();
+        full.seal_epoch = [0x33; SEAL_EPOCH_LEN];
+        full.update("dirA/a.rs".to_string(), mtime, 100, fake_hash(0x01), true);
+        full.update("dirB/b.rs".to_string(), mtime, 100, fake_hash(0x02), true);
+        full.write(tmp.path()).unwrap();
+
+        let mut scoped = StatCache::read_scoped(tmp.path(), "dirA");
+        assert!(
+            !scoped.seals_invalidated,
+            "a read-only scan never computes seal trust"
+        );
+
+        // Simulate a concurrent push rotating the on-disk epoch after `ls`
+        // loaded its scoped slice but before `ls` writes back.
+        let mut concurrent = StatCache::read(tmp.path());
+        concurrent.seal_epoch = [0x44; SEAL_EPOCH_LEN];
+        concurrent.dirty = true;
+        concurrent.write(tmp.path()).unwrap();
+
+        // `ls`'s own scoped writeback: some in-scope change, but no seal
+        // invalidation.
+        scoped.dirty = true;
+        assert!(scoped.write_scoped_merge(tmp.path(), "dirA").unwrap());
+
+        let after = StatCache::read(tmp.path());
+        assert_eq!(
+            after.seal_epoch,
+            [0x44; SEAL_EPOCH_LEN],
+            "a read-only scoped writeback must not revert a concurrent rotation"
+        );
+        assert!(
+            after.entries["dirB/b.rs"].sealed,
+            "out-of-scope SEALED bit must survive a read-only scoped writeback"
         );
     }
 
@@ -1442,6 +1709,10 @@ mod tests {
         assert!(
             cache.needs_new_epoch,
             "a missing marker must request a fresh epoch"
+        );
+        assert!(
+            cache.seals_invalidated,
+            "an epoch mismatch must set seals_invalidated"
         );
     }
 
@@ -1469,6 +1740,10 @@ mod tests {
         cache.compute_seals_trusted(tmp.path(), &store);
         assert!(cache.seals_trusted());
         assert!(!cache.needs_new_epoch, "a matching epoch needs no rotation");
+        assert!(
+            !cache.seals_invalidated,
+            "trust holding must not set seals_invalidated"
+        );
     }
 
     #[test]
@@ -1534,6 +1809,246 @@ mod tests {
             "sampling failure must not trigger an epoch rotation (design/07: \
              sampling only narrows trust for the current scan)"
         );
+        assert!(
+            cache.seals_invalidated,
+            "a sampling failure must still set seals_invalidated (design/07 \
+             \"Scoped scans and rotation\": both epoch mismatch AND sampling \
+             failure must trigger a full seal-clear, even without a new epoch)"
+        );
+        assert!(
+            !cache.is_sealed("missing.txt"),
+            "compute_seals_trusted must clear the SEALED bit it could not verify"
+        );
+    }
+
+    /// Deterministic pseudo-random byte generator (xorshift64*), mirroring
+    /// `codec::chunk`'s test helper of the same name. Used to build blobs
+    /// large enough that FastCDC reliably splits them into >= 2 chunks
+    /// (CDC_MIN = 1 MiB).
+    fn pseudo_random(seed: u64, len: usize) -> Vec<u8> {
+        let mut state = seed | 1;
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            let v = state.wrapping_mul(0x2545F4914F6CDD1D);
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.truncate(len);
+        out
+    }
+
+    /// Run `f` with `OMEMFS_SEAL_SAMPLE` set to `n` for its duration, holding
+    /// `SEAL_SAMPLE_ENV_LOCK` so concurrent tests (here and in `scan.rs`)
+    /// cannot observe a different value.
+    fn with_seal_sample_size<R>(n: usize, f: impl FnOnce() -> R) -> R {
+        let _guard = SEAL_SAMPLE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("OMEMFS_SEAL_SAMPLE", n.to_string());
+        }
+        let result = f();
+        unsafe {
+            std::env::remove_var("OMEMFS_SEAL_SAMPLE");
+        }
+        result
+    }
+
+    #[test]
+    fn sample_verify_uses_blob_fully_cached_not_shallow_exists() {
+        // (defect 1c) A sampled sealed entry whose blob is a chunked manifest
+        // with the manifest object present but one chunk missing must be
+        // detected -- a shallow `store.exists()` on the manifest hash alone
+        // would say "present" and incorrectly leave trust intact (design/07
+        // "Depth of the local-existence check").
+        let tmp = tempfile::TempDir::new().unwrap();
+        let epoch = [0x77; SEAL_EPOCH_LEN];
+        write_seal_epoch_marker(tmp.path(), &epoch).unwrap();
+        let store = LocalStore::for_cache(tmp.path().join("objects"));
+
+        // A seed empirically confirmed to make FastCDC split a 10 MiB buffer
+        // into >= 2 chunks (also used by an equivalent scan.rs test).
+        let content = pseudo_random(0xABCD_EF01, 10 * 1024 * 1024);
+        let serialised = crate::object::serialise_blob(&content);
+        let hash = crate::object::blob_hash(&content);
+        crate::codec::chunk::store_chunked(&store, &hash, &serialised, None).unwrap();
+        let manifest_raw = crate::codec::store_read(&store, &hash, None).unwrap();
+        let chunk_hashes = crate::object::deserialise_manifest(&manifest_raw)
+            .expect("a 10 MiB pseudo-random blob must be chunked");
+        assert!(chunk_hashes.len() >= 2);
+        let victim = chunk_hashes[0].clone();
+        // Delete only one chunk; the manifest object itself remains present
+        // (LocalStore's flat depth-0 layout stores objects directly as
+        // `<objects_root>/<hash>` below the migration threshold).
+        std::fs::remove_file(tmp.path().join("objects").join(victim.as_str())).unwrap();
+        assert!(store.exists(&hash).unwrap(), "manifest object still present");
+
+        let mut cache = StatCache::default();
+        cache.seal_epoch = epoch;
+        let mtime = mtime_at(1_000_000_000, 0);
+        cache.update(
+            "big.bin".to_string(),
+            mtime,
+            content.len() as u64,
+            hash,
+            true,
+        );
+
+        with_seal_sample_size(8, || {
+            cache.compute_seals_trusted(tmp.path(), &store);
+        });
+        assert!(
+            !cache.seals_trusted(),
+            "sampling must catch a manifest-present-but-chunk-missing blob via \
+             blob_fully_cached, not a shallow store.exists() on the manifest hash"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Sampling stride / probe budget (design/07 "Sampling verification",
+    // defect 4)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sample_verify_evenly_spaced_catches_loss_at_last_entry_for_2m_minus_1() {
+        // Regression test: n = 2*sample_max - 1. The OLD fixed-stride formula
+        // (stride = n / sample_n, floor division) samples indices
+        // {0, stride, 2*stride, ...}, which for this n never reaches the last
+        // sorted entry, so a loss there went undetected. The new
+        // evenly-spaced idx(k) formula always includes index n-1 when
+        // sample_n >= 2.
+        with_seal_sample_size(4, || {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let epoch = [0x81; SEAL_EPOCH_LEN];
+            write_seal_epoch_marker(tmp.path(), &epoch).unwrap();
+            let store = LocalStore::for_cache(tmp.path().join("objects"));
+
+            let sample_max = 4usize;
+            let n = 2 * sample_max - 1; // 7
+            let mut cache = StatCache::default();
+            cache.seal_epoch = epoch;
+            let mtime = mtime_at(1_000_000_000, 0);
+
+            let mut hashes = Vec::with_capacity(n);
+            for i in 0..n {
+                let content = format!("content-{i}").into_bytes();
+                let hash = crate::object::blob_hash(&content);
+                let serialised = crate::object::serialise_blob(&content);
+                crate::codec::chunk::store_chunked(&store, &hash, &serialised, None).unwrap();
+                cache.update(format!("f{i:02}.txt"), mtime, 100, hash.clone(), true);
+                hashes.push(hash);
+            }
+            // Delete ONLY the last (sorted-last) entry's object.
+            let last_hash = &hashes[n - 1];
+            std::fs::remove_file(tmp.path().join("objects").join(last_hash.as_str())).unwrap();
+
+            cache.compute_seals_trusted(tmp.path(), &store);
+            assert!(
+                !cache.seals_trusted(),
+                "evenly-spaced sampling must catch a loss at the last sorted entry \
+                 for n = 2*sample_max - 1, which the old floor-division stride missed"
+            );
+        });
+    }
+
+    #[test]
+    fn sample_verify_boundary_parametric_detects_loss_at_sample_positions() {
+        // n = sample_max, sample_max+1, 2*sample_max-1, 10*sample_max; loss
+        // placed at the FIRST, MIDDLE, and LAST sample position (k = 0,
+        // sample_n/2, sample_n-1) for each -- every one of those positions
+        // must be detected, since idx(k) is exactly what sample_verify
+        // computes.
+        let sample_max = 4usize;
+        for n in [sample_max, sample_max + 1, 2 * sample_max - 1, 10 * sample_max] {
+            let sample_n = sample_max.min(n);
+            let idx_at = |k: usize| -> usize {
+                if sample_n == 1 {
+                    0
+                } else {
+                    k * (n - 1) / (sample_n - 1)
+                }
+            };
+            for &k in &[0usize, sample_n / 2, sample_n - 1] {
+                with_seal_sample_size(sample_max, || {
+                    let tmp = tempfile::TempDir::new().unwrap();
+                    let epoch = [0x91; SEAL_EPOCH_LEN];
+                    write_seal_epoch_marker(tmp.path(), &epoch).unwrap();
+                    let store = LocalStore::for_cache(tmp.path().join("objects"));
+                    let mut cache = StatCache::default();
+                    cache.seal_epoch = epoch;
+                    let mtime = mtime_at(1_000_000_000, 0);
+
+                    let width = n.to_string().len();
+                    let mut hashes = Vec::with_capacity(n);
+                    for i in 0..n {
+                        let content = format!("boundary-{n}-{i}").into_bytes();
+                        let hash = crate::object::blob_hash(&content);
+                        let serialised = crate::object::serialise_blob(&content);
+                        crate::codec::chunk::store_chunked(&store, &hash, &serialised, None)
+                            .unwrap();
+                        cache.update(
+                            format!("f{:0width$}.txt", i, width = width),
+                            mtime,
+                            100,
+                            hash.clone(),
+                            true,
+                        );
+                        hashes.push(hash);
+                    }
+                    let victim_index = idx_at(k);
+                    std::fs::remove_file(
+                        tmp.path().join("objects").join(hashes[victim_index].as_str()),
+                    )
+                    .unwrap();
+
+                    cache.compute_seals_trusted(tmp.path(), &store);
+                    assert!(
+                        !cache.seals_trusted(),
+                        "n={} sample_n={} k={} idx={}: loss at a sample position must be detected",
+                        n,
+                        sample_n,
+                        k,
+                        victim_index
+                    );
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn sample_verify_probe_budget_does_not_panic_or_hang_when_exhausted() {
+        // Several large, genuinely-chunked, genuinely-present blobs: the
+        // probe budget (8 * sample_max) is small relative to the number of
+        // chunks a 10 MiB blob can have, so later samples may run out of
+        // budget and be skipped (treated as trusted) rather than panicking
+        // or looping. This test only asserts the call completes cleanly.
+        with_seal_sample_size(4, || {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let epoch = [0xA1; SEAL_EPOCH_LEN];
+            write_seal_epoch_marker(tmp.path(), &epoch).unwrap();
+            let store = LocalStore::for_cache(tmp.path().join("objects"));
+            let mut cache = StatCache::default();
+            cache.seal_epoch = epoch;
+            let mtime = mtime_at(1_000_000_000, 0);
+
+            for i in 0..4u64 {
+                let content = pseudo_random(0x2000_0000 + i, 10 * 1024 * 1024);
+                let serialised = crate::object::serialise_blob(&content);
+                let hash = crate::object::blob_hash(&content);
+                crate::codec::chunk::store_chunked(&store, &hash, &serialised, None).unwrap();
+                cache.update(
+                    format!("f{i}.bin"),
+                    mtime,
+                    content.len() as u64,
+                    hash,
+                    true,
+                );
+            }
+            cache.compute_seals_trusted(tmp.path(), &store);
+            let _ = cache.seals_trusted();
+        });
     }
 
     #[test]

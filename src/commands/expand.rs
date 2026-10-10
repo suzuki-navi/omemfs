@@ -1,6 +1,5 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -264,19 +263,32 @@ pub fn run(opts: ExpandOptions) -> Result<(), Error> {
                 }
 
                 let abs_path = opts.work_dir.join(rel_path);
-                if let Some(parent) = abs_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                // Streaming materialisation from the local cache (bounded memory).
-                codec::chunk::materialise_to_file(&local, &record.hash, None, &abs_path)?;
+                // Streaming materialisation from the local cache (bounded
+                // memory). `materialise_to_file` (via fsguard) resolves and
+                // creates the parent directory itself.
+                codec::chunk::materialise_to_file(
+                    &opts.work_dir,
+                    &local,
+                    &record.hash,
+                    None,
+                    &abs_path,
+                )?;
 
-                if let Some(mt) = record.mtime {
-                    let ft = FileTime::from_unix_time(mt.timestamp(), mt.timestamp_subsec_nanos());
-                    filetime::set_file_mtime(&abs_path, ft).ok();
+                // The temp + rename in materialise_to_file resets permissions
+                // and mtime, so both must be re-applied after it. Resolved
+                // through fsguard (N2, design/03_sync_model.md "Write
+                // safety: the working-tree write boundary") rather than a
+                // path-based `filetime`/`apply_mode` call.
+                if let Ok((dir, leaf)) =
+                    crate::fsguard::open_leaf(&opts.work_dir, rel_path, false)
+                {
+                    if let Some(mt) = record.mtime {
+                        let ft =
+                            FileTime::from_unix_time(mt.timestamp(), mt.timestamp_subsec_nanos());
+                        dir.set_mtime(&leaf, ft).ok();
+                    }
+                    dir.set_mode(&leaf, &record.mode).ok();
                 }
-                // The temp + rename in materialise_to_file resets permissions —
-                // the mode must be re-applied after it.
-                crate::fsmeta::apply_mode(&abs_path, &record.mode);
 
                 stub::remove(&repo.work_dir, rel_path)?;
                 count += 1;
@@ -495,7 +507,7 @@ fn expand_tree_materialise(
     remote_key: Option<&crate::codec::encrypt::EncryptKey>,
     stub_threshold: u64,
 ) -> Result<usize, Error> {
-    fs::create_dir_all(base_dir)?;
+    crate::fsguard::create_dir_all(work_dir, base_dir)?;
     let mut materialised = 0usize;
 
     let data = codec::ensure_local_then_read(remote, local, tree_hash, remote_key)?;
@@ -553,7 +565,7 @@ fn expand_tree_materialise(
                         remote, local, &hash, remote_key, true,
                     )?;
                 }
-                crate::fsmeta::materialise_blob_at(local, &hash, &abs, &mtime, &mode)?;
+                crate::fsmeta::materialise_blob_at(work_dir, local, &hash, &abs, &mtime, &mode)?;
                 materialised += 1;
             }
             TreeEntry::Tree {
@@ -571,7 +583,7 @@ fn expand_tree_materialise(
                     && !stub::stub_would_be_visible_to_git(&dir_stub_path, work_dir);
                 if keep_stubbed {
                     // Leave as a directory stub.
-                    fs::create_dir_all(&sub_dir)?;
+                    crate::fsguard::create_dir_all(work_dir, &sub_dir)?;
                     stub::write_dir_stub(
                         work_dir,
                         &rel_path,
@@ -609,7 +621,7 @@ fn expand_tree_materialise(
                 #[cfg(unix)]
                 {
                     let link_path = base_dir.join(&name);
-                    crate::fsmeta::write_symlink_atomic(&link_path, &target)?;
+                    crate::fsmeta::write_symlink_atomic(work_dir, &link_path, &target)?;
                     crate::fsmeta::restore_symlink_mtime(&link_path, &mtime);
                 }
                 let _ = target;
@@ -701,7 +713,7 @@ fn lower_one_child(
         TreeEntry::Symlink { target, mtime, .. } => {
             #[cfg(unix)]
             {
-                crate::fsmeta::write_symlink_atomic(&abs_path, target)?;
+                crate::fsmeta::write_symlink_atomic(work_dir, &abs_path, target)?;
                 crate::fsmeta::restore_symlink_mtime(&abs_path, mtime);
             }
             #[cfg(not(unix))]
@@ -722,7 +734,7 @@ fn lower_one_child(
                 if !local.exists(hash)? {
                     crate::commands::push::transfer_objects(remote, local, hash, remote_key, true)?;
                 }
-                crate::fsmeta::materialise_blob_at(local, hash, &abs_path, mtime, mode)?;
+                crate::fsmeta::materialise_blob_at(work_dir, local, hash, &abs_path, mtime, mode)?;
                 Ok(1)
             } else {
                 stub::write(
@@ -753,7 +765,7 @@ fn lower_one_child(
                     hash, &abs_path, work_dir, &rel_path, local, remote, remote_key, 0,
                 )
             } else {
-                fs::create_dir_all(&abs_path)?;
+                crate::fsguard::create_dir_all(work_dir, &abs_path)?;
                 stub::write_dir_stub(
                     work_dir,
                     &rel_path,

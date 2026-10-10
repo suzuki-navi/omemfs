@@ -489,6 +489,112 @@ PY
     rm -rf "$BACKUP_DIR"
 }
 
+# ---------------------------------------------------------------------------
+# push: backup L3 recovery and the --with-backup convergence path
+# (design/07 "Upload-failure recovery", "backup push" paragraph; defect 7)
+# ---------------------------------------------------------------------------
+
+# Configure a second local remote as 'backup' by editing config directly (the
+# interactive 'config add-backup' needs a TTY). Sets BACKUP_DIR.
+configure_backup_remote() {
+    BACKUP_DIR="$(mktemp -d)"
+    python - "$PWD/.omemfs/config" "$BACKUP_DIR" <<'PY'
+import json, sys
+cfg_path, backup_path = sys.argv[1], sys.argv[2]
+with open(cfg_path) as f:
+    cfg = json.load(f)
+cfg["remotes"]["backup"] = {"type": "local", "path": backup_path}
+with open(cfg_path, "w") as f:
+    json.dump(cfg, f, indent=2)
+PY
+}
+
+@test "push --with-backup: local-object-missing on backup upload clears seals, exits 0, and a retry succeeds" {
+    configure_backup_remote
+
+    mkdir -p sealtest
+    for i in 1 2 3 4 5; do
+        echo "content $i" > "sealtest/f$i.txt"
+    done
+    touch -d "2020-01-01 00:00:00" sealtest/f*.txt
+
+    # Plain push (no backup yet): populates origin and seals every entry.
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    hash2="$("$OMEMFS" ls --full-hash sealtest/f2.txt | grep -oE '[0-9a-f]{64}' | head -1)"
+    [ -n "$hash2" ]
+    sum2_before="$(sha256sum sealtest/f2.txt | awk '{print $1}')"
+    [ -f ".omemfs/objects/${hash2}" ]
+    rm -f ".omemfs/objects/${hash2}"
+
+    # The working tree is otherwise unchanged, so origin's own scan must NOT
+    # notice or recapture the missing blob (OMEMFS_SEAL_SAMPLE=1 lets it slip
+    # past sampling) -- origin reports "Nothing to push.", and the NEW
+    # convergence path (defect 7ii) still attempts a backup push, which is
+    # the first time backup has ever seen this content and so tries to
+    # upload everything, including f2.txt's now-missing local blob.
+    run env OMEMFS_SEAL_SAMPLE=1 "$OMEMFS" push --with-backup
+    [ "$status" -eq 0 ]
+    [[ "${output,,}" == *"warning"* ]]
+    [[ "${output,,}" == *"backup"* ]]
+
+    # Retry: STAT_CACHE seals were cleared by backup's own L3 recovery, so
+    # this push's scan re-verifies everything, recaptures f2.txt's blob from
+    # the (untouched) working tree, and backup succeeds.
+    run "$OMEMFS" push --with-backup
+    [ "$status" -eq 0 ]
+    [ -f ".omemfs/objects/${hash2}" ]
+    sum2_after="$(sha256sum sealtest/f2.txt | awk '{print $1}')"
+    [ "$sum2_after" = "$sum2_before" ]
+
+    run "$OMEMFS" clone --existing --url "$BACKUP_DIR" from_backup
+    [ "$status" -eq 0 ]
+    sum2_backup="$(sha256sum from_backup/sealtest/f2.txt | awk '{print $1}')"
+    [ "$sum2_backup" = "$sum2_before" ]
+
+    rm -rf "$BACKUP_DIR"
+}
+
+@test "push --with-backup: backup push is attempted even when origin has nothing to push" {
+    configure_backup_remote
+
+    echo "hello" > file.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    # No local changes at all: origin reports "Nothing to push.", but backup
+    # has never been pushed to yet, so --with-backup must still reach it.
+    run "$OMEMFS" push --with-backup
+    [ "$status" -eq 0 ]
+    [[ "${output,,}" == *"nothing to push"* ]]
+    [[ "$output" == *"Pushed to backup"* ]]
+    [ -f "$BACKUP_DIR/INDEX_ROOT" ]
+
+    rm -rf "$BACKUP_DIR"
+}
+
+@test "push --with-backup: already-up-to-date backup prints a note and does not rewrite" {
+    configure_backup_remote
+
+    echo "hello" > file.txt
+    run "$OMEMFS" push --with-backup
+    [ "$status" -eq 0 ]
+    [ -f "$BACKUP_DIR/INDEX_ROOT" ]
+    local mtime_before
+    mtime_before="$(stat -c %Y "$BACKUP_DIR/INDEX_ROOT")"
+
+    # No changes anywhere: backup is already caught up.
+    run "$OMEMFS" push --with-backup
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Backup already up to date."* ]]
+    local mtime_after
+    mtime_after="$(stat -c %Y "$BACKUP_DIR/INDEX_ROOT")"
+    [ "$mtime_before" = "$mtime_after" ]
+
+    rm -rf "$BACKUP_DIR"
+}
+
 @test "push: second push does not re-upload already-present objects" {
     # Regression guard for the "empty Bloom filter every push" bug. On the
     # first push, the Bloom filter / remote index reflects nothing, so all

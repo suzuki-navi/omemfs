@@ -202,6 +202,7 @@ fn pull_full(
         for path in &conflicts {
             let abs = repo.work_dir.join(path);
             write_conflict_for_path(
+                &repo.work_dir,
                 &abs,
                 path,
                 clone_root.as_ref(),
@@ -233,7 +234,8 @@ fn pull_full(
     )?;
     // Every remaining conflict has already been ruled out above, so it is now
     // safe to write the resolved line-merges directly to the working tree.
-    let merged_paths = write_resolved_line_merges(&resolved_line_merges, &repo.work_dir)?;
+    let merged_paths =
+        write_resolved_line_merges(&resolved_line_merges, &repo.work_dir, &repo.work_dir)?;
     phase_apply.complete(format!("{} paths", changed));
 
     repo.write_clone_root(&remote_root)?;
@@ -601,6 +603,7 @@ fn pull_scoped(
             };
             let clone_scoped_hash = clone_scoped_by_pd[i].as_ref();
             write_conflict_for_path(
+                &repo.work_dir,
                 &abs,
                 path,
                 clone_scoped_hash,
@@ -640,7 +643,11 @@ fn pull_scoped(
             // abort check returned early otherwise), so it is now safe to
             // write this pd's resolved line-merges directly to the working
             // tree.
-            merged_paths.extend(write_resolved_line_merges(&resolved_by_pd[i], &scoped_abs)?);
+            merged_paths.extend(write_resolved_line_merges(
+                &resolved_by_pd[i],
+                &repo.work_dir,
+                &scoped_abs,
+            )?);
         }
         phase.complete(format!("{} paths", total_changed));
     }
@@ -833,6 +840,7 @@ fn entry_source(
 /// Skips a side when its source is None (the path did not exist on that side).
 /// Each side is streamed to its helper file, so no whole-blob buffer is held.
 fn write_conflict_helpers(
+    work_dir: &std::path::Path,
     path: &std::path::Path,
     base: Option<&HelperSource>,
     local: Option<&HelperSource>,
@@ -843,13 +851,13 @@ fn write_conflict_helpers(
         CONFLICT_SUFFIX_BASE, CONFLICT_SUFFIX_LOCAL, CONFLICT_SUFFIX_REMOTE,
     };
     if let Some(src) = base {
-        write_helper_file(path, CONFLICT_SUFFIX_BASE, src, store)?;
+        write_helper_file(work_dir, path, CONFLICT_SUFFIX_BASE, src, store)?;
     }
     if let Some(src) = local {
-        write_helper_file(path, CONFLICT_SUFFIX_LOCAL, src, store)?;
+        write_helper_file(work_dir, path, CONFLICT_SUFFIX_LOCAL, src, store)?;
     }
     if let Some(src) = remote {
-        write_helper_file(path, CONFLICT_SUFFIX_REMOTE, src, store)?;
+        write_helper_file(work_dir, path, CONFLICT_SUFFIX_REMOTE, src, store)?;
     }
     Ok(())
 }
@@ -871,6 +879,7 @@ fn write_conflict_helpers(
 /// its local hit.
 #[allow(clippy::too_many_arguments)]
 fn write_conflict_for_path(
+    work_dir: &std::path::Path,
     abs: &std::path::Path,
     path: &str,
     base_hash: Option<&Hash>,
@@ -888,6 +897,7 @@ fn write_conflict_for_path(
         .transpose()?
         .flatten();
     write_conflict_helpers(
+        work_dir,
         abs,
         base_src.as_ref(),
         local_src.as_ref(),
@@ -902,7 +912,7 @@ fn write_conflict_for_path(
         }
         None => None,
     };
-    build_conflict_meta(base_entry.as_ref(), remote_diff.get(path)).write(abs)?;
+    build_conflict_meta(base_entry.as_ref(), remote_diff.get(path)).write(work_dir, abs)?;
     Ok(())
 }
 
@@ -918,6 +928,7 @@ fn write_conflict_for_path(
 ///   - `WorkingFile(path)`: `io::copy` streams the working-tree file into the
 ///     same atomic temp+rename writer, never reading it whole.
 fn write_helper_file(
+    work_dir: &std::path::Path,
     base_path: &std::path::Path,
     suffix: &str,
     source: &HelperSource,
@@ -927,17 +938,23 @@ fn write_helper_file(
         let s = base_path.to_string_lossy();
         std::path::PathBuf::from(format!("{}{}", s, suffix))
     };
-    if let Some(parent) = helper_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     match source {
         HelperSource::Blob(hash) => {
-            codec::chunk::materialise_to_file(store, hash, None, &helper_path)?;
+            codec::chunk::materialise_to_file(work_dir, store, hash, None, &helper_path)?;
         }
         HelperSource::WorkingFile(file) => {
-            // `&File` implements `Read`, so `io::copy` works without consuming or
-            // mutably borrowing through the enum reference.
-            crate::store::local::atomic_write_with_no_fsync(&helper_path, |writer| {
+            // Same working-tree write boundary as the `Blob` arm (which gets
+            // it via `codec::chunk::materialise_to_file`): `helper_path`
+            // shares its parent directory with `base_path`, so if that
+            // directory has been replaced by a symlink pointing outside
+            // `work_dir`, a plain `io::copy` would otherwise follow it and
+            // write the conflict-helper file outside the working tree. See
+            // design/03_sync_model.md, "Write safety: the working-tree write
+            // boundary". `work_dir` must be the true repository root, not a
+            // scoped subdirectory.
+            crate::fsguard::atomic_write_with(work_dir, &helper_path, |writer| {
+                // `&File` implements `Read`, so `io::copy` works without
+                // consuming or mutably borrowing through the enum reference.
                 std::io::copy(&mut &*file, writer)
                     .map(|_| ())
                     .map_err(Error::Io)
@@ -1149,14 +1166,21 @@ fn resolve_line_merges(
 /// paths. Only call once the pull has passed the conflict-abort check (i.e.
 /// `conflicts` is empty) -- see `resolve_line_merges`. Returns the
 /// repo-root-relative paths written, for the "Line-merged" report block.
+///
+/// `work_dir` must be the true repository root -- for a scoped pull, `base_dir`
+/// can itself be several components below the repository root, and those
+/// intermediate components need checking too; passing `base_dir` as the
+/// fsguard boundary here would wrongly exempt them (design/03_sync_model.md,
+/// "Write safety: the working-tree write boundary").
 fn write_resolved_line_merges(
     resolved: &[ResolvedLineMerge],
+    work_dir: &std::path::Path,
     base_dir: &std::path::Path,
 ) -> Result<Vec<String>, Error> {
     let mut merged_paths = Vec::with_capacity(resolved.len());
     for r in resolved {
         let abs = base_dir.join(&r.key);
-        crate::store::local::atomic_write_with_no_fsync(&abs, |w| {
+        crate::fsguard::atomic_write_with(work_dir, &abs, |w| {
             w.write_all(&r.bytes).map_err(Error::Io)
         })?;
         merged_paths.push(r.repo_rel.clone());
@@ -1234,7 +1258,7 @@ fn apply_diff(
                 DiffEntry::Modified { hash, .. } => {
                     let work_rel = abs_path
                         .strip_prefix(work_dir)
-                        .map(|p| p.to_string_lossy().replace('\\', "/"))
+                        .map(|p| p.to_string_lossy().into_owned())
                         .unwrap_or_else(|_| rel_path.to_string());
                     let updates_stub_only = stub::exists(work_dir, &work_rel) && !abs_path.exists();
                     if !updates_stub_only && !local.exists(hash)? {
@@ -1267,7 +1291,7 @@ fn apply_diff(
         // base_dir != work_dir, so stub operations target the right location).
         let work_rel = abs_path
             .strip_prefix(work_dir)
-            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| rel_path.to_string());
         match change {
             DiffEntry::Added {
@@ -1300,7 +1324,7 @@ fn apply_diff(
                     )?;
                     // Remove any existing real file at abs_path.
                     if abs_path.exists() {
-                        fs::remove_file(&abs_path)?;
+                        crate::fsguard::remove_file_tolerant(work_dir, &abs_path)?;
                     }
                 } else {
                     materialise_blob(
@@ -1341,7 +1365,7 @@ fn apply_diff(
                 changed += 1;
             }
             DiffEntry::AddedEmptyDir => {
-                fs::create_dir_all(&abs_path)?;
+                crate::fsguard::create_dir_all(work_dir, &abs_path)?;
                 changed += 1;
             }
             DiffEntry::Symlink { target, mtime, .. } => {
@@ -1350,16 +1374,22 @@ fn apply_diff(
                 // path, then create the symlink. The existing entry is removed
                 // without following it.
                 stub::remove(work_dir, &work_rel)?;
-                // write_symlink_atomic ensures the parent directory exists.
-                crate::fsmeta::write_symlink_atomic(&abs_path, target)?;
+                // write_symlink_atomic (via fsguard) ensures the parent
+                // directory exists.
+                crate::fsmeta::write_symlink_atomic(work_dir, &abs_path, target)?;
                 // Restore the link's own mtime (lutimes) so a subsequent scan
                 // recomputes the same tree and push stays a no-op.
                 crate::fsmeta::restore_symlink_mtime(&abs_path, mtime);
                 changed += 1;
             }
             DiffEntry::Deleted => {
-                if abs_path.exists() {
-                    fs::remove_file(&abs_path)?;
+                // N1 (design/03_sync_model.md, "Write safety: the working-
+                // tree write boundary"): this delete is driven by the remote
+                // diff, not a fresh on-disk probe, but it is still a lexical
+                // write-tree path that must not follow a symlinked parent.
+                let existed = abs_path.exists();
+                crate::fsguard::remove_file_tolerant(work_dir, &abs_path)?;
+                if existed {
                     changed += 1;
                 }
                 // Remove stub if it existed.
@@ -1385,9 +1415,9 @@ fn apply_diff(
                 if visible_to_git {
                     // Fall back to full materialisation for paths inside a local git
                     // worktree where stub files would be visible to Git.
-                    materialise_tree(hash, &abs_path, store, remote, remote_key)?;
+                    materialise_tree(hash, &abs_path, work_dir, store, remote, remote_key)?;
                 } else {
-                    fs::create_dir_all(&abs_path)?;
+                    crate::fsguard::create_dir_all(work_dir, &abs_path)?;
                     stub::write_dir_stub(
                         work_dir,
                         &work_rel,
@@ -1476,10 +1506,9 @@ fn materialise_blob(
     remote_key: Option<&crate::codec::encrypt::EncryptKey>,
 ) -> Result<(), Error> {
     ensure_blob_local(remote, store, hash, remote_key)?;
-    if let Some(parent) = abs_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    crate::fsmeta::materialise_blob_at(store, hash, abs_path, mtime, mode)?;
+    // `materialise_blob_at` (via fsguard) resolves and creates the parent
+    // directory itself.
+    crate::fsmeta::materialise_blob_at(work_dir, store, hash, abs_path, mtime, mode)?;
     stub::remove(work_dir, work_rel)?;
     Ok(())
 }
@@ -1755,11 +1784,12 @@ fn tree_contains_git_dir(store: &dyn ObjectStore, hash: &Hash) -> bool {
 fn materialise_tree(
     tree_hash: &Hash,
     dir: &std::path::Path,
+    work_dir: &std::path::Path,
     store: &dyn ObjectStore,
     remote: &dyn ObjectStore,
     remote_key: Option<&crate::codec::encrypt::EncryptKey>,
 ) -> Result<(), Error> {
-    fs::create_dir_all(dir)?;
+    crate::fsguard::create_dir_all(work_dir, dir)?;
     let data = codec::store_read(store, tree_hash, None)?;
     let Tree::Normal { entries } = Tree::deserialise(&data)?;
     for entry in &entries {
@@ -1773,13 +1803,13 @@ fn materialise_tree(
             } => {
                 let abs = dir.join(name);
                 ensure_blob_local(remote, store, hash, remote_key)?;
-                crate::fsmeta::materialise_blob_at(store, hash, &abs, mtime, mode)?;
+                crate::fsmeta::materialise_blob_at(work_dir, store, hash, &abs, mtime, mode)?;
             }
             TreeEntry::Tree {
                 name, hash, mtime, ..
             } => {
                 let sub = dir.join(name);
-                materialise_tree(hash, &sub, store, remote, remote_key)?;
+                materialise_tree(hash, &sub, work_dir, store, remote, remote_key)?;
                 if let Some(mt) = mtime {
                     let ft = FileTime::from_unix_time(mt.timestamp(), mt.timestamp_subsec_nanos());
                     filetime::set_file_mtime(&sub, ft).ok();
@@ -1793,7 +1823,7 @@ fn materialise_tree(
                 #[cfg(unix)]
                 {
                     let link_path = dir.join(name);
-                    crate::fsmeta::write_symlink_atomic(&link_path, target)?;
+                    crate::fsmeta::write_symlink_atomic(work_dir, &link_path, target)?;
                     crate::fsmeta::restore_symlink_mtime(&link_path, mtime);
                 }
                 let _ = target;
@@ -2159,6 +2189,7 @@ mod tests {
         let out_dir = TempDir::new().unwrap();
         let base = out_dir.path().join("file.bin");
         write_helper_file(
+            out_dir.path(),
             &base,
             ".omemfs-conflict-remote",
             &HelperSource::Blob(hash),
@@ -2183,6 +2214,7 @@ mod tests {
         let store = LocalStore::for_cache(store_dir.path());
         let file = fs::File::open(&src).unwrap();
         write_helper_file(
+            dir.path(),
             &src,
             ".omemfs-conflict-local",
             &HelperSource::WorkingFile(file),
@@ -2208,6 +2240,7 @@ mod tests {
         let store = LocalStore::for_cache(store_dir.path());
         let file = fs::File::open(&src).unwrap();
         write_helper_file(
+            dir.path(),
             &src,
             ".omemfs-conflict-local",
             &HelperSource::WorkingFile(file),
@@ -2215,6 +2248,52 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fs::read(&helper).unwrap(), b"new content");
+    }
+
+    // `HelperSource::WorkingFile` must refuse to write a conflict-helper file
+    // through a directory that has been replaced by a symlink pointing
+    // outside `work_dir` -- the same guard the `Blob` arm already gets via
+    // `codec::chunk::materialise_to_file` (design/03_sync_model.md, "Write
+    // safety: the working-tree write boundary").
+    #[test]
+    #[cfg(unix)]
+    fn write_helper_file_refuses_working_file_through_symlinked_parent() {
+        let work_dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+
+        // "sub" stands in for a directory the clone_root tree tracks, but on
+        // disk it has been swapped for a symlink pointing outside the
+        // working tree.
+        let sub = work_dir.path().join("sub");
+        std::os::unix::fs::symlink(outside.path(), &sub).unwrap();
+
+        // The "local" file being conflict-helper-copied lives elsewhere; only
+        // `base_path`'s parent -- i.e. `sub` -- matters for the guard.
+        let src_dir = TempDir::new().unwrap();
+        let src = src_dir.path().join("local.txt");
+        fs::write(&src, b"local content").unwrap();
+        let file = fs::File::open(&src).unwrap();
+
+        let store_dir = TempDir::new().unwrap();
+        let store = LocalStore::for_cache(store_dir.path());
+
+        let base_path = sub.join("file.txt");
+        let err = write_helper_file(
+            work_dir.path(),
+            &base_path,
+            ".omemfs-conflict-local",
+            &HelperSource::WorkingFile(file),
+            &store,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::SymlinkEscape(_)),
+            "expected SymlinkEscape, got {err:?}"
+        );
+        assert!(
+            !outside.path().join("file.txt.omemfs-conflict-local").exists(),
+            "conflict-helper content must never be written outside work_dir"
+        );
     }
 
     // -----------------------------------------------------------------------

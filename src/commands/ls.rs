@@ -170,7 +170,7 @@ pub fn run(mut opts: LsOptions) -> Result<(), Error> {
             .iter()
             .map(|p| {
                 let rel = p.strip_prefix(&opts.work_dir).unwrap_or(p);
-                rel.to_string_lossy().replace('\\', "/")
+                rel.to_string_lossy().into_owned()
             })
             .collect();
         let scope_dirty = ScopeFilter::new(&scoped_prefixes_dirty);
@@ -344,7 +344,7 @@ pub fn run(mut opts: LsOptions) -> Result<(), Error> {
             .iter()
             .map(|t| {
                 let rel = t.strip_prefix(&opts.work_dir).unwrap_or(t);
-                rel.to_string_lossy().replace('\\', "/")
+                rel.to_string_lossy().into_owned()
             })
             .collect()
     };
@@ -1229,7 +1229,7 @@ fn scan_scoped_for_ls(
             work_dir.join(path)
         };
         let rel = abs.strip_prefix(work_dir).unwrap_or(&abs);
-        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        let rel_str = rel.to_string_lossy().into_owned();
         let rel_str = rel_str.trim_matches('/').to_string();
 
         // Root scope (".") degenerates to a full scan; do it and return.
@@ -1363,7 +1363,7 @@ fn single_scope_prefix(work_dir: &std::path::Path, paths: &[PathBuf]) -> Option<
         work_dir.join(p)
     };
     let rel = abs.strip_prefix(work_dir).unwrap_or(&abs);
-    let prefix = rel.to_string_lossy().replace('\\', "/");
+    let prefix = rel.to_string_lossy().into_owned();
     let prefix = prefix.trim_matches('/').to_string();
     if prefix.is_empty() {
         None

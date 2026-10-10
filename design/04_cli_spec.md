@@ -398,8 +398,9 @@ omemfs push [<path>...]
 
 1. Scan the working tree and build all tree and blob objects. Store new objects in `.omemfs/objects/`. Conflict helper files are excluded from the scan; their base paths are recorded as a side-effect during scan traversal.
 2. If any conflict helpers were found during the scan → error (see below). Note: paths excluded by `.omemfs-filter` are not scanned, so conflict helper files inside ignored directories do not block the push.
-3. If the new root hash equals the current clone root → `nothing to push`, exit.
+3. If the new root hash equals the current clone root → print `Nothing to push.`. If `--with-backup` is given, `backup` is configured, and this is not a `--dry-run`, still attempt a backup push (see below) before exiting — origin having nothing new to send does not mean backup is caught up, and this is the only way a backup push that failed on a previous run (e.g. cleared STAT_CACHE seals after an `Error::LocalObjectMissing`) ever gets retried when the working tree itself is unchanged. Otherwise exit here.
 4. Read the index root from origin (derived key for encrypted remotes, fixed `INDEX_ROOT` for unencrypted remotes). If the clone root is not the empty-tree hash and the index root is absent, fail with a hard error (see post-clone sync guard in `03_sync_model.md`).
+4b. Compare the remote root just read against `clone_root` (empty-root states normalized as equivalent). If they differ, fail immediately with the "remote has been updated since last sync" error, before uploading anything — see `03_sync_model.md`, "Push → Steps" step 4b.
 5. Upload objects missing from origin.
 6. Update origin's index root with a CAS write conditioned on the raw bytes read in step 4. If the CAS fails → error (see below).
 7. Write the new root hash to `clone_root`.
@@ -409,21 +410,24 @@ omemfs push [<path>...]
 
 Same as full push, but:
 - Conflict-helper detection (step 2) is a side effect of scanning only the specified paths' subtrees, exactly as in full push — it is never a separate filesystem walk of the whole `work_dir`. Consequently, conflict helpers outside the specified paths, or inside a scoped path but excluded by `.omemfs-filter`, do not block the push; a symlink loop elsewhere in the working tree (outside the scanned subtrees) cannot break a scoped push either, since it is never visited.
+- Before touching the remote, each pushed `<path>`'s subtree (as of the snapshot read in step 4) is compared against `clone_root`'s subtree at the same path; if any pushed path's subtree has diverged remotely since this clone's last sync, the push fails with the same "remote has been updated since last sync" error, before uploading anything. Remote changes outside every pushed `<path>` do not trigger this and are preserved by the splice below (see `03_sync_model.md`, "Path-scoped push" step 2b).
 - Only objects reachable from the specified paths' new subtrees are uploaded.
 - The index root is updated by splicing each new subtree into the current remote root tree; all splices are applied before the single CAS write.
 - `clone_root` is updated by applying the same splices to the current clone root tree.
 - If a specified path was deleted locally **and** is already absent on the remote (another client already deleted it), this is a no-op for that path — no error is raised. An informational note is printed: `note: '<path>' is already absent on remote`. This applies to both single-path and multi-path push.
+- If every scoped result turns out to be a no-op deletion (the "already absent on remote" case above, possibly for every path given), the scoped push exits without uploading or writing anything new to origin — but, like the full-push "Nothing to push" case, still attempts a backup push when `--with-backup` was given, `backup` is configured, and this is not a `--dry-run`.
 
 **Backup push behaviour (`--with-backup`)**
 
-A backup push runs after a successful origin push. It uploads the state identified by the current `clone_root` to the `backup` remote:
+A backup push normally runs after a successful origin push, but is also attempted from the "Nothing to push" and "every scoped result was a no-op" early-return paths above, whenever this is not a `--dry-run` — origin having nothing new to send does not mean backup has caught up, and skipping the attempt there would mean a previously failed backup push (see below) never gets retried while the working tree stays unchanged. It uploads the state identified by the current `clone_root` to the `backup` remote:
 
+0. If backup's own current remote root already equals `clone_root`, print `Backup already up to date.` and stop — this avoids a redundant remote read/write on every push once backup has caught up, which matters now that a backup push is attempted even when origin had nothing to send.
 1. Enumerate all objects reachable from `clone_root`.
 2. Upload objects missing from backup.
 3. Read backup's current index root and update it with a CAS write.
 4. `clone_root` is **not** updated (backup is write-only; the sync baseline remains the origin state).
 
-If the backup push fails, a warning is printed but the exit code reflects only the origin push result. The origin push is not rolled back.
+If the backup push fails, a warning is printed but the exit code reflects only the origin push result. The origin push is not rolled back. If the failure is specifically an upload step finding a referenced local object missing (the same failure shape as origin's L3 upload-failure recovery — design/07_stat_cache.md, "Upload-failure recovery"), backup push clears STAT_CACHE's SEALED bits exactly like origin's recovery does, and the warning says so; the next `push --with-backup` (even with an unchanged working tree, thanks to the early-return attempt above) re-verifies everything and retries.
 
 ```
 --with-backup requires a 'backup' remote to be configured.
@@ -451,7 +455,7 @@ Backup remote root: c5d6e7f8
     src/main.rs.omemfs-conflict-local
     src/main.rs.omemfs-conflict-remote
   ```
-- Concurrent push detected on origin:
+- Concurrent push detected on origin. This single error covers two distinct causes (see `03_sync_model.md`, "Push error: concurrent remote update"): (i) divergence detected up front by step 4b / the scoped per-path check — the common case, where someone else already pushed since this clone's last sync — or (ii) a genuine CAS failure at finish time, if another push's CAS-write lands in the narrow window between this push's own up-front check and its own finish. The up-front check is the primary defense against a lost update; the CAS only narrows the residual window to this push's own duration and does not by itself guarantee fast-forward-only semantics. Either way, the same message is shown:
   ```
   error: remote has been updated since last sync
   Run 'omemfs pull' and retry 'omemfs push'.
@@ -760,15 +764,16 @@ omemfs restore [--remote <name>] [--no-remote] [--dry-run] [<path>...]
    - If the path is absent from `clone_root`: plan to delete the file from the working tree (it was locally added and is being discarded).
    - If the path is not present in the working tree and not in `clone_root`: no-op.
    - A path that is currently a stub is reconciled (the stub record is updated to match `clone_root`) instead of being materialised, and nothing below it is planned for fetch — see `08_stub_system.md`, "Stub reconcile (pull and restore)".
-   - Conflict helper files (`<path>.omemfs-conflict-{base,local,remote}`) are always planned for removal when the directory scan for locally-added/unknown entries finds them, regardless of whether `<path>` itself has its own restore or delete action — this also covers `<path>` being an unchanged directory, an unchanged symlink, or a locally-added file that is itself being deleted, none of which plan any action of their own for `<path>`. A conflict helper already removed as a side effect of `<path>`'s own action by the time this delete runs is treated as already-gone, not an error (see "Errors" below).
+   - Conflict helper files (`<path>.omemfs-conflict-{base,local,remote}`) are always planned for removal when the directory scan for locally-added/unknown entries finds them, regardless of whether `<path>` itself has its own restore or delete action — this also covers `<path>` being an unchanged directory, an unchanged symlink, or a locally-added file that is itself being deleted, none of which plan any action of their own for `<path>`. A conflict helper already removed as a side effect of `<path>`'s own action by the time this delete runs is treated as already-gone, not an error (see "Errors" below). The `<path>.omemfs-conflict-meta` metadata sidecar (`omemfs conflict`, "Conflict metadata sidecar") is omemfs-internal bookkeeping rather than user content, exactly like the three helpers and like a stub file: whichever of the two places removes it — the base path's own action, or this directory-scan fallback — removes it silently, with no `deleted:` line and no count increment, the same way an orphaned stub file already is.
+   - The set of distinct object hashes the plan still needs to fetch is deduplicated: several paths that happen to reference identical content (the same hash) contribute exactly one entry to that set, not one per path. This only affects the fetch-phase accounting below; the plan's own action list is unaffected and still has one action per path.
    - While walking, every blob whose object (or, for a chunked blob, any of its chunks) is missing from the local cache is noted, along with any `clone_root` tree object the walk itself could not read locally. A local cache miss here is not evidence that the object was lost — see "Missing objects" below.
    - `--dry-run` stops here: nothing beyond the plan is computed, and nothing is fetched or written.
-2. **Fetch missing objects.** If the plan found nothing missing — every planned blob and every `clone_root` tree object the walk needed was already in the local cache — this phase does nothing at all: no remote is contacted, no configuration is read, and no cloud client is constructed. This preserves today's fully offline behaviour whenever the local cache is already complete. If `--no-remote` was given, this phase is likewise skipped, and the paths that would otherwise have been fetched are instead recorded as unavailable. Otherwise, the missing objects — and any unreadable `clone_root` tree object, healed one level at a time through the same lazy tree store `pull`/`ls` use (`03_sync_model.md`, "Lazy tree reads") — are fetched from `--remote` in one batched, concurrent transfer (the same multi-root batching `expand` uses; see `02_storage_format.md`, "Multi-root batching"). Only objects reachable from `clone_root` are ever fetched — the remote root is never read, and `restore` never advances the working tree beyond what `clone_root` already records.
-3. **Apply.** Every planned action is applied: files are written, deletions performed, stubs reconciled, conflict helper files removed. Every object the plan needs was resolved (or explicitly declared unavailable) in phase 2, so a failure applying the plan is a genuine I/O error, never a cache miss discovered mid-write. A delete is tolerant of the target already being gone (whether because an earlier action in the same plan already removed it, or because it was removed from outside `restore` between plan and apply) rather than treating that as an error. Because phase 2's fetch can take real wall-clock time, a mode-only fix re-checks that its target still exists immediately before applying, and a delete that phase 1 found nothing to remove re-checks whether something now exists to remove; either check finding the working tree changed since phase 1 is reported rather than crashing apply. This is a cheap presence check only — `restore` does not re-verify byte-for-byte content that phase 1 already found matching.
+2. **Fetch missing objects.** If the plan found nothing missing — every planned blob and every `clone_root` tree object the walk needed was already in the local cache — this phase does nothing at all: no remote is contacted, no configuration is read, and no cloud client is constructed. This preserves today's fully offline behaviour whenever the local cache is already complete. If `--no-remote` was given, this phase is likewise skipped, and the paths that would otherwise have been fetched are instead recorded as unavailable. Otherwise, the missing objects — and any unreadable `clone_root` tree object, healed through the same lazy tree store `pull`/`ls` use (`03_sync_model.md`, "Lazy tree reads"), with every hash still unresolved at the start of a healing pass fetched concurrently rather than one at a time — are fetched from `--remote` in one batched, concurrent transfer (the same multi-root batching `expand` uses; see `02_storage_format.md`, "Multi-root batching"). Only objects reachable from `clone_root` are ever fetched — the remote root is never read, and `restore` never advances the working tree beyond what `clone_root` already records.
+3. **Apply.** Every planned action is applied: files are written, deletions performed, stubs reconciled, conflict helper files (and the metadata sidecar) removed. Every object the plan needs was resolved (or explicitly declared unavailable) in phase 2, so an error applying an action is a genuine I/O error, never a cache miss discovered mid-write. A delete is tolerant of the target already being gone (whether because an earlier action in the same plan already removed it, or because it was removed from outside `restore` between plan and apply) rather than treating that as an error. Because phase 2's fetch can take real wall-clock time, a mode-only fix re-checks that its target still exists immediately before applying, and a delete that phase 1 found nothing to remove re-checks whether something now exists to remove; either check finding the working tree changed since phase 1 is reported rather than crashing apply. This is a cheap presence check only — `restore` does not re-verify byte-for-byte content that phase 1 already found matching. If the on-disk type at a path has changed since phase 1 planned a delete for it — for example, a stale file-type stub record whose path is now actually a directory — that mismatch is detected before the delete runs (see "Errors" below): restore never turns a "delete one file" action into a recursive directory delete, so a non-empty directory found where a file was expected fails that one path rather than being removed wholesale. An error applying **any** action — this type-mismatch case or any other genuine I/O failure — is reported per path (see "Errors" below) and does not stop the rest of Apply: every other planned action in the same run is still attempted.
 
 `clone_root` is **not** modified by `restore`, and the remote root is never read.
 
-This operation is the inverse of local edits: after `restore`, the working tree at `<path>` matches the clone root exactly, except for any path reported `unavailable:`, which is left as it was found. Any conflict helper files for restored paths are removed as part of the restore.
+This operation is the inverse of local edits: after `restore`, the working tree at `<path>` matches the clone root exactly, except for any path reported `unavailable:` or `failed:`, which is left as it was found. Any conflict helper files (and the metadata sidecar) for restored paths are removed as part of the restore, without being reported as deletions of user content.
 
 **Missing objects**
 
@@ -783,7 +788,7 @@ unavailable: build/libs/app.war
 1 path(s) restored, 1 path(s) unavailable.
 ```
 
-Each `unavailable:` line names the working-tree **path**, never a bare object hash. This matters most for a chunk hash: a chunk is never referenced by any tree entry, so there is no way to work backward from a chunk hash alone to the path that needed it. `restore` exits non-zero whenever the `unavailable:` list is non-empty, even though every other applicable action was applied.
+Each `unavailable:` line names the working-tree **path**, never a bare object hash. This matters most for a chunk hash: a chunk is never referenced by any tree entry, so there is no way to work backward from a chunk hash alone to the path that needed it. `restore` exits non-zero whenever the `unavailable:` list is non-empty, even though every other applicable action was applied. The repository root itself, whose working-tree path is internally the empty string, is never rendered as a blank in an action line — an `unavailable:` (or `would fetch:`) line for the root prints `unavailable: .` (or `would fetch: .`), never a bare `unavailable:` with nothing after it.
 
 A fetch failure that is *not* simply an object not yet fetched into this clone — an authentication or DEK mismatch, corrupted/invalid remote data, a misconfigured or mistyped `--remote`, a full local disk, and so on — is never silently folded into an ordinary `unavailable:` line with no further explanation. `restore` still applies every action that does not need the failed fetch and reports `unavailable:` for the rest exactly as above, but it additionally prints one line naming the real cause after the summary:
 
@@ -795,7 +800,7 @@ unavailable: build/libs/app.war
 warning: fetch from 'typo-ed-remote' failed: remote 'typo-ed-remote' not configured
 ```
 
-This warning is omitted for the ordinary "not yet fetched" case (including `--no-remote` and a genuinely unreachable remote) — those are expected and already fully explained by the `unavailable:` lines themselves.
+This warning is omitted for `--no-remote` and for the plain "not yet fetched" case (`ObjectNotFound` — the object genuinely has never been pulled into this clone). For a *genuinely unreachable* remote, the behaviour is backend-dependent by design, not a bug: the local-directory backend (the one `restore`'s own test suite exercises against an unreachable remote) maps that failure to an ordinary I/O error, which is treated the same as the plain cache-miss case and stays silent; a cloud backend instead surfaces the cloud provider's own transport error, which is not classified as recoverable and therefore does produce this warning line, because for a cloud backend that error is the only clue to the real cause — DNS failure, an expired credential, throttling, and so on — and folding it into a bland `unavailable:` would make a genuinely actionable problem indistinguishable from an ordinary "not fetched yet" cache miss. Building a classification broad enough to treat every cloud SDK's transient/network errors as uniformly "recoverable" as the local backend's was judged disproportionate effort for the risk of silencing a genuinely actionable error (bad credentials, for example) along with it. Regardless of backend, the `unavailable:` lines, the summary counts, and the non-zero exit code are identical — only whether this one extra warning line appears differs.
 
 `--dry-run` reports the same missing objects without fetching anything, so it doubles as a pre-flight check of how much a subsequent `restore` would need to download:
 
@@ -805,6 +810,8 @@ $ omemfs restore --dry-run
 would fetch: build/libs/app.war
 2 path(s) would be restored.
 ```
+
+When several paths reference the same object, the fetch phase still transfers it once; the "N object(s) fetched" figure that phase 2 reports (visible with progress output) therefore counts distinct objects, not paths — restoring ten identical-content files that all need the same one missing blob reports `1 object(s) fetched`, not `10`.
 
 **Output example**
 
@@ -816,11 +823,22 @@ $ omemfs restore src/lib.rs docs/
 3 path(s) restored.
 ```
 
+A run that has both an object it could not resolve and an unrelated genuine I/O error on some other path reports both, and both are still counted in the final summary and reflected in the exit code:
+
+```
+$ omemfs restore --no-remote
+  restored: src/lib.rs
+unavailable: build/libs/app.war
+failed: docs/readme.md: Is a directory (os error 21)
+1 path(s) restored, 1 path(s) unavailable, 1 path(s) failed.
+```
+
 **Errors**
 
 - No `clone_root` (repository never synced): `error: no clone_root — repository has never been synced`
 - Path not inside work_dir: `error: path '<path>' is not inside the working tree`
 - An object needed to complete the restore could not be fetched (remote unreachable, not configured, or `--no-remote`): the affected path is listed under `unavailable:` in the summary and the command exits non-zero — see "Missing objects" above. `restore` never reports `error: object not found: <hash>`: a bare hash names no path a user could act on, and, per "Missing objects" above, a cache miss during restore's plan phase is not evidence that the object was lost.
+- A genuine I/O error applying one action — a permission error, a path whose on-disk type no longer matches what the plan expected (e.g. a stale stub record for a path that turned out to be a non-empty directory), or any other failure that is not itself a missing-object case — is printed as `failed: <path>: <cause>` and counted separately from `unavailable:`. It does **not** abort the rest of Apply: every other planned action in the same run, related or not, is still attempted. `restore` exits non-zero whenever there is at least one `unavailable:` line, at least one `failed:` line, or both; the summary line and the exit code both account for the combined total. A mid-action failure can leave that one specific path partially applied (e.g. a file half-written) — the same risk any single action already carried on its own before this behaviour existed; the difference is that it no longer takes any other, unrelated path down with it.
 
 ---
 
@@ -1580,7 +1598,7 @@ omemfs conflict <subcommand> [--dry-run] [<path>...]
 - `accept-local` — adopt the local version and remove helper files
 - `accept-base` — adopt the base (clone root) version and remove helper files
 
-**Conflict metadata sidecar.** Alongside the three `<path>.omemfs-conflict-{base,local,remote}` helpers, `pull` writes one `<path>.omemfs-conflict-meta` sidecar (JSON) recording the tracked metadata (modification time and the executable-bit mode) of the **base** and **remote** sides. omemfs tracks `mtime` and `mode` in each tree entry, so they are part of the entry's hash. Without restoring them, `accept-remote` / `accept-base` would leave the resolved file with a fresh `mtime`, so its tree-entry hash would differ from the remote / clone root and the next `push` would needlessly re-upload it (and mint a new remote root) even though the content is identical. The sidecar lets `accept` restore the accepted side's metadata so the resolution is idempotent against that root. The **local** side is intentionally not recorded: `accept-local` keeps the working-tree file as-is, so its metadata needs no restoration. The sidecar is excluded from scan/push exactly like the conflict helpers, and is removed by `accept` and `clean`.
+**Conflict metadata sidecar.** Alongside the three `<path>.omemfs-conflict-{base,local,remote}` helpers, `pull` writes one `<path>.omemfs-conflict-meta` sidecar (JSON) recording the tracked metadata (modification time and the executable-bit mode) of the **base** and **remote** sides. omemfs tracks `mtime` and `mode` in each tree entry, so they are part of the entry's hash. Without restoring them, `accept-remote` / `accept-base` would leave the resolved file with a fresh `mtime`, so its tree-entry hash would differ from the remote / clone root and the next `push` would needlessly re-upload it (and mint a new remote root) even though the content is identical. The sidecar lets `accept` restore the accepted side's metadata so the resolution is idempotent against that root. The **local** side is intentionally not recorded: `accept-local` keeps the working-tree file as-is, so its metadata needs no restoration. The sidecar is excluded from scan/push exactly like the conflict helpers, and is removed by `accept`, `clean`, and `restore`.
 
 ---
 
@@ -1721,7 +1739,7 @@ $ omemfs conflict accept-base docs/readme.md
 #### Relationship to other commands
 
 - **`push`**: errors out if any conflict helper files exist in the working tree. Resolve all conflicts before pushing.
-- **`restore <path>`**: discards local changes and also removes any conflict helper files for the restored paths.
+- **`restore <path>`**: discards local changes and also removes any conflict helper files, and the metadata sidecar, for the restored paths — including when restoring a single conflicted path, not only on a whole-tree restore. Both are omemfs-internal bookkeeping rather than user content, so this removal is never reported as a `deleted:` line and never counted in the summary, matching how an orphaned stub file is already handled.
 - **`ls`**: the `Z` column shows `!` for files (and their ancestor directories) that have conflict helper files.
 
 After resolving all conflicts with `omemfs conflict accept-*` or by editing the originals manually, run `omemfs push` to commit the resolved state.

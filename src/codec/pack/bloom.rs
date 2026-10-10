@@ -39,6 +39,21 @@ pub const FP_RATE: f64 = 0.01;
 /// repository that has never run `omemfs pack` sees no behavioural change.
 pub const MIN_CAPACITY: u64 = 100_000;
 
+/// Ceiling on any capacity `capacity_for` produces, and on the `element_count`
+/// it will treat as a meaningful capacity hint. Matches the last row of
+/// design/02 "Size at p = 1% false-positive rate" (100 M elements, ~114 MiB).
+///
+/// `element_count` is an 8-byte field inside the Bloom filter's plaintext
+/// header (design/02 "Bloom filter file format") with no range check of its
+/// own at deserialise time -- it is fully controlled by whoever wrote the
+/// remote object, so a corrupt or hostile filter can set it to any `u64`,
+/// including `u64::MAX`. Without this ceiling, a fallback capacity hint
+/// derived from such a value (design/02 "Bounding the capacity (hostile and
+/// corrupt filters)") could demand a bit array sized for terabytes, aborting
+/// the process on allocation failure. See `capacity_for` for where this
+/// bound is enforced.
+pub const MAX_CAPACITY: u64 = 100_000_000;
+
 /// Margin multiplier applied to the observed element count before rounding up
 /// to the nearest 1-2-5 ladder step. A filter built for `capacity_for(n)`
 /// stays at its designed false-positive rate until the element count it was
@@ -47,19 +62,38 @@ const CAPACITY_MARGIN_NUMERATOR: u128 = 3;
 const CAPACITY_MARGIN_DENOMINATOR: u128 = 2;
 
 /// The designed capacity for a filter that must hold `element_count` elements
-/// at `FP_RATE`, per design/02 "Filter sizing":
+/// at `FP_RATE`, per design/02 "Filter sizing" and "Bounding the capacity
+/// (hostile and corrupt filters)":
 ///
 /// ```text
-/// capacity_for(n) = ladder_ceil(max(n, 1) * 3 / 2), floored at MIN_CAPACITY
+/// capacity_for(n) = clamp(ladder_ceil(clamp(n, 1, MAX_CAPACITY) * 3 / 2), MIN_CAPACITY, MAX_CAPACITY)
 /// ladder = {1, 2, 5} x 10^k   (100_000, 200_000, 500_000, 1_000_000, ...)
 /// ```
 ///
-/// Monotonically non-decreasing in `element_count`. Never returns less than
-/// `MIN_CAPACITY`, even for `element_count == 0`.
+/// Monotonically non-decreasing in `element_count` across the *entire* `u64`
+/// domain, and always in `[MIN_CAPACITY, MAX_CAPACITY]`.
+///
+/// The input clamp (`clamp(n, 1, MAX_CAPACITY)`, applied before the x1.5
+/// margin) keeps `element_count` -- a value that, on the fallback path in
+/// `writer.rs::load_remote_bloom`, can be an adversarially or corruptly large
+/// `u64` read straight from an untrusted remote object -- from ever reaching
+/// the margin multiplication at a magnitude anywhere near `u64::MAX`. This
+/// also fixes a latent monotonicity bug that unclamped multiplication would
+/// have: near `u64::MAX`, `n * 3` overflows `u128` in a way that, combined
+/// with the subsequent `as u64` truncation in the old code, could round-trip
+/// to a *smaller* value than a slightly lower `n` would produce.
+///
+/// The output clamp (`.clamp(MIN_CAPACITY, MAX_CAPACITY)`, applied after
+/// `ladder_ceil`) is still needed even with the input clamp in place, because
+/// `ladder_ceil` can round a clamped input up past `MAX_CAPACITY` (e.g.
+/// `ladder_ceil(150_000_000) == 200_000_000`); this clips that back down.
+/// Clipping (never erroring, never falling back to `MIN_CAPACITY`) is what
+/// keeps the function monotonic everywhere -- see design/02 "Rejected
+/// alternatives" for why the other options were not chosen.
 pub fn capacity_for(element_count: u64) -> u64 {
-    let n = element_count.max(1) as u128;
+    let n = element_count.clamp(1, MAX_CAPACITY) as u128;
     let margin = (n * CAPACITY_MARGIN_NUMERATOR) / CAPACITY_MARGIN_DENOMINATOR;
-    ladder_ceil(margin as u64).max(MIN_CAPACITY)
+    ladder_ceil(margin as u64).clamp(MIN_CAPACITY, MAX_CAPACITY)
 }
 
 /// Round `value` up to the nearest step of the {1, 2, 5} x 10^k ladder.
@@ -206,8 +240,39 @@ impl BloomFilter {
         })
     }
 
+    /// Return why this filter is structurally unusable, or `None` if it is
+    /// fine to use as-is. See design/02 "Structural validation (push and read
+    /// paths)" for the write/read behavioural asymmetry built on top of this
+    /// single predicate.
+    ///
+    /// `num_bits == 0` would divide by zero inside `bit_index`'s
+    /// `% num_bits` (guarded against directly in `may_contain`/`insert` below
+    /// as a last-resort backstop, but callers should not rely on reaching
+    /// that backstop -- they should check this predicate first and route
+    /// around a defective filter instead). `num_hash_functions == 0` is
+    /// well-defined (`may_contain` trivially returns `true`, `insert` is a
+    /// no-op) but useless: such a filter never rules anything out, so it is
+    /// worth no more than not having one.
+    pub fn structural_defect(&self) -> Option<&'static str> {
+        if self.num_bits == 0 {
+            Some("num_bits == 0")
+        } else if self.num_hash_functions == 0 {
+            Some("num_hash_functions == 0")
+        } else {
+            None
+        }
+    }
+
     /// Insert a hash into the filter.
     pub fn insert(&mut self, hash: &Hash) {
+        // Backstop against a `num_bits == 0` filter reaching this method by
+        // some path other than `structural_defect()`-checked loaders (see
+        // design/02 "Structural validation"): do nothing rather than divide
+        // by zero in `bit_index`. Leaves the (empty) bit array and
+        // `element_count` untouched.
+        if self.num_bits == 0 {
+            return;
+        }
         for i in 0..self.num_hash_functions {
             let bit = bit_index(hash.as_bytes_array(), i, self.num_bits);
             set_bit(&mut self.bits, bit);
@@ -219,6 +284,15 @@ impl BloomFilter {
     /// Returns `true` if the hash *may* be present (possible false positive).
     /// Returns `false` if the hash is *definitely absent*.
     pub fn may_contain(&self, hash: &Hash) -> bool {
+        // Backstop against a `num_bits == 0` filter reaching this method by
+        // some path other than `structural_defect()`-checked loaders (see
+        // design/02 "Structural validation"): fail open ("maybe present")
+        // rather than divide by zero in `bit_index`. This can never produce a
+        // false negative, which is the only correctness property this type
+        // promises.
+        if self.num_bits == 0 {
+            return true;
+        }
         for i in 0..self.num_hash_functions {
             let bit = bit_index(hash.as_bytes_array(), i, self.num_bits);
             if !get_bit(&self.bits, bit) {
@@ -427,8 +501,32 @@ mod tests {
     #[test]
     fn capacity_for_is_monotonically_non_decreasing() {
         let samples: Vec<u64> = vec![
-            0, 1, 10, 100, 1_000, 50_000, 99_999, 100_000, 100_001, 150_000, 276_000, 500_000,
-            1_000_000, 1_999_999, 2_000_000, 10_000_000,
+            0,
+            1,
+            10,
+            100,
+            1_000,
+            50_000,
+            99_999,
+            100_000,
+            100_001,
+            150_000,
+            276_000,
+            500_000,
+            1_000_000,
+            1_999_999,
+            2_000_000,
+            10_000_000,
+            // Around and beyond MAX_CAPACITY: this is where the double clamp
+            // (design/02 "Bounding the capacity") must keep the sequence
+            // non-decreasing rather than dropping when `ladder_ceil`'s
+            // pre-clamp output would otherwise exceed MAX_CAPACITY.
+            MAX_CAPACITY - 1,
+            MAX_CAPACITY,
+            MAX_CAPACITY + 1,
+            200_000_000,
+            1_000_000_000,
+            u64::MAX,
         ];
         let mut prev = 0u64;
         for &n in &samples {
@@ -439,6 +537,54 @@ mod tests {
             );
             prev = cap;
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Bounding the capacity (hostile and corrupt filters,
+    // design/02 "Bounding the capacity (hostile and corrupt filters)")
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn capacity_for_never_exceeds_max_capacity() {
+        for n in [
+            0u64,
+            1,
+            MAX_CAPACITY - 1,
+            MAX_CAPACITY,
+            MAX_CAPACITY + 1,
+            200_000_000,
+            1_000_000_000,
+            1_000_000_000_000, // 10^12 -- the hostile element_count from the bug report
+            u64::MAX,
+        ] {
+            assert!(
+                capacity_for(n) <= MAX_CAPACITY,
+                "capacity_for({n}) must never exceed MAX_CAPACITY"
+            );
+        }
+    }
+
+    #[test]
+    fn capacity_for_clips_to_max_capacity_at_and_beyond_the_bound() {
+        // At or beyond MAX_CAPACITY, capacity_for must clip exactly to
+        // MAX_CAPACITY (not merely "some value <= MAX_CAPACITY") -- this is
+        // the specific regression this test locks in, distinct from the
+        // weaker upper-bound check above.
+        assert_eq!(capacity_for(u64::MAX), MAX_CAPACITY);
+        assert_eq!(capacity_for(1_000_000_000_000), MAX_CAPACITY);
+        assert_eq!(capacity_for(MAX_CAPACITY), MAX_CAPACITY);
+        assert_eq!(capacity_for(MAX_CAPACITY - 1), MAX_CAPACITY);
+    }
+
+    #[test]
+    fn capacity_for_hostile_element_count_does_not_abort_on_allocation() {
+        // The direct reproduction of the bug report: a 10^12 element_count
+        // must size a filter that actually fits in memory (~114 MiB at
+        // MAX_CAPACITY), not the ~1.6 TiB an unclamped 1.5x margin would
+        // demand.
+        let bf = sized_for(1_000_000_000_000);
+        assert!(bf.num_bits >= 1);
+        assert_eq!(designed_capacity(bf.num_bits), MAX_CAPACITY);
     }
 
     #[test]
@@ -543,5 +689,56 @@ mod tests {
     #[test]
     fn estimated_fp_rate_zero_bits_is_worst_case() {
         assert_eq!(estimated_fp_rate(10, 0, DEFAULT_NUM_HASH_FUNCTIONS), 1.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Structural validation (design/02 "Structural validation (push and read
+    // paths)")
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn structural_defect_reports_zero_num_bits() {
+        let bf = BloomFilter::from_parts(DEFAULT_NUM_HASH_FUNCTIONS, 0, 0, vec![]).unwrap();
+        assert_eq!(bf.structural_defect(), Some("num_bits == 0"));
+    }
+
+    #[test]
+    fn structural_defect_reports_zero_num_hash_functions() {
+        let bf = BloomFilter::from_parts(0, 64, 0, vec![0u8; 8]).unwrap();
+        assert_eq!(bf.structural_defect(), Some("num_hash_functions == 0"));
+    }
+
+    #[test]
+    fn structural_defect_none_for_a_healthy_filter() {
+        let bf = BloomFilter::new(1_000, FP_RATE, DEFAULT_NUM_HASH_FUNCTIONS);
+        assert_eq!(bf.structural_defect(), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // may_contain / insert backstop against num_bits == 0
+    // (design/02 "Structural validation (push and read paths)")
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn may_contain_zero_bits_does_not_panic_and_reports_maybe_present() {
+        let bf = BloomFilter::from_parts(7, 0, 0, vec![]).unwrap();
+        let h = make_hash(0x42);
+        // Direct regression test for the division-by-zero panic in
+        // `bit_index`'s `% num_bits`: with num_bits == 0, may_contain must
+        // fail open (true == "maybe present"), never panic and never claim
+        // definite absence.
+        assert!(bf.may_contain(&h));
+    }
+
+    #[test]
+    fn insert_zero_bits_is_a_no_op_and_does_not_panic() {
+        let mut bf = BloomFilter::from_parts(7, 0, 0, vec![]).unwrap();
+        let h = make_hash(0x99);
+        // Direct regression test for the division-by-zero panic in
+        // `bit_index`'s `% num_bits`: with num_bits == 0, insert must return
+        // without touching the (empty) bit array or element_count.
+        bf.insert(&h);
+        assert_eq!(bf.element_count, 0, "insert must not increment element_count when num_bits == 0");
+        assert!(bf.bits.is_empty(), "insert must not touch the bit array when num_bits == 0");
     }
 }

@@ -459,14 +459,64 @@ pub fn is_chunked(
 /// `local.exists` check so a partial manifest is treated as "still needs
 /// fetching", not "already cached".
 ///
-/// Reads only `local` (never the remote), so this is always local-cache-only
-/// and cheap: at most one extra read of the manifest's own (typically small)
-/// bytes plus one `exists` check per chunk it names.
+/// Reads only `local` (never the remote), so this never crosses the network.
+/// It is not, however, free of races or of avoidable cost:
+///
+/// - **Benign self-healing on any post-`exists` read failure.** Between the
+///   `exists` check and the read below, a concurrent writer in this same
+///   process can legitimately make the read fail even though the object was
+///   genuinely present a moment ago: `ObjectsDir::find_in`
+///   (`src/store/objects_dir.rs`) reads `.depth` before `.migrating`, while
+///   `do_migration` writes the new `.depth` before removing `.migrating`, so
+///   a worker's `find` can straddle another worker's migration and miss an
+///   object that has already moved into its shard subdirectory (this is
+///   reachable in practice from `expand`'s `collect_tree_fetches`, which runs
+///   `parallel_walk` workers that call `ensure_local_then_read` -- which can
+///   trigger a migration -- concurrently with this function). Any error from
+///   the read is therefore treated the same as "absent" (`Ok(false)`, not
+///   propagated), matching the self-healing policy `clone.rs`'s
+///   `ensure_tree_in_local` already uses and the policy described atop
+///   `src/codec/mod.rs`: a wrong "not yet cached" answer just costs one extra
+///   (idempotent) fetch, while propagating the error here would turn a benign
+///   race into a hard failure for callers that were only asking "is this
+///   local already, or do I need to fetch it".
+///
+/// - **Avoiding a full read+decompress when the object plainly cannot be a
+///   manifest.** `local` never applies encryption -- the local cache is
+///   always written with `key = None` (see `ensure_local_then_read` above,
+///   and design/02_storage_format.md "The local filesystem is assumed to be
+///   under the user's control and is not encrypted") -- so the only transform
+///   between an object's plaintext and its on-disk bytes is
+///   `codec::compress`. A manifest's plaintext is fixed-shape:
+///   `ED F2 | hash * N` (`object::serialise_manifest`), and chunk hashes are
+///   SHA-256 output -- high-entropy enough that `compress` never gains
+///   anything by wrapping it in a zstd frame, so it always picks the "raw"
+///   candidate for a genuine manifest, and a manifest's on-disk bytes are its
+///   plaintext verbatim, starting with the literal `ED F2` tag. Nothing else
+///   can produce that on-disk prefix: a blob's Stage-1 serialisation escapes
+///   any content starting `ED F0..FF` (`object::blob_needs_escape`), so a
+///   blob's plaintext can never literally start `ED F2`, and a chunk's
+///   plaintext always starts `ED F3`. `peek_rules_out_manifest` uses this to
+///   read at most 2 on-disk bytes and, whenever they are conclusive, skip the
+///   full `store_read` (whole-object read + decompress) entirely -- which
+///   matters because `expand --recursive` (`stub_threshold = 0`) calls this
+///   function for every cached blob regardless of size, including large
+///   single-object (non-chunked) blobs up to `CDC_MAX` (16 MiB).
 pub(crate) fn blob_fully_cached(local: &dyn ObjectStore, hash: &Hash) -> Result<bool, Error> {
     if !local.exists(hash)? {
         return Ok(false);
     }
-    let raw = codec::store_read(local, hash, None)?;
+
+    match peek_rules_out_manifest(local, hash) {
+        Ok(true) => return Ok(true),
+        Ok(false) => {} // inconclusive, or definitely a manifest: read fully below
+        Err(_) => return Ok(false), // exists->read race: self-heal (see doc comment above)
+    }
+
+    let raw = match codec::store_read(local, hash, None) {
+        Ok(r) => r,
+        Err(_) => return Ok(false), // exists->read race: self-heal (see doc comment above)
+    };
     match object::deserialise_manifest(&raw) {
         None => Ok(true),
         Some(chunk_hashes) => {
@@ -478,6 +528,41 @@ pub(crate) fn blob_fully_cached(local: &dyn ObjectStore, hash: &Hash) -> Result<
             Ok(true)
         }
     }
+}
+
+/// Peek at most the first 2 bytes of `hash`'s on-disk (encoded, not decoded)
+/// bytes in `local` and return `true` only when they PROVE the object cannot
+/// be a chunk manifest -- see `blob_fully_cached`'s doc comment for why this
+/// is sound rather than merely likely. Returns `false` when the on-disk bytes
+/// are inconclusive (a zstd frame -- `compress`'s `ED DE` / `ED DF` magic --
+/// hides the plaintext) or when they prove the object IS a manifest (the
+/// literal `ED F2` tag, unescaped and uncompressed); either way the caller
+/// must fall back to a full read to get a definite answer.
+fn peek_rules_out_manifest(local: &dyn ObjectStore, hash: &Hash) -> Result<bool, Error> {
+    let mut reader = local.open_read(hash)?;
+    let mut buf = [0u8; 2];
+    let mut filled = 0;
+    while filled < buf.len() {
+        let n = reader.read(&mut buf[filled..]).map_err(Error::Io)?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    if filled < buf.len() {
+        // Too short to hold the 2-byte ED F2 tag at all.
+        return Ok(true);
+    }
+    if buf == object::TYPE_TAG_MANIFEST {
+        // Definitely a manifest (see doc comment): the caller must read it
+        // fully to get the chunk list.
+        return Ok(false);
+    }
+    // `ED DE` / `ED DF`: compress chose a zstd frame, hiding the plaintext.
+    // Conservatively inconclusive rather than assuming a manifest can never
+    // compress smaller than raw.
+    let compressed_frame = buf[0] == 0xED && matches!(buf[1], 0xDE | 0xDF);
+    Ok(!compressed_frame)
 }
 
 /// Read and reassemble an object from `store` at `logical_hash` into a single
@@ -582,13 +667,25 @@ where
 /// ever visible. `mtime` and `mode` are NOT applied here; the caller applies
 /// them after the rename per the materialisation contract. See design/02
 /// "Streaming read / materialisation".
+///
+/// This is the one function every blob-content write into the working tree
+/// funnels through -- directly (`expand`'s top-level blob-stub branch,
+/// `pull`'s conflict-helper-file write) or via `fsmeta::materialise_blob_at`
+/// (`pull`, `expand`, `clone`, `restore`'s main content path) -- so the
+/// working-tree write boundary (`fsguard`) is enforced here rather than in
+/// any one caller (design/03_sync_model.md, "Write safety: the working-tree
+/// write boundary"). `work_dir` is the repository root, used to resolve and
+/// verify `dest_path`'s parent directory component-by-component; passing a
+/// scoped subdirectory instead would exempt everything at or above it from
+/// the check.
 pub fn materialise_to_file(
+    work_dir: &Path,
     store: &dyn ObjectStore,
     logical_hash: &Hash,
     key: Option<&codec::encrypt::EncryptKey>,
     dest_path: &Path,
 ) -> Result<(), Error> {
-    crate::store::local::atomic_write_with_no_fsync(dest_path, |writer| {
+    crate::fsguard::atomic_write_with(work_dir, dest_path, |writer| {
         for_each_blob_chunk(store, logical_hash, key, |chunk_bytes| {
             writer.write_all(chunk_bytes).map_err(Error::Io)
         })
@@ -604,6 +701,8 @@ mod tests {
     use super::*;
     use crate::store::local::LocalStore;
     use std::io::Write;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use tempfile::TempDir;
 
     /// Deterministic pseudo-random byte generator (xorshift64*). Not for crypto;
@@ -843,7 +942,7 @@ mod tests {
 
         let out_dir = TempDir::new().unwrap();
         let dest = out_dir.path().join("out.bin");
-        materialise_to_file(&store, &hash, None, &dest).unwrap();
+        materialise_to_file(out_dir.path(), &store, &hash, None, &dest).unwrap();
         assert_eq!(fs::read(&dest).unwrap(), content);
     }
 
@@ -860,7 +959,7 @@ mod tests {
 
         let out_dir = TempDir::new().unwrap();
         let dest = out_dir.path().join("out.bin");
-        materialise_to_file(&store, &hash, None, &dest).unwrap();
+        materialise_to_file(out_dir.path(), &store, &hash, None, &dest).unwrap();
         assert_eq!(fs::read(&dest).unwrap(), content);
     }
 
@@ -885,7 +984,7 @@ mod tests {
 
         let out_dir = TempDir::new().unwrap();
         let dest = out_dir.path().join("out.bin");
-        materialise_to_file(&store, &hash, None, &dest).unwrap();
+        materialise_to_file(out_dir.path(), &store, &hash, None, &dest).unwrap();
         let got = fs::read(&dest).unwrap();
         assert_eq!(&got[..2], &[0xED, 0xF0], "content must begin with ED F0");
         assert_eq!(got, content, "escape stripped exactly once");
@@ -915,13 +1014,51 @@ mod tests {
 
         let out_dir = TempDir::new().unwrap();
         let dest = out_dir.path().join("out.bin");
-        let result = materialise_to_file(&store, &hash, None, &dest);
+        let result = materialise_to_file(out_dir.path(), &store, &hash, None, &dest);
         assert!(
             matches!(result, Err(Error::InvalidObject(_))),
             "expected InvalidObject, got {:?}",
             result
         );
         assert!(!dest.exists(), "no partial file must be visible at dest");
+    }
+
+    // --- Working-tree write boundary (design/03_sync_model.md, "Write
+    // safety: the working-tree write boundary") -------------------------
+    //
+    // `materialise_to_file` is the true common choke point for every
+    // blob-content write into the working tree: `expand`'s top-level
+    // blob-stub branch and `pull`'s conflict-helper-file write call it
+    // directly, bypassing `fsmeta::materialise_blob_at`, so the guard must
+    // live here rather than only in that wrapper. Deeper coverage of the
+    // guard mechanism itself (symlinked intermediate components, a
+    // symlinked `work_dir` root, etc.) lives in `src/fsguard.rs`'s own unit
+    // tests; these two just confirm `materialise_to_file` is wired to it.
+
+    #[test]
+    #[cfg(unix)]
+    fn materialise_to_file_refuses_symlinked_parent_directory() {
+        let work_dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+
+        let sub = work_dir.path().join("sub");
+        std::os::unix::fs::symlink(outside.path(), &sub).unwrap();
+
+        let content = pseudo_random(0x1111_2222, 64 * 1024);
+        let store_dir = TempDir::new().unwrap();
+        let (store, hash) = store_blob(store_dir.path(), &content);
+
+        let dest = sub.join("out.bin");
+        let result = materialise_to_file(work_dir.path(), &store, &hash, None, &dest);
+        assert!(
+            matches!(result, Err(Error::SymlinkEscape(_))),
+            "expected SymlinkEscape, got {:?}",
+            result
+        );
+        assert!(
+            !outside.path().join("out.bin").exists(),
+            "content must never be written outside the working tree"
+        );
     }
 
     // --- blob_fully_cached (restore's "Missing objects", design/04) -----
@@ -979,6 +1116,243 @@ mod tests {
             !blob_fully_cached(&store, &hash).unwrap(),
             "a manifest with a missing chunk must not be reported as fully cached"
         );
+    }
+
+    /// A store wrapper that fails `open_read` for one chosen hash, no matter
+    /// what the underlying file actually contains. Used to simulate the
+    /// exists->read TOCTOU gap described in `blob_fully_cached`'s doc comment
+    /// without needing real concurrency: `exists` still reports the object as
+    /// present (delegated to `inner`), but the read that follows fails, the
+    /// same shape of failure a `find_in` / migration race can produce.
+    struct FlakyReadStore<'a> {
+        inner: &'a LocalStore,
+        fail_hash: Hash,
+    }
+
+    impl ObjectStore for FlakyReadStore<'_> {
+        fn exists(&self, hash: &Hash) -> Result<bool, Error> {
+            self.inner.exists(hash)
+        }
+        fn size(&self, hash: &Hash) -> Result<u64, Error> {
+            self.inner.size(hash)
+        }
+        fn list_with_sizes(&self) -> Result<Vec<(String, u64)>, Error> {
+            self.inner.list_with_sizes()
+        }
+        fn open_read(&self, hash: &Hash) -> Result<Box<dyn io::Read>, Error> {
+            if hash == &self.fail_hash {
+                return Err(Error::ObjectNotFound(hash.as_str().to_string()));
+            }
+            self.inner.open_read(hash)
+        }
+        fn write_from(&self, hash: &Hash, reader: &mut dyn io::Read) -> Result<(), Error> {
+            self.inner.write_from(hash, reader)
+        }
+    }
+
+    #[test]
+    fn blob_fully_cached_ok_false_when_peek_read_fails_after_true_exists() {
+        // Problem 1 (TOCTOU): exists() reports the object present, but the
+        // very first read attempt (the new cheap on-disk peek) fails. This
+        // must degrade to Ok(false) -- "treat as not yet cached, fetch again"
+        // -- not propagate as an Err that would abort the caller.
+        let content = pseudo_random(0x2468_1357, 64 * 1024);
+        let store_dir = TempDir::new().unwrap();
+        let (store, hash) = store_blob(store_dir.path(), &content);
+        assert!(store.exists(&hash).unwrap());
+
+        let flaky = FlakyReadStore {
+            inner: &store,
+            fail_hash: hash.clone(),
+        };
+        assert!(
+            !blob_fully_cached(&flaky, &hash).unwrap(),
+            "a read failure right after a true exists() must yield Ok(false), not Err"
+        );
+    }
+
+    #[test]
+    fn blob_fully_cached_ok_false_when_full_read_fails_after_true_exists() {
+        // Same TOCTOU contract, but forced past the cheap peek: the object is
+        // stored compressed (a zstd frame), so the peek is inconclusive and
+        // falls through to the full `store_read`, which is the read that
+        // fails here. Must still degrade to Ok(false), never Err.
+        let content: Vec<u8> = b"the quick brown fox jumps over the lazy dog "
+            .iter()
+            .cloned()
+            .cycle()
+            .take(64 * 1024)
+            .collect();
+        let store_dir = TempDir::new().unwrap();
+        let (store, hash) = store_blob(store_dir.path(), &content);
+        assert!(!is_chunked(&store, &hash, None));
+        // Confirm the on-disk bytes are genuinely a zstd frame (dict or
+        // plain), so the peek cannot resolve this case on its own and must
+        // fall through to the full read.
+        let raw_path = store.objects_path(&hash).expect("object path");
+        let on_disk = fs::read(&raw_path).unwrap();
+        assert!(
+            on_disk.len() >= 2 && on_disk[0] == 0xED && matches!(on_disk[1], 0xDE | 0xDF),
+            "expected zstd on-disk framing for this repetitive content, got {:?}",
+            &on_disk[..on_disk.len().min(2)]
+        );
+
+        let flaky = FlakyReadStore {
+            inner: &store,
+            fail_hash: hash.clone(),
+        };
+        assert!(
+            !blob_fully_cached(&flaky, &hash).unwrap(),
+            "a read failure right after a true exists() must yield Ok(false), not Err"
+        );
+    }
+
+    #[test]
+    fn peek_rules_out_manifest_edge_cases() {
+        // Direct unit coverage of the on-disk byte classification, bypassing
+        // codec::encode entirely so each case pins an exact byte sequence
+        // rather than depending on what compress() happens to choose.
+        let store_dir = TempDir::new().unwrap();
+        let store = LocalStore::for_cache(store_dir.path());
+
+        let write_raw = |key_material: &[u8], bytes: Vec<u8>| -> Hash {
+            let hash = object::blob_hash(key_material);
+            store
+                .write_from(&hash, &mut io::Cursor::new(bytes))
+                .unwrap();
+            hash
+        };
+
+        // Empty object: cannot hold the 2-byte ED F2 tag at all.
+        let h_empty = write_raw(b"peek-case-empty", Vec::new());
+        assert!(peek_rules_out_manifest(&store, &h_empty).unwrap());
+
+        // One byte, even 0xED: still too short to hold the tag.
+        let h_one = write_raw(b"peek-case-one-byte", vec![0xED]);
+        assert!(peek_rules_out_manifest(&store, &h_one).unwrap());
+
+        // Literal, unescaped ED F2 prefix: definitely a manifest, must NOT be
+        // ruled out (the caller falls through to a full read).
+        let h_manifest = write_raw(b"peek-case-manifest", vec![0xED, 0xF2, 0x00]);
+        assert!(!peek_rules_out_manifest(&store, &h_manifest).unwrap());
+
+        // Plain-zstd magic: ambiguous (plaintext is hidden), must NOT be
+        // ruled out.
+        let h_zstd = write_raw(b"peek-case-zstd", vec![0xED, 0xDF, 0x01]);
+        assert!(!peek_rules_out_manifest(&store, &h_zstd).unwrap());
+
+        // Dict-zstd magic: same as above.
+        let h_dict = write_raw(b"peek-case-dict", vec![0xED, 0xDE, 0x01]);
+        assert!(!peek_rules_out_manifest(&store, &h_dict).unwrap());
+
+        // Escaped-raw marker (ED D0): a manifest can never trigger this,
+        // since its own ED F2 tag is never in the D0..DF escape range.
+        let h_escaped = write_raw(b"peek-case-escaped", vec![0xED, 0xD0, 0x01]);
+        assert!(peek_rules_out_manifest(&store, &h_escaped).unwrap());
+
+        // Ordinary content unrelated to any tag.
+        let h_plain = write_raw(b"peek-case-plain", b"hello".to_vec());
+        assert!(peek_rules_out_manifest(&store, &h_plain).unwrap());
+    }
+
+    /// A store wrapper that counts the total bytes read across every
+    /// `open_read` stream it hands out, used to prove the read-avoidance
+    /// optimisation in `blob_fully_cached` / `peek_rules_out_manifest`
+    /// actually avoids reading the whole object rather than merely returning
+    /// the right answer.
+    struct CountingReadStore<'a> {
+        inner: &'a LocalStore,
+        bytes_read: Arc<AtomicU64>,
+    }
+
+    struct CountingReader {
+        inner: Box<dyn io::Read>,
+        counter: Arc<AtomicU64>,
+    }
+
+    impl io::Read for CountingReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.counter.fetch_add(n as u64, Ordering::Relaxed);
+            Ok(n)
+        }
+    }
+
+    impl ObjectStore for CountingReadStore<'_> {
+        fn exists(&self, hash: &Hash) -> Result<bool, Error> {
+            self.inner.exists(hash)
+        }
+        fn size(&self, hash: &Hash) -> Result<u64, Error> {
+            self.inner.size(hash)
+        }
+        fn list_with_sizes(&self) -> Result<Vec<(String, u64)>, Error> {
+            self.inner.list_with_sizes()
+        }
+        fn open_read(&self, hash: &Hash) -> Result<Box<dyn io::Read>, Error> {
+            let inner = self.inner.open_read(hash)?;
+            Ok(Box::new(CountingReader {
+                inner,
+                counter: self.bytes_read.clone(),
+            }))
+        }
+        fn write_from(&self, hash: &Hash, reader: &mut dyn io::Read) -> Result<(), Error> {
+            self.inner.write_from(hash, reader)
+        }
+    }
+
+    #[test]
+    fn blob_fully_cached_avoids_full_read_for_large_incompressible_single_object() {
+        // Problem 2 (performance) regression: for a large, incompressible,
+        // single-chunk (non-manifest) blob, blob_fully_cached must determine
+        // "not a manifest" from a couple of on-disk bytes rather than reading
+        // and decompressing the whole ~900 KiB object.
+        //
+        // 900 KiB is comfortably below CDC_MIN (1 MiB), so FastCDC cannot
+        // find a cut point and the object is guaranteed to be stored whole
+        // (see store_chunked: "small object: store whole"), and the content
+        // is pseudo-random so `compress` cannot shrink it below its raw
+        // on-disk length -- both preconditions the doc comment relies on.
+        let content = pseudo_random(0xF00D_BEEF, 900 * 1024);
+        let store_dir = TempDir::new().unwrap();
+        let (store, hash) = store_blob(store_dir.path(), &content);
+        assert!(!is_chunked(&store, &hash, None), "must be a single whole object");
+
+        let counting = CountingReadStore {
+            inner: &store,
+            bytes_read: Arc::new(AtomicU64::new(0)),
+        };
+        assert!(blob_fully_cached(&counting, &hash).unwrap());
+        let read = counting.bytes_read.load(Ordering::Relaxed);
+        assert!(
+            read < 64,
+            "expected only a small on-disk peek, but read {} bytes of a {}-byte object",
+            read,
+            content.len()
+        );
+    }
+
+    #[test]
+    fn blob_fully_cached_true_for_compressible_single_object_via_full_read_fallback() {
+        // Highly compressible content is stored on disk as a zstd frame
+        // (ED DE / ED DF), which the cheap peek cannot rule out as a
+        // manifest, so blob_fully_cached must fall back to the full read --
+        // and still correctly report the whole object as fully cached.
+        let content: Vec<u8> = b"the quick brown fox jumps over the lazy dog "
+            .iter()
+            .cloned()
+            .cycle()
+            .take(64 * 1024)
+            .collect();
+        let store_dir = TempDir::new().unwrap();
+        let (store, hash) = store_blob(store_dir.path(), &content);
+        assert!(!is_chunked(&store, &hash, None));
+
+        let stored_size = store.size(&hash).unwrap();
+        assert!(
+            stored_size < content.len() as u64,
+            "expected compression to shrink this repetitive content on disk"
+        );
+        assert!(blob_fully_cached(&store, &hash).unwrap());
     }
 
     #[test]

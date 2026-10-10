@@ -60,6 +60,7 @@ use crate::codec::pack::bloom::BloomFilter;
 use crate::codec::pack::index::{IndexEntry, IndexFile};
 use crate::codec::pack::index_root::IndexRoot;
 use crate::codec::pack::root_pointer::RootPointer;
+use crate::dlog_l6;
 use crate::error::Error;
 use crate::object::Hash;
 use crate::store::ObjectStore;
@@ -399,7 +400,19 @@ impl PackReader {
         if !shard_already_searched {
             if let Some(bloom_hash) = index_root.bloom_hash_opt() {
                 let bloom = self.load_bloom_filter(&bloom_hash)?;
-                if !bloom.may_contain(hash) {
+                // A filter that fetched/decrypted/deserialised fine but is
+                // structurally degenerate (design/02 "Structural validation
+                // (push and read paths)") cannot be trusted to answer
+                // "definitely absent" -- treat it exactly like "no Bloom
+                // filter recorded at all" and fall through to the cold-shard
+                // fetch below, rather than calling `may_contain` on it.
+                if let Some(reason) = bloom.structural_defect() {
+                    dlog_l6!(
+                        "locate: ignoring structurally defective Bloom filter \
+                         ({}), falling through to cold-shard fetch",
+                        reason
+                    );
+                } else if !bloom.may_contain(hash) {
                     return Ok(Located::NotFound);
                 }
             }
@@ -1477,6 +1490,83 @@ mod tests {
                 .exists(&shard_hash)
                 .unwrap(),
             "with no Bloom filter recorded, the cold shard must still be fetched on a miss"
+        );
+    }
+
+    /// Regression test for design/02 "Structural validation (push and read
+    /// paths)": a Bloom filter that deserialises successfully but is
+    /// structurally unusable (`num_bits == 0`) must not panic `locate`'s
+    /// Bloom step. Before the fix, `may_contain` divides by `num_bits`
+    /// (`bit_index`'s `% num_bits`), so this test panics with "attempt to
+    /// calculate the remainder with a divisor of zero" on unfixed code -- run
+    /// it against the pre-fix tree first to confirm the panic, then again
+    /// after the fix to confirm it is gone.
+    ///
+    /// Each sub-case uses its own fresh `PackReader` (own objcache) so the
+    /// cold shard is genuinely uncached on first lookup and step [A]'s
+    /// cache-hit shortcut cannot bypass the Bloom step -- both lookups
+    /// actually exercise `structural_defect()`'s fall-through.
+    #[test]
+    fn corrupted_bloom_filter_falls_through_without_panicking() {
+        use crate::codec::pack::index::InlineEntry;
+
+        let tmp = TempDir::new().unwrap();
+        let base = make_remote_base(&tmp);
+        let remote_for_setup = LocalStore::for_remote(&base);
+
+        let present_data = vec![0xF1u8; 10];
+        let present_hash = Hash::compute(&present_data);
+        let shard_hash = write_raw_index(
+            &remote_for_setup,
+            vec![IndexEntry::Inline(InlineEntry {
+                hash: present_hash.clone(),
+                data: present_data.clone(),
+            })],
+        );
+
+        // Corrupted Bloom filter: num_bits == 0. element_count is arbitrary
+        // and irrelevant to this test -- only num_bits matters here.
+        let corrupted = BloomFilter::from_parts(7, 0, 5, vec![]).unwrap();
+        let corrupted_bytes = corrupted.serialise();
+        let bloom_hash = Hash::compute(&corrupted_bytes);
+        remote_for_setup
+            .write_from(&bloom_hash, &mut io::Cursor::new(&corrupted_bytes))
+            .unwrap();
+
+        let mut root = IndexRoot::new_empty();
+        root.cold_shards = vec![*shard_hash.as_bytes_array()];
+        root.bloom_hash = *bloom_hash.as_bytes_array();
+        write_raw_index_root(&base, &root);
+
+        let absent_hash = Hash::compute(b"corrupted-bloom-absent-object");
+
+        // (a) An existing hash must still resolve correctly.
+        let tmp_a = TempDir::new().unwrap();
+        let (reader_a, _record_a, objcache_a) = make_reader_with_stats(&base, &tmp_a);
+        let got = read_all(reader_a.open_read(&present_hash).unwrap());
+        assert_eq!(got, present_data);
+        assert!(
+            LocalStore::for_cache(&objcache_a)
+                .exists(&shard_hash)
+                .unwrap(),
+            "the cold shard must have been fetched -- proof the corrupted \
+             Bloom filter was skipped (fell through) rather than substituted \
+             for the shard fetch"
+        );
+
+        // (b) A genuinely absent hash must resolve to NotFound, not panic.
+        let tmp_b = TempDir::new().unwrap();
+        let (reader_b, _record_b, objcache_b) = make_reader_with_stats(&base, &tmp_b);
+        let result = reader_b.open_read(&absent_hash);
+        assert!(
+            result.is_err(),
+            "a genuinely absent hash must resolve to NotFound, not panic"
+        );
+        assert!(
+            LocalStore::for_cache(&objcache_b)
+                .exists(&shard_hash)
+                .unwrap(),
+            "the cold shard must have been fetched for the absent-hash lookup too"
         );
     }
 

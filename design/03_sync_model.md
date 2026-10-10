@@ -287,10 +287,14 @@ lives in `.omemfs/`, the blobs in `.omemfs/objects/`, and they can diverge).
 
 To make `push` correct regardless of how the STAT_CACHE was populated, its scan
 accepts a metadata/cache hit only when the referenced local blob is present.
-When it is absent, the file is captured and staged during the scan. The tree
-root is not sealed until every newly referenced blob is local (or already a
-preserved remote entry). Upload never re-reads the working tree. Consequently,
-edits or deletes after the scan cannot invalidate the root being uploaded.
+"Present" always means `codec::chunk::blob_fully_cached` — the manifest and
+every chunk it lists, for a chunked blob — never a bare `store.exists()` on
+the top-level hash alone (see `07_stat_cache.md`, "Depth of the
+local-existence check"). When it is absent, the file is captured and staged
+during the scan. The tree root is not sealed until every newly referenced
+blob is local (or already a preserved remote entry). Upload never re-reads
+the working tree. Consequently, edits or deletes after the scan cannot
+invalidate the root being uploaded.
 
 ### Diff output
 
@@ -321,9 +325,11 @@ omemfs push
 2. Scan the working tree and build tree and blob objects with blob writing enabled (`write_blobs = true`). Each file is opened once per attempt; metadata and bytes come from the same open handle. Retry active files once, then preserve their previous entry (or omit an unstable new file) and report a warning. Store every newly referenced blob in `.omemfs/objects/` before sealing the tree root.
 
 3. Compare the working tree hash to the clone root hash.
-   - If they are equal → nothing to push, exit.
+   - If they are equal → nothing to push. If `--with-backup` was given and this is not a `--dry-run`, still attempt a backup push (design/04_cli_spec.md, "Backup push behaviour") before exiting, since origin having nothing new does not mean backup has caught up. Otherwise exit here.
 
 4. Read the index root from the remote backend and record the raw bytes (including the remote root hash and pack index metadata). The index root location is the derived key for encrypted remotes, or the fixed `<prefix>/INDEX_ROOT` for unencrypted remotes.
+
+4b. Compare the remote root read in step 4 against `clone_root`. If they differ, the remote has advanced since this clone last synced: fail immediately with the same error as a CAS failure (`remote has been updated since last sync`), without uploading any objects or touching the index root. Normalize both sides before comparing: a missing index root, an explicitly empty/all-zero remote root, an absent `clone_root`, and the canonical empty-tree hash must all be treated as equivalent to "nothing has been pushed yet" — so the very first push into a fresh remote, and a push immediately after `clone --new`/`clone --existing`, are both allowed to proceed. There is one more exception, checked first: if the working tree just scanned in step 1 already hashes to exactly the remote root just read (i.e. this push's own new content already matches what the remote currently holds), the push proceeds regardless of how stale `clone_root` is — pushing it changes nothing on the remote, so no update can be lost. This is what makes a push right after `omemfs conflict accept-remote <path>` succeed as a safe no-op: a conflicting `pull` never advances `clone_root` (see "Conflict handling" below), but `accept-remote` restores the remote side's exact content *and* its tracked mtime/mode, so the resolved working tree already hashes identically to the remote root.
 
 5. Upload objects that are missing from the remote (BFS order: blobs before trees), reading only the sealed local object store. A missing local object is an invariant violation and fails the push; the live working tree is never consulted during upload.
 
@@ -352,6 +358,13 @@ Run 'omemfs pull' and retry 'omemfs push'.
 ```
 
 The locally built tree is preserved; only the index root was not updated. After `pull` succeeds, `push` can proceed.
+
+This single error message now covers two distinct causes:
+
+1. **Divergence detected up front (step 4b / the per-path check under "Path-scoped push" below).** This is the common case: someone else already pushed since this clone's last sync, observed at the very start of this push, before any object was built or uploaded. This is the primary defense against a lost update — without it, a push whose remote had already advanced before the push started would sail through the CAS unaffected, because the CAS's own precondition (the token read at push start still matching at finish) is trivially satisfied in that case: nothing changed *during* the push's own window, so the CAS has nothing to catch.
+2. **A genuine CAS failure at finish time**, if another push's CAS-write lands in the narrow window between this push's own step 4b check and its own finish. The CAS narrows this residual window to just this push's own duration; it does not, by itself, guarantee fast-forward-only semantics across the whole operation — that guarantee comes from step 4b (and its per-path analogue for a scoped push).
+
+Both outcomes are correct and indistinguishable to the user: either way, someone else's change would otherwise have been silently overwritten, and this push must be retried after a `pull`.
 
 ---
 
@@ -604,6 +617,16 @@ apply_changes(base_tree, remote_tree, working_tree):
             if path in working_tree has different hash → conflict
 ```
 
+### Write safety: the working-tree write boundary
+
+No code may write, create, or unlink a working-tree path via a lexical `Path`. Every such operation goes through `src/fsguard.rs`, which resolves the path component-by-component from a `work_dir` directory fd using `openat(O_DIRECTORY|O_NOFOLLOW)` and then performs the operation `*at()`-relative to the resolved fd. A component strictly below `work_dir` that is a symlink is refused with `Error::SymlinkEscape`; `work_dir` itself and its ancestors are deliberately exempt (a legitimately symlinked or mounted `work_dir` must keep working). An unresolvable boundary is always an error, never a pass. Because the resolved fd *is* the fd the write uses, there is no check-then-use window.
+
+This replaces an earlier lexical guard (`fsmeta::reject_symlink_escape`, since removed) that re-derived the boundary via `Repo::discover` and then walked the path a second time with `symlink_metadata` before the real write happened. That shape had three independent fail-open holes: `Repo::discover` itself calls `.is_dir()` (which follows symlinks), so a symlinked directory whose target happened to contain its own `.omemfs/` marker was mistaken for the repository root itself, collapsing the walk to nothing to check; a `Repo::discover` or `strip_prefix` failure returned `Ok(())` (permissive) rather than an error; and the check-then-write shape was a TOCTOU regardless of the first two holes. `fsguard` closes all three by construction: there is no separate boundary-discovery step to spoof, no permissive fallback branch anywhere in the module, and the fd that passed the check is the fd the write uses, so there is nothing to race.
+
+Deletion and metadata mutation (chmod / mtime) go through the same primitive as content writes — `fsguard::remove_file_tolerant` and `GuardedDir::set_mode`/`set_mtime` — for the same reason: a lexically-planned delete or a path-based `chmod`/`utimes` follows a symlink exactly like a naive write would.
+
+Enumerating call sites is deliberately avoided here — the guarantee comes from `fsguard` being the only available primitive for working-tree mutation, not from an exhaustive list. See `src/fsguard.rs`'s module doc comment for the primitive's exact contract (error policy, temp-file naming, and the `GuardedDir` API).
+
 ---
 
 ## Checking local changes
@@ -638,6 +661,8 @@ ETag and generation number are different concepts that differ between providers;
 
 The CAS ensures that the index root is only updated if its version still equals the token observed before uploading (the expected token is captured at the start of the operation, never re-derived at finish time). If the condition fails, the push is rejected and the user must pull first.
 
+**What the CAS does and does not guarantee.** The CAS by itself guarantees only *atomicity* of the index-root update relative to the token observed at push start: it prevents two pushes from both succeeding when their upload windows overlap, and it prevents this push from silently clobbering a change that landed *during* its own window. It does **not**, by itself, provide fast-forward-only / lost-update protection across the whole operation: if the remote had already advanced *before* this push started, the token read at push start already reflects that advanced state, so the CAS's precondition (token unchanged between start and finish) is trivially satisfied and the CAS has nothing to catch — this push would sail through and silently overwrite the intervening change. That guarantee is provided by a separate, up-front check: the whole-root divergence check (step 4b under "Push → Steps" above) for a full push, and the per-path divergence check below for a scoped push. The CAS's job is to close the much narrower residual window — a concurrent push whose own start-to-finish window overlaps this one — that the up-front check, being a single point-in-time comparison, cannot cover.
+
 The index root location is determined by the encryption mode:
 
 - **Encrypted remote**: the derived key `objects/<HMAC-SHA256(DEK, "omemfs:index-root:v1") hex>` under the same fixed 3-level sharding as content objects.
@@ -666,6 +691,12 @@ Path-scoped operations apply only to the specified path (file or directory subtr
 
 1. Scan `<path>` in the working tree and build a new subtree.
 2. Read the index root and extract the current remote root hash; record the raw index root bytes for the CAS check.
+2b. Per-path divergence check (the scoped analogue of step 4b above): for each pushed `<path>`, compare the remote's subtree at `<path>` — as observed in the snapshot read in step 2 — against `clone_root`'s subtree at the same `<path>`. If any pushed path's subtree differs, fail immediately with the same "remote has been updated since last sync" error, scoped to that path, without uploading any objects or touching the index root. Remote changes **outside** every pushed `<path>` must **not** block the push — they are preserved by the splice logic below, which only ever touches the pushed paths and leaves the rest of the remote root tree untouched.
+
+    The same "no real divergence" exceptions as step 4b apply per path, checked first:
+    - If `<path>`'s freshly-scanned new subtree already matches the remote's current subtree at `<path>`, the push proceeds for that path regardless of `clone_root`'s staleness there — same rationale as step 4b (a push right after `omemfs conflict accept-remote <path>` for a scoped path).
+    - Deleting a `<path>` that is already absent on the remote is always allowed, matching the existing "already absent on remote" no-op handling below — there being nothing there means there is nothing to lose, regardless of what `clone_root` still records for it.
+    - The empty-root normalization from step 4b (a missing path on either side, an absent `clone_root`, and the empty-tree hash all equivalent to "nothing here yet") applies wherever a whole root is being compared.
 3. Splice the new `<path>` subtree into a copy of the **remote root tree** (use the remote root as the base for the rest of the tree). Compute the new root tree hash.
 4. Upload objects missing from the remote (only those reachable from the new `<path>` subtree).
 5. Update the index root with a CAS conditioned on the raw bytes read in step 2.
@@ -722,6 +753,8 @@ After the operation:
 Both operations maintain the following invariant:
 
 > `clone_root` records the per-path sync boundary. A path that has been synced (pushed or pulled) is reflected in clone root at the remote version. A path that has not yet been synced retains its previous clone root value, and the diff between clone root and remote root correctly describes the pending remote changes for that path.
+
+Step 2b above is what enforces this invariant on the push side: it refuses to advance a path's remote state unless this clone's `clone_root` for that exact path is still the value the remote agrees with, so a scoped push can never silently overwrite a remote change to a path it did not itself observe.
 
 ---
 

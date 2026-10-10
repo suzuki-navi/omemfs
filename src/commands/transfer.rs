@@ -163,6 +163,60 @@ impl Drop for BudgetGuard<'_> {
     }
 }
 
+/// Apply `f` to every item on at most `workers` threads and collect every
+/// result in item order. Unlike [`parallel_bfs`]'s first-error-wins strategy
+/// (all workers stop draining as soon as one fails), the caller inspects each
+/// item's own result -- no single item's `Err` aborts the others, and every
+/// item is visited exactly once regardless of whether it succeeds or fails.
+/// Serial (a plain `items.iter().map(f).collect()`) when `workers < 2`.
+///
+/// Used by `restore`'s heal loop (M6) instead of `rayon`'s
+/// `par_iter().map(...).collect()`: that held every healed object's payload
+/// resident for the whole batch, so peak memory was `to_heal.len() * one
+/// object`. Discarding each result's payload as soon as it is produced (the
+/// caller maps `Ok(bytes)` to `Ok(())` before this function even sees it, in
+/// `restore.rs`) plus bounding this function's own concurrency to `workers`
+/// makes peak memory `workers * one object` instead.
+///
+/// Uses a plain `AtomicUsize` work-stealing cursor rather than
+/// [`parallel_bfs`]'s `Mutex<VecDeque>` + `Condvar`: the item count here is
+/// fixed up front (no dynamically-discovered children to enqueue), so a
+/// shared counter indexing into `items` is enough -- no park/wake machinery
+/// is needed.
+pub fn parallel_map<T: Sync, R: Send>(
+    items: &[T],
+    workers: usize,
+    f: &(dyn Fn(&T) -> R + Sync),
+) -> Vec<R> {
+    let n = items.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    if workers < 2 {
+        return items.iter().map(f).collect();
+    }
+    let cursor = AtomicUsize::new(0);
+    let results: Mutex<Vec<Option<R>>> = Mutex::new((0..n).map(|_| None).collect());
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let i = cursor.fetch_add(1, Ordering::SeqCst);
+                if i >= n {
+                    return;
+                }
+                let r = f(&items[i]);
+                results.lock().unwrap()[i] = Some(r);
+            });
+        }
+    });
+    results
+        .into_inner()
+        .unwrap()
+        .into_iter()
+        .map(|slot| slot.expect("every index in 0..n is claimed by exactly one worker"))
+        .collect()
+}
+
 /// Extract the child hashes referenced by `data` (a chunk manifest or a tree).
 /// Mirrors the serial loops' child-discovery exactly: a chunk manifest yields
 /// its chunk hashes; otherwise a `Tree::Normal` yields each entry's hash; any
@@ -495,6 +549,69 @@ mod tests {
         if std::env::var("OMEMFS_TRANSFER_MEMORY_BUDGET").is_err() {
             assert_eq!(resolve_memory_budget(), DEFAULT_TRANSFER_MEMORY_BUDGET);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // parallel_map (M6)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parallel_map_visits_every_item_exactly_once_in_order() {
+        let items: Vec<u32> = (0..37).collect();
+        let visits = Mutex::new(vec![0u32; items.len()]);
+        let results = parallel_map(&items, 4, &|i: &u32| {
+            visits.lock().unwrap()[*i as usize] += 1;
+            i * 2
+        });
+        assert_eq!(
+            results,
+            items.iter().map(|i| i * 2).collect::<Vec<_>>(),
+            "results must come back in the same order as the input items"
+        );
+        assert!(
+            visits.lock().unwrap().iter().all(|&c| c == 1),
+            "every item must be visited exactly once"
+        );
+    }
+
+    #[test]
+    fn parallel_map_serial_path_for_workers_below_two() {
+        let items: Vec<u32> = (0..5).collect();
+        let order = Mutex::new(Vec::new());
+        let results = parallel_map(&items, 1, &|i: &u32| {
+            order.lock().unwrap().push(*i);
+            *i + 100
+        });
+        assert_eq!(results, vec![100, 101, 102, 103, 104]);
+        // Serial path: visited in input order on a single (the calling) thread.
+        assert_eq!(*order.lock().unwrap(), items);
+    }
+
+    #[test]
+    fn parallel_map_preserves_a_mix_of_ok_and_err_per_item() {
+        let items: Vec<u32> = (0..10).collect();
+        let results: Vec<Result<u32, String>> = parallel_map(&items, 4, &|i: &u32| {
+            if i % 3 == 0 {
+                Err(format!("bad-{}", i))
+            } else {
+                Ok(*i)
+            }
+        });
+        for (i, r) in results.into_iter().enumerate() {
+            let i = i as u32;
+            if i % 3 == 0 {
+                assert_eq!(r, Err(format!("bad-{}", i)));
+            } else {
+                assert_eq!(r, Ok(i));
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_map_empty_input_returns_empty_output() {
+        let items: Vec<u32> = Vec::new();
+        let results = parallel_map(&items, 4, &|i: &u32| *i);
+        assert!(results.is_empty());
     }
 
     #[test]

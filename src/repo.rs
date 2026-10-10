@@ -747,7 +747,7 @@ pub fn normalize_path(
     // that compares for equality (`rel == scope`) silently fails to match a
     // directory passed with a trailing slash, turning the command into a no-op.
     // A path that is only slashes normalises to the empty string.
-    let normalised = rel.to_string_lossy().replace('\\', "/");
+    let normalised = rel.to_string_lossy().into_owned();
     Ok(normalised.trim_end_matches('/').to_string())
 }
 

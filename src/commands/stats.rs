@@ -1005,19 +1005,32 @@ fn print_text(
         };
         out.writeln(&format!("  pack sizes  {}", sizes_str))?;
         out.writeln(&format!("  cold splits  {}", d.cold_splits))?;
-        let bloom_capacity = crate::codec::pack::bloom::designed_capacity(d.bloom_num_bits);
-        let bloom_est_fp = crate::codec::pack::bloom::estimated_fp_rate(
-            d.bloom_elements,
-            d.bloom_num_bits,
-            crate::codec::pack::bloom::DEFAULT_NUM_HASH_FUNCTIONS,
-        );
-        out.writeln(&format!(
-            "  hot index  {} entries     bloom  {} elements (designed capacity {}, est. FP rate {:.2}%)",
-            d.hot_index_entries,
-            d.bloom_elements,
-            bloom_capacity,
-            bloom_est_fp * 100.0
-        ))?;
+        // bloom_num_bits == 0 means this record was written before the field
+        // existed (serde default on the missing key; a real filter always
+        // has num_bits >= 1, see codec::pack::bloom::sized_for) -- the
+        // capacity/FP-rate figures are unknown for it, not zero/worst-case,
+        // so omit them rather than showing designed_capacity(0) = 0 and the
+        // hardcoded estimated_fp_rate(.., 0, ..) = 1.0 worst case.
+        if d.bloom_num_bits == 0 {
+            out.writeln(&format!(
+                "  hot index  {} entries     bloom  {} elements",
+                d.hot_index_entries, d.bloom_elements,
+            ))?;
+        } else {
+            let bloom_capacity = crate::codec::pack::bloom::designed_capacity(d.bloom_num_bits);
+            let bloom_est_fp = crate::codec::pack::bloom::estimated_fp_rate(
+                d.bloom_elements,
+                d.bloom_num_bits,
+                crate::codec::pack::bloom::DEFAULT_NUM_HASH_FUNCTIONS,
+            );
+            out.writeln(&format!(
+                "  hot index  {} entries     bloom  {} elements (designed capacity {}, est. FP rate {:.2}%)",
+                d.hot_index_entries,
+                d.bloom_elements,
+                bloom_capacity,
+                bloom_est_fp * 100.0
+            ))?;
+        }
     } else if !io_recent.is_empty() {
         // There is I/O history but no pack run carries pack_detail: show the
         // header with a placeholder so "not run recently" is distinguishable
@@ -1771,18 +1784,24 @@ fn print_json(
             d.hot_index_entries
         ))?;
         out.writeln(&format!("    \"bloom_elements\": {},", d.bloom_elements))?;
-        out.writeln(&format!(
-            "    \"bloom_designed_capacity\": {},",
-            crate::codec::pack::bloom::designed_capacity(d.bloom_num_bits)
-        ))?;
-        out.writeln(&format!(
-            "    \"bloom_estimated_fp_rate\": {},",
-            crate::codec::pack::bloom::estimated_fp_rate(
-                d.bloom_elements,
-                d.bloom_num_bits,
-                crate::codec::pack::bloom::DEFAULT_NUM_HASH_FUNCTIONS
-            )
-        ))?;
+        // bloom_num_bits == 0 means this record predates the field (see the
+        // matching comment in print_summary above) -- omit the derived
+        // capacity/FP-rate keys entirely rather than emit misleading
+        // designed_capacity(0) = 0 / worst-case estimated_fp_rate values.
+        if d.bloom_num_bits != 0 {
+            out.writeln(&format!(
+                "    \"bloom_designed_capacity\": {},",
+                crate::codec::pack::bloom::designed_capacity(d.bloom_num_bits)
+            ))?;
+            out.writeln(&format!(
+                "    \"bloom_estimated_fp_rate\": {},",
+                crate::codec::pack::bloom::estimated_fp_rate(
+                    d.bloom_elements,
+                    d.bloom_num_bits,
+                    crate::codec::pack::bloom::DEFAULT_NUM_HASH_FUNCTIONS
+                )
+            ))?;
+        }
         out.writeln(&format!("    \"pack_sizes_after\": {}", sizes_json))?;
         out.writeln("  },")?;
     }

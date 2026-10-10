@@ -86,10 +86,14 @@ touches working-tree files — the same reasoning as `expand` above: a concurren
 `push` must not scan a file `restore` is partway through fetching or writing.
 This means the lock can be held for as long as the remote transfer takes when a
 large amount of content is missing from the local cache; `restore` does not
-release and reacquire it between the fetch and apply phases. A `push` or `pull`
-that starts while a large `restore` is fetching simply waits for the lock like
-it would for any other slow holder — there is no separate timeout or fallback
-for this case.
+release and reacquire it between the fetch and apply phases. Because
+acquisition uses `LOCK_EX | LOCK_NB` (see "Lock acquisition" above), a `push`
+or `pull` that starts while a large `restore` is fetching does not wait for
+it: acquisition fails immediately with the lock-contention error described in
+"Lock contention" below (`error: Unable to acquire lock
+'.omemfs/clone_root.lock': file exists.` plus the holder's PID and command
+name) — there is no separate timeout, retry, or fallback for this case; the
+caller must retry once `restore` finishes.
 
 ---
 

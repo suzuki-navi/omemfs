@@ -3,8 +3,6 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rayon::prelude::*;
-
 use crate::codec;
 use crate::codec::chunk::blob_fully_cached;
 use crate::dtimer_l1;
@@ -15,6 +13,7 @@ use crate::repo::Repo;
 use crate::store::ObjectStore;
 use crate::store::stats::IoRecord;
 use crate::stub::{self, StubRecord, StubTargetType};
+use crate::commands::transfer;
 use crate::term::{ColorChoice, Styles, color_enabled, paint};
 use crate::tree_ops;
 
@@ -135,6 +134,18 @@ pub fn run(opts: RestoreOptions) -> Result<(), Error> {
                     // over `to_heal` is enough -- no shared queue/visited-set
                     // machinery is needed.
                     //
+                    // M6: `transfer::parallel_map` (not `rayon`'s
+                    // `par_iter().map(...).collect()`, which held every
+                    // healed object's full `Vec<u8>` payload resident for the
+                    // whole batch) runs on `workers` threads honouring the
+                    // same `OMEMFS_TRANSFER_CONCURRENCY` knob every other
+                    // network fan-out in this codebase respects, and the
+                    // fetched bytes are discarded immediately (`.map(|_|
+                    // ())`) -- a heal's only lasting effect is populating the
+                    // local cache, which the next `plan_restore` re-run below
+                    // reads back from. Peak memory here is therefore `workers
+                    // * one object`, not `to_heal.len() * one object`.
+                    //
                     // `MAX_HEAL_ITERATIONS` is a safety net, not an expected
                     // limit: real clone_root hierarchies are nowhere near
                     // this deep, so hitting it only happens in a bug
@@ -143,6 +154,8 @@ pub fn run(opts: RestoreOptions) -> Result<(), Error> {
                     // any other permanently-unresolved hash, rather than the
                     // command hanging or erroring out.
                     const MAX_HEAL_ITERATIONS: usize = 10_000;
+                    let heal_workers = transfer::resolve_concurrency(&pack_reader)
+                        .max(transfer::resolve_concurrency(&local));
                     let mut permanently_unresolved: HashSet<Hash> = HashSet::new();
                     let mut iterations = 0usize;
                     loop {
@@ -160,9 +173,10 @@ pub fn run(opts: RestoreOptions) -> Result<(), Error> {
                             permanently_unresolved.extend(to_heal);
                             break;
                         }
-                        let results: Vec<(Hash, Result<Vec<u8>, Error>)> = to_heal
-                            .par_iter()
-                            .map(|hash| {
+                        let results: Vec<(Hash, Result<(), Error>)> = transfer::parallel_map(
+                            &to_heal,
+                            heal_workers,
+                            &|hash| {
                                 (
                                     hash.clone(),
                                     codec::ensure_local_then_read(
@@ -170,10 +184,11 @@ pub fn run(opts: RestoreOptions) -> Result<(), Error> {
                                         &local,
                                         hash,
                                         remote_key,
-                                    ),
+                                    )
+                                    .map(|_bytes| ()),
                                 )
-                            })
-                            .collect();
+                            },
+                        );
                         let mut healed_any = false;
                         for (hash, result) in results {
                             match result {
@@ -263,8 +278,14 @@ pub fn run(opts: RestoreOptions) -> Result<(), Error> {
     let phase3 = crate::progress::begin_phase("Restore working tree");
     let mut counts = Counts::default();
     let mut unavailable_paths: Vec<String> = Vec::new();
+    let mut failed_paths: Vec<String> = Vec::new();
     for action in plan.actions {
-        apply_action(
+        // L5: capture a display path for this action *before* `apply_action`
+        // takes ownership of it, so a `failed:` line can still name the path
+        // even though `action` itself may have been partially consumed by
+        // the attempt.
+        let path = action_display_path(&action);
+        if let Err(e) = apply_action(
             action,
             &repo.work_dir,
             &repo.work_dir,
@@ -272,7 +293,21 @@ pub fn run(opts: RestoreOptions) -> Result<(), Error> {
             &unavailable_hashes,
             &mut counts,
             &mut unavailable_paths,
-        )?;
+        ) {
+            // L5: continue-on-error, uniformly for every non-panic error --
+            // no special-casing by error kind. A single bad path (a
+            // permission error, a stale stub record whose path turned out to
+            // be a non-empty directory -- L7 -- or any other genuine I/O
+            // failure) must not discard every other, unrelated action
+            // already queued in this same Apply loop. Note this can leave
+            // *this one* path partially applied (e.g. a file half-written);
+            // that was already a pre-existing risk for any single action
+            // failing, on its own, before this change -- the change here
+            // only stops it from being contagious to unrelated paths.
+            print_failed(&path, &e);
+            counts.failed += 1;
+            failed_paths.push(path);
+        }
     }
     // A directory whose clone_root tree object could never be read (locally
     // or, after phase 2, from the remote) has no action at all in `plan` --
@@ -305,10 +340,14 @@ pub fn run(opts: RestoreOptions) -> Result<(), Error> {
         duration_ms,
     );
 
-    if !unavailable_paths.is_empty() {
+    // L5: the exit code and message account for both kinds of unrestored
+    // path -- an unresolved object (`unavailable:`) and a genuine per-action
+    // I/O failure (`failed:`) -- since both leave the working tree short of
+    // matching `clone_root` at that path.
+    if !unavailable_paths.is_empty() || !failed_paths.is_empty() {
         return Err(Error::Other(format!(
             "{} path(s) could not be restored",
-            unavailable_paths.len()
+            unavailable_paths.len() + failed_paths.len()
         )));
     }
     Ok(())
@@ -367,6 +406,16 @@ enum Action {
         logical_rel: String,
         stub_abs: PathBuf,
     },
+    /// L6: a conflict helper (`<path>.omemfs-conflict-{base,local,remote}`)
+    /// or the `<path>.omemfs-conflict-meta` metadata sidecar, found while
+    /// scanning a directory for extras (i.e. its own base path has no
+    /// restore/delete action of its own to piggy-back this cleanup onto --
+    /// see `remove_conflict_helpers`/`conflict_helpers_exist` for the other
+    /// case, where it does). Removed silently: this is omemfs-internal
+    /// bookkeeping, never user content, so unlike `DeleteFile` it is neither
+    /// printed as `deleted:` nor counted in the summary -- the same
+    /// treatment an orphaned stub file already gets.
+    DeleteConflictArtifact { rel: String },
     ReconcileFileStubToBlob {
         rel: String,
         hash: Hash,
@@ -456,6 +505,15 @@ fn plan_restore(
     let mut seen_rels: HashSet<String> = HashSet::new();
     plan.unresolved_trees
         .retain(|(_, rel)| seen_rels.insert(rel.clone()));
+    // L4: several paths can reference identical content (the same hash), so
+    // `plan_restore_blob_action` (below) can push the same hash onto
+    // `plan.pending` once per matching path. `transfer_objects_many` already
+    // dedups internally for the fetch itself, but the phase-2 "N object(s)
+    // fetched" count is computed from `plan.pending.len()` before the fetch,
+    // so an undeduped `pending` overcounts. Dedup by hash the same way
+    // `unresolved_trees` above is deduped by path.
+    let mut seen_hashes: HashSet<Hash> = HashSet::new();
+    plan.pending.retain(|h| seen_hashes.insert(h.clone()));
     // Insurance against any other source of duplicate actions (e.g. a future
     // planning path that does not go through `collapse_dedup_paths` above):
     // an exact duplicate -- same path AND same action kind -- is dropped
@@ -521,6 +579,7 @@ fn action_identity(action: &Action) -> (&'static str, String) {
             "DeleteOrphanFileStub",
             format!("{}::{}", logical_rel, stub_abs.display()),
         ),
+        Action::DeleteConflictArtifact { rel } => ("DeleteConflictArtifact", rel.clone()),
         Action::ReconcileFileStubToBlob { rel, .. } => ("ReconcileFileStubToBlob", rel.clone()),
         Action::ReconcileDirStubToTree { rel, .. } => ("ReconcileDirStubToTree", rel.clone()),
         Action::ReconcileDirStubToBlob { rel, .. } => ("ReconcileDirStubToBlob", rel.clone()),
@@ -870,6 +929,19 @@ fn plan_remove_added_files(
             }
             continue;
         }
+        // L6: a conflict helper or the metadata sidecar found here has no
+        // restore/delete action of its own for its base path (see the
+        // comment above) -- and, like a stub file, is omemfs-internal
+        // residue rather than user content. Route it to the silent
+        // `DeleteConflictArtifact` action instead of falling into the
+        // generic "unknown file" `DeleteFile` branch below, which would
+        // report it as `deleted:` and count it as if it were a real file the
+        // user is losing.
+        if crate::commands::conflict::is_conflict_artifact(&name) {
+            let rel = rel_path(&base_dir.join(&name), work_dir);
+            plan.actions.push(Action::DeleteConflictArtifact { rel });
+            continue;
+        }
         let file_type = entry.file_type().map_err(Error::Io)?;
         if known.contains(&name) {
             // Recurse into known subdirectories that are trees in clone_root.
@@ -1003,6 +1075,11 @@ struct Counts {
     restored: usize,
     deleted: usize,
     unavailable: usize,
+    /// L5: paths whose Apply raised a genuine I/O error (never a missing
+    /// object -- that is `unavailable` above). Reported as `failed: <path>:
+    /// <cause>` lines and included in the exit code / summary alongside
+    /// `unavailable`.
+    failed: usize,
 }
 
 /// Report a whole plan for `--dry-run`: prints and counts every action, but
@@ -1075,6 +1152,9 @@ fn report_action(
             print_action(true, "delete", logical_rel);
             counts.deleted += 1;
         }
+        // L6: omemfs-internal residue, never user content -- no report, no
+        // count, in `--dry-run` either.
+        Action::DeleteConflictArtifact { .. } => {}
         Action::ReconcileFileStubToBlob { rel, .. }
         | Action::ReconcileDirStubToTree { rel, .. }
         | Action::ReconcileDirStubToBlob { rel, .. }
@@ -1114,7 +1194,7 @@ fn apply_action(
                 return Ok(());
             }
             let abs = work_dir.join(&rel);
-            write_blob(&abs, &hash, &mtime, &mode, local, stub_root, &rel)?;
+            write_blob(work_dir, &abs, &hash, &mtime, &mode, local, stub_root, &rel)?;
             print_action(false, "restore", &rel);
             counts.restored += 1;
             remove_conflict_helpers(&abs);
@@ -1127,16 +1207,22 @@ fn apply_action(
             // but Phase 2's fetch for *other* pending blobs can still take
             // real wall-clock time in between, during which something
             // outside omemfs could have removed this path. Re-check right
-            // before `apply_mode`, which fails silently on a missing file
-            // (`src/fsmeta.rs`), so without this check the command would
-            // otherwise print "restored:" for a path that no longer exists.
+            // before the chmod below, so the command does not otherwise
+            // print "restored:" for a path that no longer exists.
             if !abs.exists() {
                 print_action(false, "unavailable", &rel);
                 counts.unavailable += 1;
                 unavailable_paths.push(rel);
                 return Ok(());
             }
-            crate::fsmeta::apply_mode(&abs, &mode);
+            // N2 (design/03_sync_model.md, "Write safety: the working-tree
+            // write boundary"): this is the "mode-only, no content write"
+            // case -- there is no guarded write already in flight to piggy-
+            // back the chmod onto, so the parent is resolved through
+            // `fsguard` directly instead of a path-based `apply_mode` call,
+            // which would otherwise follow a symlinked component.
+            let (dir, leaf) = crate::fsguard::open_leaf(work_dir, &rel, false)?;
+            dir.set_mode(&leaf, &mode)?;
             print_action(false, "restore", &rel);
             counts.restored += 1;
             remove_conflict_helpers(&abs);
@@ -1149,7 +1235,7 @@ fn apply_action(
             let abs = work_dir.join(&rel);
             stub::remove(stub_root, &rel).ok();
             stub::remove_dir_stub(stub_root, &rel).ok();
-            crate::fsmeta::write_symlink_atomic(&abs, &target)?;
+            crate::fsmeta::write_symlink_atomic(work_dir, &abs, &target)?;
             crate::fsmeta::restore_symlink_mtime(&abs, &mtime);
             remove_conflict_helpers(&abs);
             print_action(false, "restore", &rel);
@@ -1169,10 +1255,46 @@ fn apply_action(
             // does not have must still not survive `restore`.
             let delete_file = delete_file || abs.is_file() || stub::exists(stub_root, &rel);
             if delete_file {
-                remove_file_tolerant(&abs)?;
-                stub::remove(stub_root, &rel)?;
-                print_action(false, "delete", &rel);
-                counts.deleted += 1;
+                // L7: `crate::fsguard::remove_file_tolerant`'s `unlinkat`
+                // only tolerates `NotFound` -- an `EISDIR` from it must
+                // still propagate at its other call sites, where a
+                // directory appearing unexpectedly is a real-bug signal, not
+                // something to paper over. Here specifically, though, a
+                // stale FILE-type stub record (or a plain file) whose path
+                // is actually a directory on disk is an expected case: the
+                // type may have changed between Plan and Apply, or the stub
+                // record is simply stale. Check the on-disk type first
+                // (`symlink_metadata`, never following a symlink there) so
+                // this one path gets its own handling instead of hitting
+                // `EISDIR` from the tolerant helper.
+                match fs::symlink_metadata(&abs) {
+                    Ok(md) if md.is_dir() => {
+                        // Never turn a "delete one file" action into a
+                        // recursive directory delete -- a Plan/Apply race
+                        // making `abs` a non-empty directory would make
+                        // `remove_dir_all` a real data-loss hazard. Drop the
+                        // stale stub record, then require the directory to
+                        // already be empty; a non-empty directory surfaces
+                        // as a genuine error for this one path only (L5
+                        // turns that into a `failed:` line rather than
+                        // aborting the rest of Apply).
+                        stub::remove(stub_root, &rel)?;
+                        fs::remove_dir(&abs)?;
+                        print_action(false, "delete", &rel);
+                        counts.deleted += 1;
+                    }
+                    _ => {
+                        // N1 (design/03_sync_model.md, "Write safety: the
+                        // working-tree write boundary"): this delete is
+                        // driven by a lexically-planned path, exactly like a
+                        // naive write would be, so it must go through the
+                        // same guarded boundary.
+                        crate::fsguard::remove_file_tolerant(work_dir, &abs)?;
+                        stub::remove(stub_root, &rel)?;
+                        print_action(false, "delete", &rel);
+                        counts.deleted += 1;
+                    }
+                }
             }
             if delete_dir_stub {
                 stub::remove_dir_stub(stub_root, &rel)?;
@@ -1192,8 +1314,10 @@ fn apply_action(
             // conflict helper already removed as a side effect of its base
             // path's own action (problem 2), or because it raced with an
             // external delete between Plan and Apply. Mirrors `stub::
-            // remove`'s NotFound-tolerant pattern (`src/stub.rs`).
-            remove_file_tolerant(&abs)?;
+            // remove`'s NotFound-tolerant pattern (`src/stub.rs`). Routed
+            // through fsguard (N1) rather than a bare path-based
+            // `fs::remove_file` -- see `Action::DeleteAbsent` above.
+            crate::fsguard::remove_file_tolerant(work_dir, &abs)?;
             stub::remove(stub_root, &rel)?;
             print_action(false, "delete", &rel);
             counts.deleted += 1;
@@ -1205,17 +1329,26 @@ fn apply_action(
             fs::remove_dir(&abs).ok();
         }
         Action::EnsureDir { rel } => {
-            fs::create_dir_all(work_dir.join(&rel))?;
+            crate::fsguard::create_dir_all(work_dir, &work_dir.join(&rel))?;
         }
         Action::DeleteOrphanFileStub {
             logical_rel,
             stub_abs,
         } => {
             // NotFound-tolerant for the same reasons as `Action::DeleteFile`
-            // above (problem 1).
-            remove_file_tolerant(&stub_abs)?;
+            // above (problem 1). Routed through fsguard (N1).
+            crate::fsguard::remove_file_tolerant(work_dir, &stub_abs)?;
             print_action(false, "delete", &logical_rel);
             counts.deleted += 1;
+        }
+        Action::DeleteConflictArtifact { rel } => {
+            // L6: omemfs-internal residue, never user content -- removed the
+            // same NotFound-tolerant way as any other stray file here, but
+            // with no `deleted:` line and no count increment (matching how
+            // an orphaned stub file inside a removed directory is already
+            // handled in `remove_added_dir`, below).
+            let abs = work_dir.join(&rel);
+            crate::fsguard::remove_file_tolerant(work_dir, &abs)?;
         }
         Action::ReconcileFileStubToBlob {
             rel,
@@ -1297,7 +1430,7 @@ fn apply_action(
         } => {
             stub::remove(stub_root, &rel)?;
             let abs = work_dir.join(&rel);
-            fs::create_dir_all(&abs)?;
+            crate::fsguard::create_dir_all(work_dir, &abs)?;
             stub::write_dir_stub(
                 stub_root,
                 &rel,
@@ -1344,7 +1477,17 @@ fn remove_added_dir(
         // implementation detail of the parent directory being removed).
         if stub::is_stub_filename(&name) {
             if !dry_run {
-                let _ = fs::remove_file(&abs);
+                let _ = crate::fsguard::remove_file_tolerant(work_dir, &abs);
+            }
+            continue;
+        }
+        // L6: a conflict helper or the metadata sidecar inside a directory
+        // that is itself being wholly removed is the same kind of
+        // omemfs-internal residue, treated the same way -- silently, with no
+        // `deleted:` line and no count increment.
+        if crate::commands::conflict::is_conflict_artifact(&name) {
+            if !dry_run {
+                let _ = crate::fsguard::remove_file_tolerant(work_dir, &abs);
             }
             continue;
         }
@@ -1355,8 +1498,9 @@ fn remove_added_dir(
                 print_action(true, "delete", &rel);
             } else {
                 // NotFound-tolerant for the same reasons as
-                // `Action::DeleteFile` (problem 1).
-                remove_file_tolerant(&abs)?;
+                // `Action::DeleteFile` (problem 1). Routed through fsguard
+                // (N1) rather than a bare path-based `fs::remove_file`.
+                crate::fsguard::remove_file_tolerant(work_dir, &abs)?;
                 stub::remove(stub_root, &rel)?;
                 print_action(false, "delete", &rel);
             }
@@ -1371,23 +1515,16 @@ fn remove_added_dir(
     Ok(())
 }
 
-/// Remove a file, tolerating the file already being absent. Problem 1:
-/// without this, two planned delete actions that ended up targeting the same
-/// path (a duplicate/overlapping path argument, or a conflict helper already
-/// removed as a side effect of its base path's own action -- problem 2)
-/// aborted the whole Apply phase with a bare ENOENT on the second attempt.
-/// Mirrors `stub::remove`'s (`src/stub.rs`) NotFound-tolerant pattern.
-fn remove_file_tolerant(path: &std::path::Path) -> Result<(), Error> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(Error::Io(e)),
-    }
-}
-
 /// Write a blob to `abs_path`, restoring mtime and the executable-bit mode.
-/// Removes any stub for this path.
+/// Removes any stub for this path. `materialise_blob_at` (via `fsguard`)
+/// resolves and creates `abs`'s parent directory itself, so there is no
+/// separate `create_dir_all` step here (Problem: a bare `fs::create_dir_all`
+/// used to run ahead of the guarded content write, creating directories
+/// outside the working tree even when the write itself was correctly
+/// refused -- design/03_sync_model.md, "Write safety: the working-tree write
+/// boundary").
 fn write_blob(
+    work_dir: &std::path::Path,
     abs: &std::path::Path,
     hash: &Hash,
     mtime: &Option<chrono::DateTime<chrono::Utc>>,
@@ -1396,10 +1533,7 @@ fn write_blob(
     stub_root: &std::path::Path,
     rel: &str,
 ) -> Result<(), Error> {
-    if let Some(parent) = abs.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    crate::fsmeta::materialise_blob_at(store, hash, abs, mtime, mode)?;
+    crate::fsmeta::materialise_blob_at(work_dir, store, hash, abs, mtime, mode)?;
     stub::remove(stub_root, rel)?;
     Ok(())
 }
@@ -1436,7 +1570,7 @@ fn needs_restore_blob(
 
 fn print_summary(counts: &Counts, dry_run: bool) {
     let total = counts.restored + counts.deleted;
-    if total == 0 && counts.unavailable == 0 {
+    if total == 0 && counts.unavailable == 0 && counts.failed == 0 {
         print_action(false, "plain", "Nothing to restore.");
         return;
     }
@@ -1446,18 +1580,62 @@ fn print_summary(counts: &Counts, dry_run: bool) {
             "plain",
             &format!("{} path(s) would be restored.", total),
         );
-    } else if counts.unavailable > 0 {
-        print_action(
-            false,
-            "plain",
-            &format!(
-                "{} path(s) restored, {} path(s) unavailable.",
-                total, counts.unavailable
-            ),
-        );
+    } else if counts.unavailable > 0 || counts.failed > 0 {
+        // L5: append an `, N path(s) failed` clause alongside the existing
+        // `unavailable` one, present only when non-zero, so a run with
+        // exactly one of the two kinds of unrestored path reads naturally
+        // (matching the pre-existing `unavailable`-only phrasing) while a
+        // run with both still reports each count explicitly.
+        let mut summary = format!("{} path(s) restored", total);
+        if counts.unavailable > 0 {
+            summary.push_str(&format!(", {} path(s) unavailable", counts.unavailable));
+        }
+        if counts.failed > 0 {
+            summary.push_str(&format!(", {} path(s) failed", counts.failed));
+        }
+        summary.push('.');
+        print_action(false, "plain", &summary);
     } else {
         print_action(false, "plain", &format!("{} path(s) restored.", total));
     }
+}
+
+/// L5: a best-effort display path for `action`, computed by borrowing it --
+/// safe to call immediately before `apply_action` consumes `action` by
+/// value, so a `failed:` line can still name the path an action that raised
+/// an error was for. Reuses `action_identity`'s own per-variant path
+/// extraction rather than duplicating it; the composite identity string
+/// `action_identity` builds for `DeleteOrphanFileStub` is irrelevant here --
+/// only its first (path) component is used, which for every variant is
+/// already the right thing to show a user.
+fn action_display_path(action: &Action) -> String {
+    action_identity(action).1
+}
+
+/// Print a `failed: <path>: <cause>` line for an action whose Apply raised a
+/// genuine error (L5, design/04_cli_spec.md "Errors"). A separate function
+/// from `print_action` rather than a new `kind` there: `print_action`'s kinds
+/// each have their own small, fixed vocabulary of prefixes, whereas this one
+/// embeds a caller-supplied, unbounded error message.
+fn print_failed(path: &str, err: &Error) {
+    let path = display_path(path);
+    let colored = color_enabled(ColorChoice::Auto, atty::is(atty::Stream::Stdout));
+    let styles = Styles::new();
+    let text = if colored {
+        format!("{}: {}: {}", paint(colored, styles.deleted, "failed"), path, err)
+    } else {
+        format!("failed: {}: {}", path, err)
+    };
+    crate::progress::emit_output_line(&text);
+}
+
+/// M7: substitute `.` for an empty path, for display purposes only. The
+/// repository root's working-tree path is genuinely `""` internally (e.g.
+/// `plan_tree`'s `rel_base` for the root call, and `work_dir.join("")` is a
+/// valid, correct path) -- that representation must not change, only how it
+/// is rendered to the user in an action line.
+fn display_path(path: &str) -> &str {
+    if path.is_empty() { "." } else { path }
 }
 
 /// Print a single action line. `kind` selects a color and prefix:
@@ -1476,7 +1654,14 @@ fn print_summary(counts: &Counts, dry_run: bool) {
 /// hardcoded prefix to recover `path` for coloring -- the caller formats,
 /// the callee un-formats -- so a one-character change to either prefix
 /// string would silently break coloring (refactor-instructions.md F2).
+///
+/// M7: `path` is substituted through [`display_path`] first (for every kind
+/// except `"plain"`, whose `path` argument is a whole free-form message, not
+/// a working-tree path), so an action line for the repository root -- whose
+/// `rel`/`rel_base` is genuinely `""` internally -- never prints as a bare
+/// `unavailable: ` or `would fetch: ` with nothing after the colon.
 fn print_action(dry_run: bool, kind: &str, path: &str) {
+    let path = if kind == "plain" { path } else { display_path(path) };
     let colored = color_enabled(ColorChoice::Auto, atty::is(atty::Stream::Stdout));
     let styles = Styles::new();
     let text = match kind {
@@ -1515,9 +1700,18 @@ fn print_action(dry_run: bool, kind: &str, path: &str) {
     crate::progress::emit_output_line(&text);
 }
 
-/// Remove the three conflict helper files for `base_path` if they exist.
+/// Remove the three conflict helper files, and the metadata sidecar, for
+/// `base_path` if they exist.
+///
+/// L6: this used to iterate only `CONFLICT_SUFFIXES` (the three helpers),
+/// which meant restoring a single conflicted path left its
+/// `.omemfs-conflict-meta` sidecar behind -- it was only ever cleaned up
+/// incidentally by a whole-tree restore's "unknown extra file" scan (see
+/// `Action::DeleteConflictArtifact`), and even then it used to be
+/// misreported as a `deleted:` line as if it were user content. Iterating
+/// `CONFLICT_ARTIFACT_SUFFIXES` here fixes the single-path case directly.
 fn remove_conflict_helpers(base_path: &std::path::Path) {
-    for suffix in crate::commands::conflict::CONFLICT_SUFFIXES {
+    for suffix in crate::commands::conflict::CONFLICT_ARTIFACT_SUFFIXES {
         let p = helper_path(base_path, suffix);
         if p.exists() {
             let _ = fs::remove_file(&p);
@@ -1525,9 +1719,10 @@ fn remove_conflict_helpers(base_path: &std::path::Path) {
     }
 }
 
-/// Returns true if any conflict helper file exists alongside `base_path`.
+/// Returns true if any conflict helper file (or the metadata sidecar) exists
+/// alongside `base_path`. See `remove_conflict_helpers` (L6).
 fn conflict_helpers_exist(base_path: &std::path::Path) -> bool {
-    crate::commands::conflict::CONFLICT_SUFFIXES
+    crate::commands::conflict::CONFLICT_ARTIFACT_SUFFIXES
         .iter()
         .any(|suffix| helper_path(base_path, suffix).exists())
 }
@@ -1539,8 +1734,8 @@ fn helper_path(base: &std::path::Path, suffix: &str) -> std::path::PathBuf {
 
 fn rel_path(abs: &std::path::Path, work_dir: &std::path::Path) -> String {
     abs.strip_prefix(work_dir)
-        .map(|p| p.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_else(|_| abs.to_string_lossy().replace('\\', "/"))
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| abs.to_string_lossy().into_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -1766,6 +1961,67 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // M7: root path rendered as "." in action lines
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn display_path_substitutes_dot_for_the_empty_root_path_only() {
+        assert_eq!(display_path(""), ".");
+        assert_eq!(display_path("sub/file.txt"), "sub/file.txt");
+        assert_eq!(display_path("."), ".");
+    }
+
+    // -----------------------------------------------------------------------
+    // L4: pending fetch set deduplicated by hash
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn plan_pending_has_one_entry_when_two_paths_share_identical_missing_content() {
+        // Two distinct paths reference the exact same (never-cached) blob
+        // content. The plan's pending-fetch set must contribute exactly one
+        // entry for the shared hash, not one per path -- the phase-2 "N
+        // object(s) fetched" summary counts distinct objects.
+        let local_dir = TempDir::new().unwrap();
+        let local = LocalStore::for_cache(local_dir.path());
+        let content = b"identical content referenced by two paths".to_vec();
+        let hash = crate::object::blob_hash(&content);
+        let root = store_tree(
+            &local,
+            vec![
+                blob_entry("a.txt", hash.clone(), content.len() as u64),
+                blob_entry("b.txt", hash.clone(), content.len() as u64),
+            ],
+        );
+
+        let work_dir = TempDir::new().unwrap();
+        // Neither path exists in the working tree at all.
+
+        let plan = plan_restore(
+            &root,
+            &[work_dir.path().to_path_buf()],
+            work_dir.path(),
+            work_dir.path(),
+            &local,
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.pending,
+            vec![hash],
+            "the pending set must be deduplicated to one entry for the shared hash"
+        );
+        let restore_actions = plan
+            .actions
+            .iter()
+            .filter(|a| matches!(a, Action::RestoreBlobContent { .. }))
+            .count();
+        assert_eq!(
+            restore_actions, 2,
+            "the plan's action list still has one RestoreBlobContent action per path"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Problem 1: path dedup / collapse
     // -----------------------------------------------------------------------
 
@@ -1857,7 +2113,11 @@ mod tests {
         // "sub" is a directory in clone_root; conflict helper files named
         // after it (`sub.omemfs-conflict-*`) are never seen by the
         // TreeEntry::Tree branch (it only recurses), so they must be picked
-        // up here as ordinary unknown files in the parent scan.
+        // up here as unknown files in the parent scan. L6: because these are
+        // omemfs-internal residue rather than user content, they get the
+        // silent `DeleteConflictArtifact` action (removed, but never
+        // reported as `deleted:` or counted), not the generic `DeleteFile`
+        // action an arbitrary unknown file would get.
         let local_dir = TempDir::new().unwrap();
         let local = LocalStore::for_cache(local_dir.path());
         let sub_tree = store_tree(&local, vec![]);
@@ -1882,9 +2142,54 @@ mod tests {
 
         assert!(
             plan.actions.iter().any(
-                |a| matches!(a, Action::DeleteFile { rel } if rel == "sub.omemfs-conflict-base")
+                |a| matches!(a, Action::DeleteConflictArtifact { rel } if rel == "sub.omemfs-conflict-base")
             ),
-            "a conflict helper for a directory base path must still be planned for deletion"
+            "a conflict helper for a directory base path must still be planned for (silent) deletion"
+        );
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| matches!(a, Action::DeleteFile { rel } if rel == "sub.omemfs-conflict-base")),
+            "a conflict artifact must never be planned as a reported DeleteFile"
+        );
+    }
+
+    #[test]
+    fn plan_remove_added_files_plans_silent_deletion_of_a_stray_meta_sidecar() {
+        // A lone `.omemfs-conflict-meta` sidecar with no corresponding
+        // helper files (e.g. left behind by an older build that never
+        // cleaned it up on a single-path restore -- the exact L6 bug) must
+        // also be planned as a silent `DeleteConflictArtifact`, not a
+        // reported `DeleteFile`.
+        let local_dir = TempDir::new().unwrap();
+        let local = LocalStore::for_cache(local_dir.path());
+        let content = b"hello".to_vec();
+        let hash = store_blob(&local, &content);
+        let root = store_tree(&local, vec![blob_entry("file.txt", hash, content.len() as u64)]);
+
+        let work_dir = TempDir::new().unwrap();
+        fs::write(work_dir.path().join("file.txt"), &content).unwrap();
+        fs::write(
+            work_dir.path().join("file.txt.omemfs-conflict-meta"),
+            b"{}",
+        )
+        .unwrap();
+
+        let plan = plan_restore(
+            &root,
+            &[work_dir.path().to_path_buf()],
+            work_dir.path(),
+            work_dir.path(),
+            &local,
+        )
+        .unwrap();
+
+        assert!(
+            plan.actions.iter().any(
+                |a| matches!(a, Action::DeleteConflictArtifact { rel } if rel == "file.txt.omemfs-conflict-meta")
+            ),
+            "a stray meta sidecar must be planned for silent removal"
         );
     }
 
@@ -1961,6 +2266,84 @@ mod tests {
 
         assert!(!abs.exists());
         assert_eq!(counts.deleted, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // L7: DeleteAbsent hitting a directory where a file was expected
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn apply_delete_absent_removes_an_empty_stale_directory() {
+        // A stale FILE-type stub record (or plain-file expectation) whose
+        // path is actually an EMPTY directory on disk: Apply must remove the
+        // stale record and the (empty) directory, reporting it the same way
+        // an ordinary successful delete is reported.
+        let work_dir = TempDir::new().unwrap();
+        let abs = work_dir.path().join("p");
+        fs::create_dir(&abs).unwrap();
+
+        let action = Action::DeleteAbsent {
+            rel: "p".to_string(),
+            delete_file: true,
+            delete_dir_stub: false,
+        };
+        let local_dir = TempDir::new().unwrap();
+        let local = LocalStore::for_cache(local_dir.path());
+        let mut counts = Counts::default();
+        let mut unavailable_paths = Vec::new();
+        apply_action(
+            action,
+            work_dir.path(),
+            work_dir.path(),
+            &local,
+            &HashSet::new(),
+            &mut counts,
+            &mut unavailable_paths,
+        )
+        .unwrap();
+
+        assert!(!abs.exists(), "the now-empty stale directory must be removed");
+        assert_eq!(counts.deleted, 1);
+    }
+
+    #[test]
+    fn apply_delete_absent_fails_for_a_non_empty_stale_directory_without_recursing() {
+        // Same stale-record scenario, but the directory is NOT empty. Apply
+        // must never turn this into a recursive `remove_dir_all` -- it must
+        // fail this one path (which, thanks to L5, the caller in `run()`
+        // turns into a single `failed:` line rather than aborting the rest
+        // of Apply) and leave the directory and its contents untouched.
+        let work_dir = TempDir::new().unwrap();
+        let abs = work_dir.path().join("p");
+        fs::create_dir(&abs).unwrap();
+        fs::write(abs.join("inner.txt"), b"still here").unwrap();
+
+        let action = Action::DeleteAbsent {
+            rel: "p".to_string(),
+            delete_file: true,
+            delete_dir_stub: false,
+        };
+        let local_dir = TempDir::new().unwrap();
+        let local = LocalStore::for_cache(local_dir.path());
+        let mut counts = Counts::default();
+        let mut unavailable_paths = Vec::new();
+        let result = apply_action(
+            action,
+            work_dir.path(),
+            work_dir.path(),
+            &local,
+            &HashSet::new(),
+            &mut counts,
+            &mut unavailable_paths,
+        );
+
+        assert!(result.is_err(), "a non-empty stale directory must be a genuine error");
+        assert!(abs.is_dir(), "the directory must be left untouched");
+        assert!(
+            abs.join("inner.txt").exists(),
+            "the directory's contents must be left untouched"
+        );
+        assert_eq!(counts.deleted, 0);
     }
 
     // -----------------------------------------------------------------------

@@ -118,45 +118,17 @@ pub fn tree_entry_blob_from_fs(
 
 /// Create (or atomically replace) a symlink at `path` pointing to `target`.
 ///
-/// Ensures the parent directory exists, then removes any existing entry at
-/// `path` first WITHOUT following it: an existing directory is removed
-/// recursively (assumed empty by the time this runs -- per-entry deletions
-/// for its contents are applied separately by the caller), a regular file or
-/// symlink is unlinked. The new symlink is then created at a temporary
-/// sibling name and renamed into place, so that readers never observe a
-/// half-written or missing link.
-///
-/// Consolidates two near-identical copies (refactor-instructions.md E3):
-/// pull.rs's former `replace_with_symlink` (which skipped the
-/// `create_dir_all`, relying on the caller to have ensured the parent
-/// existed) and restore.rs's former `write_symlink`. `create_dir_all` on an
-/// already-existing parent is a cheap no-op stat, so unifying on "always
-/// ensure the parent" changes nothing observable for pull's call site.
-pub fn write_symlink_atomic(path: &Path, target: &str) -> Result<(), Error> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    match std::fs::symlink_metadata(path) {
-        Ok(md) if md.file_type().is_dir() => {
-            let _ = std::fs::remove_dir_all(path);
-        }
-        Ok(_) => {
-            std::fs::remove_file(path)?;
-        }
-        Err(_) => {}
-    }
-    #[cfg(unix)]
-    {
-        let tmp = path.with_extension("omemfs-symlink-tmp");
-        let _ = std::fs::remove_file(&tmp);
-        std::os::unix::fs::symlink(target, &tmp)?;
-        std::fs::rename(&tmp, path)?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = target;
-    }
-    Ok(())
+/// Routes through `fsguard::write_symlink` (design/03_sync_model.md, "Write
+/// safety: the working-tree write boundary"), which resolves `path`'s parent
+/// component-by-component from a `work_dir` directory fd and creates the
+/// symlink at a temporary sibling name before renaming it into place, so
+/// readers never observe a half-written or missing link, and a component
+/// strictly below `work_dir` that has been swapped for a symlink is refused
+/// rather than followed. `work_dir` must be the true repository root, not a
+/// scoped subdirectory -- passing a scoped directory would exempt everything
+/// at or above it from the check.
+pub fn write_symlink_atomic(work_dir: &Path, path: &Path, target: &str) -> Result<(), Error> {
+    crate::fsguard::write_symlink(work_dir, path, target)
 }
 
 /// Stream `hash`'s content (already present in `store`) into `abs_path` via
@@ -176,6 +148,7 @@ pub fn write_symlink_atomic(path: &Path, target: &str) -> Result<(), Error> {
 /// `codec::ensure_local_then_read`'s doc comment for why that step resists
 /// a single shared implementation). Callers remain responsible for both.
 pub fn materialise_blob_at(
+    work_dir: &Path,
     store: &dyn ObjectStore,
     hash: &Hash,
     abs_path: &Path,
@@ -185,13 +158,35 @@ pub fn materialise_blob_at(
     // Streaming materialisation (temp + rename, bounded memory): a crash
     // mid-write must not leave a half-written file that looks like a local
     // modification. See design/11 and design/02 "Streaming read".
-    crate::codec::chunk::materialise_to_file(store, hash, None, abs_path)?;
-    if let Some(mt) = mtime {
-        let ft = FileTime::from_unix_time(mt.timestamp(), mt.timestamp_subsec_nanos());
-        filetime::set_file_mtime(abs_path, ft).ok();
+    //
+    // The working-tree write boundary (`fsguard`) is enforced inside
+    // `materialise_to_file` itself, not here: `expand`'s top-level blob-stub
+    // branch and `pull`'s conflict-helper-file write call
+    // `codec::chunk::materialise_to_file` directly, bypassing this wrapper,
+    // so checking one level down is what actually covers every call site
+    // (design/03_sync_model.md, "Write safety: the working-tree write
+    // boundary"). `work_dir` must be the true repository root, not a scoped
+    // subdirectory.
+    crate::codec::chunk::materialise_to_file(work_dir, store, hash, None, abs_path)?;
+    // Apply mtime/mode via the same guarded directory chain (N2): re-resolve
+    // the parent through `fsguard` rather than a path-based `filetime`/
+    // `fs::set_permissions` call, so a symlinked component cannot redirect
+    // these metadata mutations either. Best-effort, matching the pre-fsguard
+    // silent-on-error semantics of `apply_mode`/`filetime::set_file_mtime`:
+    // the content write above already succeeded, so a failure here can only
+    // be an extremely narrow post-write race.
+    if let Ok(rel) = abs_path.strip_prefix(work_dir) {
+        // `\` is an ordinary Linux filename byte, not a separator -- do not
+        // rewrite it to `/` (design/01_object_model.md invariant #5).
+        let rel_str = rel.to_string_lossy().into_owned();
+        if let Ok((dir, leaf)) = crate::fsguard::open_leaf(work_dir, &rel_str, false) {
+            if let Some(mt) = mtime {
+                let ft = FileTime::from_unix_time(mt.timestamp(), mt.timestamp_subsec_nanos());
+                dir.set_mtime(&leaf, ft).ok();
+            }
+            dir.set_mode(&leaf, mode).ok();
+        }
     }
-    // The rename resets permissions, so mode must be re-applied after it.
-    apply_mode(abs_path, mode);
     Ok(())
 }
 
@@ -335,6 +330,91 @@ mod tests {
         filetime::set_file_mtime(&f, ft).unwrap();
         let got = mtime_from_metadata(&fs::metadata(&f).unwrap());
         assert_eq!(got, Some(want));
+    }
+
+    // -------------------------------------------------------------------
+    // Working-tree write boundary (design/03_sync_model.md, "Write safety:
+    // the working-tree write boundary"). Deeper coverage of the guard
+    // mechanism itself (symlinked intermediate components at any depth, a
+    // symlinked `work_dir` root, component validation, etc.) lives in
+    // `src/fsguard.rs`'s own unit tests; these just confirm
+    // `materialise_blob_at`/`write_symlink_atomic` are wired to it.
+    // -------------------------------------------------------------------
+
+    #[test]
+    #[cfg(unix)]
+    fn materialise_blob_at_refuses_to_write_through_symlinked_parent() {
+        let work_dir = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+
+        let sub = work_dir.path().join("sub");
+        std::os::unix::fs::symlink(outside.path(), &sub).unwrap();
+
+        let cache_dir = tempfile::TempDir::new().unwrap();
+        let store = crate::store::local::LocalStore::for_cache(cache_dir.path());
+        let content = b"payload";
+        let hash = crate::object::blob_hash(content);
+        let serialised = crate::object::serialise_blob(content);
+        crate::codec::chunk::store_chunked(&store, &hash, &serialised, None).unwrap();
+
+        let dest = sub.join("child.txt");
+        let err = materialise_blob_at(work_dir.path(), &store, &hash, &dest, &None, &None)
+            .unwrap_err();
+        assert!(matches!(err, Error::SymlinkEscape(_)));
+        assert!(
+            !outside.path().join("child.txt").exists(),
+            "content must never be written outside work_dir"
+        );
+    }
+
+    #[test]
+    fn materialise_blob_at_writes_normally_through_real_dirs() {
+        // Regression guard: the guard must not block ordinary materialisation
+        // through real, non-symlinked directories.
+        let work_dir = tempfile::TempDir::new().unwrap();
+        let sub = work_dir.path().join("sub");
+        fs::create_dir_all(&sub).unwrap();
+
+        let cache_dir = tempfile::TempDir::new().unwrap();
+        let store = crate::store::local::LocalStore::for_cache(cache_dir.path());
+        let content = b"payload";
+        let hash = crate::object::blob_hash(content);
+        let serialised = crate::object::serialise_blob(content);
+        crate::codec::chunk::store_chunked(&store, &hash, &serialised, None).unwrap();
+
+        let dest = sub.join("child.txt");
+        materialise_blob_at(work_dir.path(), &store, &hash, &dest, &None, &None).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), content);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_symlink_atomic_refuses_to_write_through_symlinked_parent() {
+        let work_dir = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+
+        let sub = work_dir.path().join("sub");
+        std::os::unix::fs::symlink(outside.path(), &sub).unwrap();
+
+        let dest = sub.join("link");
+        let err = write_symlink_atomic(work_dir.path(), &dest, "target").unwrap_err();
+        assert!(matches!(err, Error::SymlinkEscape(_)));
+        assert!(
+            !outside.path().join("link").exists(),
+            "symlink must never be created outside work_dir"
+        );
+    }
+
+    #[test]
+    fn write_symlink_atomic_writes_normally_through_real_dirs() {
+        // The parent directory ("sub") does not exist yet -- write_symlink_
+        // atomic (via fsguard) must create it, matching the old behaviour.
+        let work_dir = tempfile::TempDir::new().unwrap();
+        let sub = work_dir.path().join("sub");
+
+        let dest = sub.join("link");
+        write_symlink_atomic(work_dir.path(), &dest, "target").unwrap();
+        assert_eq!(fs::read_link(&dest).unwrap(), Path::new("target"));
     }
 
     #[test]

@@ -122,7 +122,7 @@ pub fn scan_and_store_with_cache(
         .strip_prefix(work_dir)
         .unwrap_or(std::path::Path::new(""))
         .to_string_lossy()
-        .replace('\\', "/");
+        .into_owned();
     let rel_prefix = rel_prefix.trim_matches('/').to_string();
     // Scope-limited filter load (design/05): when scanning a subtree (`dir` is a
     // descendant of `work_dir`), load only the filters that can affect in-scope
@@ -392,17 +392,22 @@ fn scan_dir(
                 if n == ".omemfs" {
                     continue;
                 }
-                if is_conflict_helper(&n) {
+                // Conflict helpers and the metadata sidecar (L6:
+                // `crate::commands::conflict::is_conflict_artifact`, the
+                // single shared predicate -- avoids this check and the
+                // per-path cleanup in `restore.rs` drifting out of sync, as
+                // they once did when the sidecar was missing from an older,
+                // separate copy of the suffix list) are excluded from
+                // scan/push: they are internal state consumed by `omemfs
+                // conflict accept`, not working-tree content. Only the three
+                // helper suffixes are ever tracked in `conflict_paths`
+                // (`conflict_base_name` recognises those and no others); the
+                // sidecar contributes nothing there and is simply skipped.
+                if crate::commands::conflict::is_conflict_artifact(&n) {
                     if let Some(base) = conflict_base_name(&n) {
                         let rel = join_rel(rel_prefix, base);
                         side.conflict_paths.insert(rel);
                     }
-                    continue;
-                }
-                // The conflict metadata sidecar is excluded from scan/push exactly
-                // like the conflict helpers: it is internal state consumed by
-                // `omemfs conflict accept`, not working-tree content.
-                if is_conflict_meta(&n) {
                     continue;
                 }
                 // Unknown reserved name (produced by a newer omemfs version): warn
@@ -888,16 +893,20 @@ fn process_file_job(job: &FileJob, cfg: &FileJobConfig<'_>) -> Result<FileJobRes
     //     OR (entry.sealed AND seals_trusted)     -- verified-present, and
     //                                                that verification is
     //                                                still trustworthy
-    //     OR store.exists(entry.hash)             -- fall back to the check
+    //     OR blob_fully_cached(store, entry.hash) -- fall back to the check
     //                                                this replaces
     // Only the middle branch is new; it never changes what a scan accepts, it
-    // only skips a `store.exists()` call whose answer is already known.
+    // only skips a local-existence check whose answer is already known.
+    // The third branch must be `blob_fully_cached`, not a bare
+    // `store.exists()`: for a chunked blob, `exists()` on the manifest hash
+    // alone says nothing about whether every chunk it lists is still present
+    // (design/07 "Depth of the local-existence check").
     if let Some(cache) = cfg.stat_cache
         && let Some(fs_mtime_sys) = fs_mtime_st
         && let Some(cached_entry) = cache.lookup_current_entry(rel_path, fs_mtime_sys, file_size)
         && (!cfg.write_blobs
             || (cached_entry.sealed && cache.seals_trusted())
-            || cfg.store.exists(&cached_entry.hash)?)
+            || codec::chunk::blob_fully_cached(cfg.store, &cached_entry.hash)?)
     {
         let cached_hash = &cached_entry.hash;
         let mtime = mtime_stable(
@@ -911,9 +920,10 @@ fn process_file_job(job: &FileJob, cfg: &FileJobConfig<'_>) -> Result<FileJobRes
             cache_hit: true,
             fallback_hit: false,
             // The blob is confirmed present exactly when write_blobs is true:
-            // either it was already sealed-and-trusted, or store.exists() was
-            // just called and returned true (the && chain above short-circuits
-            // otherwise). A read-only scan never checked, so it is not sealed.
+            // either it was already sealed-and-trusted, or blob_fully_cached()
+            // was just called and returned true (the && chain above
+            // short-circuits otherwise). A read-only scan never checked, so
+            // it is not sealed.
             blob_sealed: cfg.write_blobs,
         };
         let entry = TreeEntry::Blob {
@@ -926,11 +936,16 @@ fn process_file_job(job: &FileJob, cfg: &FileJobConfig<'_>) -> Result<FileJobRes
         return Ok((Some(entry), Some((rel_path.clone(), scanned)), None));
     }
 
-    // Fallback: clone_root mtime+size match outside the racy window.
+    // Fallback: clone_root mtime+size match outside the racy window. The
+    // local-existence check here must be the same `blob_fully_cached` depth
+    // as the STAT_CACHE-hit branch above -- accepting a fallback hit on a
+    // manifest-only `store.exists()` while a chunk is missing would
+    // re-establish `sealed = true` on a blob that is not actually
+    // retrievable (design/07 "Depth of the local-existence check").
     if let Some(cached_entry) = cfg.clone_root_entries.and_then(|m| m.get(rel_path))
         && can_skip_hash(cached_entry, file_size, fs_mtime_st, cfg.now)
         && let Some(cached_hash) = cached_entry.hash()
-        && (!cfg.write_blobs || cfg.store.exists(cached_hash)?)
+        && (!cfg.write_blobs || codec::chunk::blob_fully_cached(cfg.store, cached_hash)?)
     {
         let (hash, cr_mtime) = match cached_entry {
             TreeEntry::Blob { hash, mtime, .. } => (hash.clone(), *mtime),
@@ -948,7 +963,7 @@ fn process_file_job(job: &FileJob, cfg: &FileJobConfig<'_>) -> Result<FileJobRes
                     cache_hit: false,
                     fallback_hit: true,
                     // Present exactly when write_blobs is true (the && chain
-                    // above required store.exists() == true in that case).
+                    // above required blob_fully_cached() == true in that case).
                     blob_sealed: cfg.write_blobs,
                 },
             )
@@ -1200,20 +1215,13 @@ pub fn is_reserved_name(name: &str) -> bool {
 }
 
 /// Returns true if `name` is a reserved name that this version recognises:
-/// `.omemfs-stub`, `.omemfs-conflict-{base,local,remote}`, or `.omemfs-filter`
-/// (in standalone or file-adjacent form). See design/09_reserved_names.md.
+/// `.omemfs-stub`, `.omemfs-conflict-{base,local,remote,meta}`, or
+/// `.omemfs-filter` (in standalone or file-adjacent form). See
+/// design/09_reserved_names.md.
 pub fn is_known_reserved_name(name: &str) -> bool {
     stub::is_stub_filename(name)
-        || is_conflict_helper(name)
-        || is_conflict_meta(name)
+        || crate::commands::conflict::is_conflict_artifact(name)
         || name == ".omemfs-filter"
-}
-
-/// Returns true if `name` is the conflict metadata sidecar produced by pull
-/// (`<base>.omemfs-conflict-meta`). Like the conflict helpers, it is excluded
-/// from scan/push and consumed by `omemfs conflict accept`.
-pub fn is_conflict_meta(name: &str) -> bool {
-    name.ends_with(".omemfs-conflict-meta")
 }
 
 /// Returns true if `name` matches the reserved `.omemfs-` namespace but is NOT
@@ -1267,6 +1275,24 @@ mod tests {
     use crate::store::local::LocalStore;
     use crate::tree_ops;
     use std::fs;
+
+    /// Deterministic pseudo-random byte generator (xorshift64*), mirroring
+    /// `codec::chunk`'s test helper of the same name. Only needs to be
+    /// reproducible and "random enough" that FastCDC finds cut points, so a
+    /// large-enough buffer reliably chunks into >= 2 pieces (CDC_MIN = 1 MiB).
+    fn pseudo_random(seed: u64, len: usize) -> Vec<u8> {
+        let mut state = seed | 1;
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            let v = state.wrapping_mul(0x2545F4914F6CDD1D);
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.truncate(len);
+        out
+    }
 
     /// With `write_blobs = false` (the ls/pull mode), the scan must:
     /// - return the SAME root hash as a `write_blobs = true` scan, and
@@ -1993,5 +2019,158 @@ mod tests {
         );
         let sf = result.files.get("a.txt").expect("a.txt rescanned");
         assert_eq!(sf.hash, a_hash, "content is unchanged, so the hash is stable");
+    }
+
+    // -----------------------------------------------------------------------
+    // Depth of the local-existence check (design/07 "Depth of the
+    // local-existence check", defect 1): a STAT_CACHE hit or clone-root
+    // fallback hit must be verified with `blob_fully_cached` (manifest AND
+    // every chunk), never a bare `store.exists()` on the manifest hash alone.
+    // -----------------------------------------------------------------------
+
+    /// (defect 1a) A STAT_CACHE hit whose entry is `sealed` but whose seal
+    /// trust was never established this scan (`seals_trusted() == false`)
+    /// falls through to the third branch of `process_file_job`'s skip
+    /// condition. For a chunked blob whose manifest object is present but one
+    /// chunk has been deleted, a shallow `store.exists()` on the manifest hash
+    /// would wrongly say "present"; `blob_fully_cached` must catch the missing
+    /// chunk and force a full recapture.
+    #[test]
+    fn stat_cache_hit_with_missing_chunk_forces_recapture_not_shallow_exists() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let work = dir.path();
+        let content = pseudo_random(0xABCD_EF01, 10 * 1024 * 1024);
+        fs::write(work.join("big.bin"), &content).unwrap();
+        let ft = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+        filetime::set_file_mtime(work.join("big.bin"), ft).unwrap();
+
+        let store_dir = tempfile::TempDir::new().unwrap();
+        let store = LocalStore::for_cache(store_dir.path());
+
+        // First scan: writes the manifest + all chunks, records a sealed
+        // entry (blob_sealed follows write_blobs=true).
+        let mut cache = StatCache::default();
+        let first =
+            scan_and_store_with_cache(work, work, &store, None, &cache, true).unwrap();
+        apply_scanned(&mut cache, &first.files);
+        let sf = first.files.get("big.bin").expect("scanned");
+        assert!(!sf.cache_hit, "first scan is always a miss");
+        let hash = sf.hash.clone();
+        assert!(
+            cache.is_sealed("big.bin"),
+            "a write_blobs scan must seal a freshly captured entry"
+        );
+
+        // Confirm chunking actually happened (a manifest object, not a flat
+        // single-object blob).
+        let manifest_raw = codec::store_read(&store, &hash, None).unwrap();
+        let chunk_hashes = crate::object::deserialise_manifest(&manifest_raw)
+            .expect("a 10 MiB pseudo-random file must be chunked");
+        assert!(chunk_hashes.len() >= 2, "expected at least 2 chunks");
+
+        // Delete exactly one chunk, keeping the manifest object itself intact.
+        let victim = chunk_hashes[0].clone();
+        let victim_path = store_dir.path().join(victim.as_str());
+        assert!(victim_path.exists(), "victim chunk must exist before removal");
+        fs::remove_file(&victim_path).unwrap();
+        assert!(
+            store.exists(&hash).unwrap(),
+            "the manifest object itself must still be present (only a chunk was deleted)"
+        );
+
+        // Second scan reuses the same cache: `compute_seals_trusted` was
+        // never called, so `seals_trusted()` stays false and the skip
+        // condition's middle branch cannot short-circuit -- it must fall
+        // through to the (now blob_fully_cached) third branch.
+        let second = scan_and_store_with_cache(work, work, &store, None, &cache, true).unwrap();
+        let sf2 = second.files.get("big.bin").expect("scanned again");
+        assert!(
+            !sf2.cache_hit,
+            "a STAT_CACHE hit whose manifest exists but is missing a chunk must not \
+             be accepted as present -- blob_fully_cached must catch it and force a \
+             full recapture, not a shallow store.exists() on the manifest hash alone"
+        );
+        assert_eq!(sf2.hash, hash, "content is unchanged, so the hash is stable");
+        assert!(
+            store.exists(&victim).unwrap(),
+            "the missing chunk must have been recaptured by the full re-read"
+        );
+    }
+
+    /// (defect 1b) The clone-root `(mtime, size)` fallback (a STAT_CACHE
+    /// *miss*) must apply the same `blob_fully_cached` depth as the
+    /// STAT_CACHE-hit branch. Accepting a fallback hit on a manifest-only
+    /// `store.exists()` while a chunk is missing would re-establish
+    /// `sealed = true` on a blob that is not actually retrievable, which is
+    /// exactly the gap that stops L3 recovery from converging (design/07
+    /// "Depth of the local-existence check").
+    #[test]
+    fn clone_root_fallback_with_missing_chunk_forces_recapture() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let work = dir.path();
+        let content = pseudo_random(0x1357_9BDF, 10 * 1024 * 1024);
+        fs::write(work.join("big.bin"), &content).unwrap();
+        let old_secs: i64 = 1_000_000_000;
+        let ft = filetime::FileTime::from_unix_time(old_secs, 0);
+        filetime::set_file_mtime(work.join("big.bin"), ft).unwrap();
+
+        let store_dir = tempfile::TempDir::new().unwrap();
+        let store = LocalStore::for_cache(store_dir.path());
+
+        // Populate the store with the blob (manifest + chunks) via a first
+        // scan with no clone root and an empty STAT_CACHE.
+        let first =
+            scan_and_store_with_cache(work, work, &store, None, &StatCache::default(), true)
+                .unwrap();
+        let hash = first.files["big.bin"].hash.clone();
+        let manifest_raw = codec::store_read(&store, &hash, None).unwrap();
+        let chunk_hashes = crate::object::deserialise_manifest(&manifest_raw)
+            .expect("a 10 MiB pseudo-random file must be chunked");
+        let victim = chunk_hashes[0].clone();
+        fs::remove_file(store_dir.path().join(victim.as_str())).unwrap();
+        assert!(store.exists(&hash).unwrap(), "manifest still present");
+
+        // Build a clone-root entry matching (mtime, size, hash) exactly, and
+        // scan with an EMPTY STAT_CACHE so process_file_job takes the
+        // clone-root fallback branch (a STAT_CACHE miss), not the cache-hit
+        // branch.
+        let mtime = Utc.timestamp_opt(old_secs, 0).single();
+        let mut clone_root: HashMap<String, TreeEntry> = HashMap::new();
+        clone_root.insert(
+            "big.bin".to_string(),
+            TreeEntry::Blob {
+                name: "big.bin".to_string(),
+                hash: hash.clone(),
+                mtime,
+                size: content.len() as u64,
+                mode: None,
+            },
+        );
+
+        let second = scan_and_store_with_cache(
+            work,
+            work,
+            &store,
+            Some(&clone_root),
+            &StatCache::default(),
+            true,
+        )
+        .unwrap();
+        let sf = second
+            .files
+            .get("big.bin")
+            .expect("scanned via clone-root fallback path");
+        assert!(
+            !sf.fallback_hit,
+            "a clone-root fallback whose manifest exists but is missing a chunk must \
+             not be accepted as present -- blob_fully_cached must catch it and force \
+             a full recapture instead of a metadata-only fallback"
+        );
+        assert!(!sf.cache_hit);
+        assert_eq!(sf.hash, hash, "content is unchanged, so the hash is stable");
+        assert!(
+            store.exists(&victim).unwrap(),
+            "the missing chunk must have been recaptured by the full re-read"
+        );
     }
 }

@@ -1101,7 +1101,14 @@ setup_two_clones() {
     grep -q "cmd_local" logs/.zsh_history
     grep -q "cmd_remote" logs/.zsh_history
 
-    run "$OMEMFS" push
+    # Push scoped to "logs", matching what was actually pulled/merged.
+    # clone2 has only ever done scoped pulls of "logs", so clone_root never
+    # recorded the repo root's other entries (e.g. the default
+    # `.omemfs-filter` clone --new creates); an unscoped push would compare
+    # the whole tree against remote and spuriously look diverged there even
+    # though nothing outside "logs" is actually at risk (design/03_sync_model.md,
+    # "Push → Steps" step 4b applies to the whole tree for a full push).
+    run "$OMEMFS" push logs
     [ "$status" -eq 0 ]
 }
 
@@ -1143,7 +1150,9 @@ setup_two_clones() {
     grep -q "cmd_local" .zsh_history
     grep -q "cmd_remote" .zsh_history
 
-    run "$OMEMFS" push
+    # Push scoped to ".zsh_history", matching what was actually pulled/merged
+    # (same rationale as the subdirectory-scoped variant above).
+    run "$OMEMFS" push .zsh_history
     [ "$status" -eq 0 ]
 }
 

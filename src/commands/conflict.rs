@@ -38,14 +38,21 @@ pub(crate) struct ConflictMeta {
 
 impl ConflictMeta {
     /// Write the sidecar JSON for the conflict whose base file is `base_path`.
-    /// A no-op when neither side carries any metadata.
-    pub(crate) fn write(&self, base_path: &std::path::Path) -> Result<(), Error> {
+    /// A no-op when neither side carries any metadata. `work_dir` must be the
+    /// true repository root (design/03_sync_model.md, "Write safety: the
+    /// working-tree write boundary") -- passing a scoped subdirectory would
+    /// exempt everything at or above it from the check.
+    pub(crate) fn write(
+        &self,
+        work_dir: &std::path::Path,
+        base_path: &std::path::Path,
+    ) -> Result<(), Error> {
         if self.base.is_none() && self.remote.is_none() {
             return Ok(());
         }
         let meta_path = sidecar_path(base_path);
         let json = serde_json::to_vec_pretty(self).map_err(Error::Json)?;
-        crate::store::local::atomic_write_with_no_fsync(&meta_path, |w| {
+        crate::fsguard::atomic_write_with(work_dir, &meta_path, |w| {
             std::io::Write::write_all(w, &json).map_err(Error::Io)
         })
     }
@@ -66,12 +73,24 @@ fn sidecar_path(base_path: &std::path::Path) -> std::path::PathBuf {
 
 /// Restore mtime and mode onto `abs_base` from `side` (if present). Best-effort:
 /// a missing or zero-valued field is left untouched, matching how `expand`
-/// applies stub-record metadata.
-fn restore_side_meta(abs_base: &std::path::Path, side: &SideMeta) {
-    crate::fsmeta::apply_mode(abs_base, &side.mode);
+/// applies stub-record metadata. Resolved through `fsguard::open_leaf` (N2,
+/// design/03_sync_model.md "Write safety: the working-tree write boundary")
+/// rather than a path-based `apply_mode`/`filetime::set_file_mtime` call, so a
+/// symlinked component cannot redirect these metadata mutations either.
+fn restore_side_meta(work_dir: &std::path::Path, abs_base: &std::path::Path, side: &SideMeta) {
+    let Ok(rel) = abs_base.strip_prefix(work_dir) else {
+        return;
+    };
+    // `\` is an ordinary Linux filename byte, not a separator -- do not
+    // rewrite it to `/` (design/01_object_model.md invariant #5).
+    let rel_str = rel.to_string_lossy().into_owned();
+    let Ok((dir, leaf)) = crate::fsguard::open_leaf(work_dir, &rel_str, false) else {
+        return;
+    };
+    dir.set_mode(&leaf, &side.mode).ok();
     if let Some(mt) = side.mtime {
         let ft = FileTime::from_unix_time(mt.timestamp(), mt.timestamp_subsec_nanos());
-        filetime::set_file_mtime(abs_base, ft).ok();
+        dir.set_mtime(&leaf, ft).ok();
     }
 }
 
@@ -129,6 +148,31 @@ pub(crate) const CONFLICT_SUFFIXES: &[&str] = &[
     CONFLICT_SUFFIX_LOCAL,
     CONFLICT_SUFFIX_REMOTE,
 ];
+
+/// L6: every filename suffix that identifies a piece of omemfs-internal
+/// conflict bookkeeping alongside a base path -- the three resolution-aid
+/// helpers (`CONFLICT_SUFFIXES`) plus the `CONFLICT_META_SUFFIX` metadata
+/// sidecar. None of these are user content: they exist only to support
+/// `omemfs conflict`. Anything that needs to recognise/remove "any conflict
+/// residue for this path" (restore's per-path cleanup, and the working-tree
+/// scan's exclusion of internal files) should use this list -- or
+/// [`is_conflict_artifact`] -- rather than keeping its own separate copy that
+/// can silently drift out of sync with this one (the metadata sidecar being
+/// missing from restore's old copy of `CONFLICT_SUFFIXES` is exactly the bug
+/// this constant exists to prevent from recurring).
+pub(crate) const CONFLICT_ARTIFACT_SUFFIXES: &[&str] = &[
+    CONFLICT_SUFFIX_BASE,
+    CONFLICT_SUFFIX_LOCAL,
+    CONFLICT_SUFFIX_REMOTE,
+    CONFLICT_META_SUFFIX,
+];
+
+/// Returns `true` if `name` ends with any suffix in
+/// [`CONFLICT_ARTIFACT_SUFFIXES`] -- i.e. `name` is omemfs-internal conflict
+/// bookkeeping (a helper or the metadata sidecar), never user content.
+pub(crate) fn is_conflict_artifact(name: &str) -> bool {
+    CONFLICT_ARTIFACT_SUFFIXES.iter().any(|s| name.ends_with(s))
+}
 
 // ---------------------------------------------------------------------------
 // list
@@ -289,11 +333,15 @@ pub fn run_accept(opts: ConflictAcceptOptions) -> Result<(), Error> {
             // other processes never observe a partially written resolution.
             // Preserve the previous permissions for accept-local; remote/base
             // metadata below deliberately overrides them when available.
+            // Routed through `fsguard::atomic_write_durable` rather than a
+            // plain `store::local::atomic_write` (design/03_sync_model.md,
+            // "Write safety: the working-tree write boundary") -- `work_dir`
+            // must be the true repository root.
             let original_permissions = std::fs::symlink_metadata(&abs_base)
                 .ok()
                 .map(|metadata| metadata.permissions());
             let data = std::fs::read(&src_helper).map_err(Error::Io)?;
-            crate::store::local::atomic_write(&abs_base, &data)?;
+            crate::fsguard::atomic_write_durable(&opts.work_dir, &abs_base, &data)?;
             if let Some(permissions) = original_permissions {
                 std::fs::set_permissions(&abs_base, permissions).map_err(Error::Io)?;
             }
@@ -310,31 +358,25 @@ pub fn run_accept(opts: ConflictAcceptOptions) -> Result<(), Error> {
                     AcceptSide::Local => None,
                 };
                 if let Some(side) = side {
-                    restore_side_meta(&abs_base, side);
+                    restore_side_meta(&opts.work_dir, &abs_base, side);
                 }
             }
         } else {
             // Missing side means this side had no content (deleted or not-yet-created).
             // Accept = restore to that state = delete the file.
-            if abs_base.exists() {
-                std::fs::remove_file(&abs_base).map_err(Error::Io)?;
-            }
+            crate::fsguard::remove_file_tolerant(&opts.work_dir, &abs_base)?;
         }
 
         // Remove all helper files for this base path (whichever exist), plus the
-        // metadata sidecar.
+        // metadata sidecar. Routed through fsguard (N1/design boundary).
         for suffix in CONFLICT_SUFFIXES {
             let helper = opts.work_dir.join(format!("{}{}", base, suffix));
-            if helper.exists() {
-                std::fs::remove_file(&helper).map_err(Error::Io)?;
-            }
+            crate::fsguard::remove_file_tolerant(&opts.work_dir, &helper)?;
         }
         let meta_sidecar = opts
             .work_dir
             .join(format!("{}{}", base, CONFLICT_META_SUFFIX));
-        if meta_sidecar.exists() {
-            std::fs::remove_file(&meta_sidecar).map_err(Error::Io)?;
-        }
+        crate::fsguard::remove_file_tolerant(&opts.work_dir, &meta_sidecar)?;
 
         out.writeln(&format!("  accepted {}: {}", opts.side.label(), base))?;
         count += 1;
@@ -428,7 +470,7 @@ fn collect_conflicting_recursive(
         } else if let Some(base_name) = strip_conflict_suffix(&name) {
             let base_path = path.parent().unwrap_or(dir).join(base_name);
             if let Ok(rel) = base_path.strip_prefix(work_dir) {
-                result.insert(rel.to_string_lossy().replace('\\', "/"));
+                result.insert(rel.to_string_lossy().into_owned());
             }
         }
     }
@@ -489,7 +531,7 @@ fn collect_helper_files_recursive(
         } else if is_conflict_helper(&name)
             && let Ok(rel) = path.strip_prefix(work_dir)
         {
-            result.push(rel.to_string_lossy().replace('\\', "/"));
+            result.push(rel.to_string_lossy().into_owned());
         }
     }
 }
@@ -523,38 +565,54 @@ fn is_real_directory(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Reject a user scope that would reach its target through a symlink.
-fn ensure_scope_is_physical(work_dir: &Path, scope: &str) -> Result<(), Error> {
-    let mut current = work_dir.to_path_buf();
-    for component in std::path::Path::new(scope).components() {
-        current.push(component);
-        match std::fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(Error::Other(format!("path {} traverses a symlink", scope)));
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(Error::Io(error)),
-        }
-    }
-    Ok(())
-}
-
 /// Resolve user-supplied paths to repository-root-relative strings.
 ///
 /// Invalid paths are errors: an explicitly supplied invalid scope must never
 /// be represented as the empty scope, which means the entire working tree.
+///
+/// This used to also reject a scope that reached its target through a
+/// symlink (`ensure_scope_is_physical`, a third independent lexical/TOCTOU-
+/// prone boundary walk). That check is now dead weight: every write this
+/// module performs (`run_accept`'s content write and helper/sidecar removals)
+/// is guarded intrinsically by `fsguard` (design/03_sync_model.md, "Write
+/// safety: the working-tree write boundary"), so a symlinked scope is
+/// refused at write time regardless of what this function returns.
 fn resolve_scope_paths(
     work_dir: &Path,
     current_dir: &Path,
     paths: &[PathBuf],
 ) -> Result<Vec<String>, Error> {
-    let scopes: Vec<String> = paths
+    paths
         .iter()
         .map(|path| crate::repo::normalize_path(path, work_dir, current_dir))
-        .collect::<Result<_, _>>()?;
-    for scope in &scopes {
-        ensure_scope_is_physical(work_dir, scope)?;
+        .collect::<Result<_, _>>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_conflict_artifact_matches_all_three_helpers_and_the_meta_sidecar() {
+        assert!(is_conflict_artifact("file.txt.omemfs-conflict-base"));
+        assert!(is_conflict_artifact("file.txt.omemfs-conflict-local"));
+        assert!(is_conflict_artifact("file.txt.omemfs-conflict-remote"));
+        assert!(is_conflict_artifact("file.txt.omemfs-conflict-meta"));
     }
-    Ok(scopes)
+
+    #[test]
+    fn is_conflict_artifact_rejects_ordinary_and_unrelated_reserved_names() {
+        assert!(!is_conflict_artifact("file.txt"));
+        assert!(!is_conflict_artifact("file.txt.omemfs-stub"));
+        assert!(!is_conflict_artifact(".omemfs-stub"));
+    }
+
+    #[test]
+    fn conflict_artifact_suffixes_is_a_superset_of_conflict_suffixes() {
+        for suffix in CONFLICT_SUFFIXES {
+            assert!(CONFLICT_ARTIFACT_SUFFIXES.contains(suffix));
+        }
+        assert!(CONFLICT_ARTIFACT_SUFFIXES.contains(&CONFLICT_META_SUFFIX));
+        assert_eq!(CONFLICT_ARTIFACT_SUFFIXES.len(), CONFLICT_SUFFIXES.len() + 1);
+    }
 }

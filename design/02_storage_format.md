@@ -1425,6 +1425,10 @@ been built for.
 | 10 M | ~12 MiB |
 | 100 M | ~114 MiB |
 
+The final row is not just the largest table entry — it is the hard ceiling
+`capacity_for` will ever target. See `MAX_CAPACITY` in "Bounding the capacity
+(hostile and corrupt filters)" below.
+
 **Push flow with Bloom filter**
 
 ```
@@ -1469,7 +1473,7 @@ matching the local target in the first place.
 capacity for `n` known elements is:
 
 ```
-capacity_for(n) = ladder_ceil(max(n, 1) * 3 / 2), floored at MIN_CAPACITY = 100_000
+capacity_for(n) = clamp(ladder_ceil(clamp(n, 1, MAX_CAPACITY) * 3 / 2), MIN_CAPACITY, MAX_CAPACITY)
 ladder = {1, 2, 5} × 10^k   (100_000, 200_000, 500_000, 1_000_000, 2_000_000, ...)
 ```
 
@@ -1482,6 +1486,16 @@ next push." The 1-2-5 ladder keeps `pack` idempotent (re-running it against an
 unchanged element count reproduces the same `num_bits`) and bounds the
 over-provisioning from quantisation to at most ~1.67×.
 
+`capacity_for(n) >= n` holds only for `n <= MAX_CAPACITY`. Above that bound the
+result is intentionally under-provisioned: `n` is clamped down before sizing,
+so the filter is deliberately built smaller than its true element count would
+call for. This degrades the filter's false-positive rate gradually as
+`element_count` grows past `MAX_CAPACITY` — exactly like any other
+over-capacity filter (see "Fill-rate reporting" below) — and never produces a
+false negative, since membership answers stay exact by construction
+regardless of how the filter was sized. See "Bounding the capacity (hostile
+and corrupt filters)" below for why the clamp exists and where it lives.
+
 - **`omemfs pack`** (`regenerate_bloom`) knows the exact element count it is
   about to insert (hot index entries + cold shard entries) and calls
   `capacity_for` directly.
@@ -1491,6 +1505,47 @@ over-provisioning from quantisation to at most ~1.67×.
   (`capacity_for(loaded.element_count)`); the fill-rate/capacity field described
   above is repurposed for this. When no filter could be read at all, the
   fallback is `MIN_CAPACITY` — the same size this constant has always produced.
+  `loaded.element_count` here is an 8-byte field inside an object that whoever
+  wrote the remote Bloom filter fully controls, and it survives
+  fetch/decrypt/deserialise with no range check of its own (see "Bounding the
+  capacity" below) — a corrupt or hostile filter can set it to any `u64`, up to
+  and including values that would demand terabytes of memory if used
+  unclamped as a capacity hint. `load_remote_bloom` passes it through to
+  `capacity_for` unclamped; the bound lives inside `capacity_for` itself, not
+  at this call site.
+
+**Bounding the capacity (hostile and corrupt filters).** `element_count`
+travels in the Bloom filter's plaintext header as a plain 8-byte big-endian
+`u64` (see "Bloom filter file format" above) with no range check at
+deserialise time — `deserialise` only checks the fixed 20-byte header and that
+the bit array length matches `num_bits`. A 20-byte object with `num_bits = 0`
+and `element_count = 10^12` therefore deserialises without error, and handing
+that `element_count` straight to `capacity_for` as a capacity hint would try
+to allocate a bit array sized for roughly 1.6 TiB — aborting the process on
+allocation failure well before `omemfs` gets a chance to report an error.
+
+`capacity_for` clamps its input to `MAX_CAPACITY = 100_000_000` — the element
+count of the largest row in the "Size at p = 1% false-positive rate" table
+above (~114 MiB) — before applying the ×1.5 margin, and clamps its *output* to
+the same bound after `ladder_ceil`, per the formula above. Both clamps matter:
+the input clamp keeps the ×1.5 multiplication (and the internal `u128 ->
+u64` truncation inside `ladder_ceil`) from ever seeing a value anywhere near
+`u64::MAX`; the output clamp guarantees `capacity_for` never returns more than
+`MAX_CAPACITY` even though `ladder_ceil` alone can round up past it (e.g.
+`ladder_ceil(150_000_000) = 200_000_000`). Clipping to `MAX_CAPACITY` — rather
+than erroring, or falling back to `MIN_CAPACITY` — preserves `capacity_for`'s
+monotonic-non-decreasing property across its entire `u64` domain, which both
+the acceptance rule above and `omemfs pack`'s idempotency depend on: an error
+would turn a corrupt Bloom filter into a push-blocking failure for no
+correctness benefit, and falling back to `MIN_CAPACITY` would make
+`capacity_for` non-monotonic (a huge but bogus element count would size the
+filter *smaller* than a merely large one).
+
+Both clamps live inside `capacity_for` itself, not in its callers
+(`load_remote_bloom` in `writer.rs`, `regenerate_bloom` in `pack.rs`) — the
+same "one place owns the sizing formula" rule this section already establishes
+for the rest of the formula. Neither caller needs to know its input might be
+hostile.
 
 This sizing logic lives in one place — `codec::pack::bloom` (constants
 `FP_RATE`, `MIN_CAPACITY`, and the `capacity_for`/`sized_for` functions) —
@@ -1514,13 +1569,78 @@ one sized by the old fixed `100_000` constant — with no rebuild and no
 re-upload. The next `omemfs pack` then resizes it, using the formula above,
 from the actual element count observed at that time.
 
+**Structural validation (push and read paths).** A single predicate,
+`BloomFilter::structural_defect()`, decides whether a successfully
+fetched/decrypted/deserialised Bloom filter is safe to use as-is: it returns
+`Some("num_bits == 0")` when the bit array would make `may_contain`/`insert`
+divide by zero, `Some("num_hash_functions == 0")` when hashing would be a
+no-op (well-defined but useless), and `None` otherwise. Both the push path
+(`load_remote_bloom` in `writer.rs`) and the read path (`locate`'s Bloom step
+in `reader.rs`) call this one predicate instead of each repeating the
+`num_bits == 0 || num_hash_functions == 0` condition inline.
+
+This draws a deliberate line between two different kinds of failure:
+
+- *"Could not be interpreted at all"* — fetch failure, decrypt failure, or
+  `BloomFilter::deserialise` returning `Err` (bad magic, wrong version,
+  truncated, bit-array length mismatch). Unchanged by this section: `writer.rs`
+  falls back to a fresh filter as it always did, and `reader.rs`'s `?` still
+  propagates the error to the caller, because the object itself cannot be
+  trusted to mean anything.
+- *"Interpreted successfully but structurally degenerate"* — `deserialise`
+  returns `Ok`, but `structural_defect()` is `Some(..)`. Only this case is new
+  fail-open behaviour, and the two paths respond to it differently because
+  they have different failure-safe defaults:
+  - **Push** (`load_remote_bloom`) replaces the filter with a fresh empty one
+    sized from `capacity_for(loaded.element_count)` (bounded per the previous
+    section), exactly as it did before `structural_defect()` existed. The push
+    proceeds as if the remote had no Bloom filter yet, at the cost of a
+    possible spurious re-upload of already-present objects on this one push.
+  - **Read** (`locate`) treats a structurally defective filter the same as "no
+    Bloom filter recorded at all" (`bloom_hash_opt() == None`): it skips the
+    Bloom step entirely and falls through to the cold-shard fetch. "Maybe
+    present" is always a safe answer for a Bloom filter to give, so falling
+    through is the correct degenerate behaviour — there is nothing to replace
+    the filter with on the read path (`PackReader` never writes), and skipping
+    the check costs one shard fetch, not correctness.
+
+As a last-resort backstop against a defect predicate that is ever wrong, or a
+filter that reaches `insert`/`may_contain` some other way without going
+through either loader, `may_contain` itself returns `true` (fail-open: "maybe
+present", never a false negative) when `num_bits == 0`, instead of dividing by
+zero; `insert` returns immediately without touching the bit array or
+`element_count` under the same condition. These are defensive backstops, not
+the primary fix — the primary fix is that `structural_defect()` keeps a
+defective filter from reaching `insert`/`may_contain` on the push path in the
+first place, and keeps `locate` from calling `may_contain` on one at all on
+the read path.
+
 **Fill-rate reporting.** Because `element_count` is already recorded and
 `capacity_for`'s bit computation can be inverted to recover the capacity a
 given `num_bits` was designed for, a loaded filter's fill state can be reported
 without any format change: `omemfs cat <bloom-hash>` and `omemfs stats` can
 show `element_count` against the filter's designed capacity and an estimated
 current false-positive rate, and `push` can emit a one-line warning when a
-filter is over capacity, suggesting `omemfs pack`.
+filter is over capacity, suggesting `omemfs pack`. Reaching `MAX_CAPACITY` is a
+ceiling `omemfs pack` cannot resize past: once a repository's live element
+count exceeds `MAX_CAPACITY`, `pack`'s `capacity_for` call clips to
+`MAX_CAPACITY` the same way the push fallback does, so the filter's
+false-positive rate keeps degrading gently with further growth rather than
+being fixed by any operation available today — see "Rejected alternatives"
+below for the layered/scalable filter design that would lift this ceiling.
+
+`omemfs stats`'s "Pack effectiveness" section reports this via the
+`bloom_num_bits` field on the `pack_detail` record in `io_stats.jsonl` (see
+`io_stats.rs`). `io_stats.jsonl` records written before that field existed lack
+the key and deserialise it to `0` via serde's default. Since `sized_for`
+guarantees a real filter always has `num_bits >= 1`, `bloom_num_bits == 0`
+unambiguously means "not recorded by this run," not "an actual zero-bit
+filter." `omemfs stats` (both the text and `--json` output) must therefore
+treat `bloom_num_bits == 0` as "unknown" and omit the designed-capacity and
+estimated-false-positive-rate figures entirely, rather than computing and
+displaying `designed_capacity(0) = 0` and the hardcoded worst-case
+`estimated_fp_rate(.., 0, ..) = 1.0`, which would misreport a healthy filter as
+zero-capacity and 100% false-positive.
 
 **Rejected alternatives**:
 
@@ -1543,6 +1663,25 @@ filter is over capacity, suggesting `omemfs pack`.
   recomputing `k` stops being optimal, and the cost of the current 1%-target
   false positive (one extra index lookup, never data loss) does not justify
   the larger filters a materially lower `p` would need.
+- *Reject an oversized `element_count` inside `deserialise` itself.* Would
+  conflate "the bytes are well-formed" with "the hint they carry is
+  plausible," turning a merely-large-but-legitimate repository's Bloom filter
+  into a hard deserialise error instead of a degraded-but-working filter, and
+  would need its own bound (duplicating `MAX_CAPACITY`) at a layer that has no
+  other opinion about filter sizing today.
+- *Treat over-`MAX_CAPACITY` as an error, or clamp down to `MIN_CAPACITY`,
+  instead of clipping to `MAX_CAPACITY`.* An error blocks a push for a
+  condition that never risks data loss — only a wider false-positive margin —
+  and clamping to `MIN_CAPACITY` breaks `capacity_for`'s monotonicity (a
+  corrupt-but-huge `element_count` would produce a *smaller* filter than a
+  legitimately large one), which "Filter sizing" above and `omemfs pack`'s
+  idempotency both rely on.
+- *Drop the `element_count` hint entirely and always fall back to
+  `MIN_CAPACITY` when a filter must be rebuilt.* Simpler, but throws away a
+  genuinely useful signal for the common case (a filter rejected for
+  `num_hash_functions == 0` on an otherwise-healthy, large repository) purely
+  to defend against the rare hostile/corrupt case that `MAX_CAPACITY` clamping
+  already handles without losing that signal.
 
 **Known incompatibility.** After `omemfs pack` has resized a filter upward, a
 push from an older binary that still checks against the fixed `100_000`
@@ -1557,19 +1696,36 @@ are acceptable" stance (see STATUS.md) — not a runtime check.
 `PackReader` (the read path) keeps every index file it has parsed resident in
 memory for the lifetime of one snapshot (`indexes: Mutex<HashMap<Hash,
 Arc<IndexFile>>>` — see "Snapshot read path" above), so a given index is
-deserialised at most once per reader. `PackWriter::load_index_file`, used by
-`index_contains` for the "maybe present" branch above, only caches the
-*decrypted bytes* on local disk (`.omemfs/objcache/`, per "Index file local
-caching" below) — it re-deserialises those bytes into an `IndexFile` on every
-call. Every "maybe present" check against the hot index (true positives
-included, not just false positives) therefore pays a full hot-index
-deserialisation, independent of the Bloom filter's false-positive rate. Fixing
-the Bloom filter's capacity narrows how often "maybe present" is reached at
-all, but does not remove this per-call cost once it is. `PackWriter` should
-gain the same kind of resident, per-run `IndexFile` cache `PackReader` already
-has, so a hot/cold index loaded once during a push is deserialised once. This
-is purely an in-memory addition on top of the existing disk cache — it changes
-no on-disk or on-wire format.
+deserialised at most once per reader, and single-flights concurrent
+cache-miss callers through an `index_load: Mutex<()>` guard so that a burst of
+parallel transfer workers racing to look up the same not-yet-cached hash
+fetches and deserialises it once, not once per racing thread.
+`PackWriter::load_index_file`, used by `index_contains` for the "maybe
+present" branch above, carries the same two properties for the same reason:
+`route()` drives it from multiple parallel transfer worker threads (design/02
+"Parallel transfer and memory"), exactly like `PackReader`.
+
+- **Resident cache** (`indexes: Mutex<HashMap<Hash, Arc<IndexFile>>>`).
+  Without it, every "maybe present" check against the hot index (true
+  positives included, not just false positives) would pay a full
+  deserialisation of the already-decrypted-and-disk-cached bytes
+  (`.omemfs/objcache/`, per "Index file local caching" below) on every call,
+  independent of the Bloom filter's false-positive rate — fixing the Bloom
+  filter's capacity narrows how often "maybe present" is reached at all, but
+  does not remove this per-call cost once it is.
+- **Single-flight guard** (`index_load: Mutex<()>`, mirroring
+  `PackReader::index_load`). Without it, the resident cache alone does not
+  prevent a race: several threads can all observe a cache miss on
+  `self.indexes` for the same hash before any of them has finished
+  fetching+deserialising, and each independently repeats the fetch and the
+  deserialisation. The guard serialises the fetch+deserialise path (checked
+  again under the lock in case another caller just finished), so at most one
+  caller per genuine cache miss pays that cost; every other caller — for that
+  hash or a different one racing at the same time — blocks briefly and then
+  either reuses the now-cached result or proceeds with its own miss.
+
+Both are purely in-memory additions on top of the existing disk cache — they
+change no on-disk or on-wire format.
 
 ---
 

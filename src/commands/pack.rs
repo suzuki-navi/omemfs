@@ -418,7 +418,7 @@ fn collect_stub_paths_recursive(
             // Derive the logical path (without the stub suffix).
             let logical_path = path.with_file_name(logical_name);
             if let Ok(rel) = logical_path.strip_prefix(work_dir) {
-                let s = rel.to_string_lossy().replace('\\', "/");
+                let s = rel.to_string_lossy().into_owned();
                 out.insert(s);
             }
         }

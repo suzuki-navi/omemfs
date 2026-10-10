@@ -102,6 +102,10 @@ pub fn run(opts: CloneOptions) -> Result<(), Error> {
 
     println!("Cloning from {} ...", remote_display_url(origin_remote));
 
+    // Deliberately NOT routed through fsguard: this creates `work_dir`
+    // itself, before any repository (hence any boundary) exists yet -- there
+    // is nothing to check against (design/03_sync_model.md, "Write safety:
+    // the working-tree write boundary").
     fs::create_dir_all(&opts.directory)?;
     let repo = Repo::init(&opts.directory, config)?;
     crate::progress::notify_repo_dir(&repo.work_dir);
@@ -202,6 +206,9 @@ pub fn run(opts: CloneOptions) -> Result<(), Error> {
 /// Write the default `.omemfs-filter` template to the repository root if the
 /// file does not already exist there (either from a remote or from a prior run).
 fn write_default_filter(dir: &Path) -> Result<(), Error> {
+    // Deliberately NOT routed through fsguard: `.omemfs-filter` is written
+    // directly at the repository root (`dir`), with no intermediate
+    // untrusted component to escape through.
     let filter_path = dir.join(".omemfs-filter");
     if !filter_path.exists() {
         fs::write(&filter_path, crate::filter::DEFAULT_FILTER_TEMPLATE)?;
@@ -1101,7 +1108,7 @@ fn expand_or_stub(
     let data = ensure_tree_in_local(src, local, tree_hash, remote_key)?;
     let Tree::Normal { entries } = Tree::deserialise(&data)?;
 
-    fs::create_dir_all(dir)?;
+    crate::fsguard::create_dir_all(work_dir, dir)?;
 
     // If this tree is being materialised and is itself a git worktree root (it
     // has a direct ".git" child), its own children must not be partial-stubbed.
@@ -1167,7 +1174,9 @@ fn expand_or_stub(
                             src, local, &hash, remote_key, false,
                         )?;
                     }
-                    crate::fsmeta::materialise_blob_at(local, &hash, &abs_path, &mtime, &mode)?;
+                    crate::fsmeta::materialise_blob_at(
+                        work_dir, local, &hash, &abs_path, &mtime, &mode,
+                    )?;
                     *expanded += 1;
                 }
             }
@@ -1196,7 +1205,7 @@ fn expand_or_stub(
                 // See design/08 "Stubs and Git repositories".
                 let should_stub = threshold > 0 && size >= threshold && !in_git_worktree;
                 if should_stub {
-                    fs::create_dir_all(&sub_dir)?;
+                    crate::fsguard::create_dir_all(work_dir, &sub_dir)?;
                     stub::write_dir_stub(
                         work_dir,
                         &rel_path,
@@ -1250,7 +1259,7 @@ fn expand_or_stub(
                 #[cfg(unix)]
                 {
                     let link_path = dir.join(&name);
-                    crate::fsmeta::write_symlink_atomic(&link_path, &target)?;
+                    crate::fsmeta::write_symlink_atomic(work_dir, &link_path, &target)?;
                     crate::fsmeta::restore_symlink_mtime(&link_path, &mtime);
                 }
                 let _ = target;

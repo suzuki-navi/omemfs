@@ -344,18 +344,80 @@ make_conflict() {
     rm -rf "$outside"
 }
 
-@test "conflict clean: rejects a scope that traverses a directory symlink" {
+@test "conflict clean: a scope that is itself a directory symlink finds nothing to clean" {
+    # `resolve_scope_paths` used to reject a symlinked scope explicitly (a
+    # lexical, TOCTOU-prone check removed alongside the fsguard rewrite --
+    # design/03_sync_model.md, "Write safety: the working-tree write
+    # boundary"). "escape" being a symlink rather than a real directory means
+    # `collect_helper_files` never recognises it as a directory scope to
+    # recurse into (`is_real_directory` is `lstat`-based), so it is treated as
+    # a plain (non-matching) file scope instead: the command finds nothing
+    # under it and exits successfully having touched nothing outside the
+    # working tree either way.
     local outside
     outside="$(mktemp -d)"
     echo "outside conflict" > "$outside/out.omemfs-conflict-remote"
     ln -s "$outside" escape
 
     run "$OMEMFS" conflict clean escape
-    [ "$status" -ne 0 ]
+    [ "$status" -eq 0 ]
     [ -f "$outside/out.omemfs-conflict-remote" ]
 
     rm escape
     rm -rf "$outside"
+}
+
+# ---------------------------------------------------------------------------
+# L6: restore removes the conflict metadata sidecar, not just the helpers
+# ---------------------------------------------------------------------------
+
+@test "restore: single-path restore of a genuine pull conflict removes every conflict artifact, including the meta sidecar (L6)" {
+    # A real `pull` conflict (unlike `make_conflict`'s synthetic helper
+    # files) also writes the `.omemfs-conflict-meta` sidecar -- see
+    # `build_conflict_meta` in src/commands/pull.rs.
+    local clone2
+    clone2="$(mktemp -d)"
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" "$clone2"
+    [ "$status" -eq 0 ]
+
+    echo "local change" > file.txt
+    (cd "$clone2" && echo "remote change" > file.txt && "$OMEMFS" push)
+
+    run "$OMEMFS" pull
+    [ "$status" -ne 0 ]
+    [ -f file.txt.omemfs-conflict-local ]
+    [ -f file.txt.omemfs-conflict-remote ]
+    [ -f file.txt.omemfs-conflict-meta ]
+
+    # Restoring the single conflicted path -- not a whole-tree restore --
+    # must remove every conflict artifact for it, including the sidecar
+    # (the L6 bug: this used to leave the sidecar behind).
+    run "$OMEMFS" restore file.txt
+    [ "$status" -eq 0 ]
+    [ ! -f file.txt.omemfs-conflict-base ]
+    [ ! -f file.txt.omemfs-conflict-local ]
+    [ ! -f file.txt.omemfs-conflict-remote ]
+    [ ! -f file.txt.omemfs-conflict-meta ]
+
+    rm -rf "$clone2"
+}
+
+@test "restore: a stray conflict metadata sidecar with no helper files is removed silently on a whole-tree restore (L6)" {
+    # Only the sidecar is present (no helpers) -- e.g. left behind by an
+    # older build's single-path restore, before this fix. It is
+    # omemfs-internal residue, not user content, so a whole-tree restore
+    # must remove it WITHOUT reporting a `deleted:` line for it, exactly
+    # like an orphaned stub file.
+    echo '{"base":{"mtime":null,"mode":null}}' > file.txt.omemfs-conflict-meta
+
+    run "$OMEMFS" restore
+    [ "$status" -eq 0 ]
+    [ ! -f file.txt.omemfs-conflict-meta ]
+    [[ "$output" != *"file.txt.omemfs-conflict-meta"* ]]
+
+    run "$OMEMFS" ls --dirty
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
 }
 
 @test "conflict list: does not recurse through a symlink loop" {

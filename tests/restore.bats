@@ -816,6 +816,230 @@ reenable_remote() {
     [ "$(cat sub_b/b.txt)" = "b content" ]
 }
 
+@test "restore: heals multiple sibling missing clone-root tree objects identically under concurrency 1 and 8 (M6)" {
+    # M6: the heal loop must honour OMEMFS_TRANSFER_CONCURRENCY like every
+    # other network fan-out operation, and produce the same observable
+    # result (and, since Phase 3's action-line printing is unaffected by the
+    # heal loop's own concurrency, the same output) regardless of the
+    # worker count.
+    mkdir -p sub_a sub_b
+    echo "a content" > sub_a/a.txt
+    echo "b content" > sub_b/b.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    run "$OMEMFS" ls -r --full-hash
+    [ "$status" -eq 0 ]
+    local a_hash b_hash
+    a_hash=$(echo "$output" | grep 'sub_a/$' | grep -oE '[0-9a-f]{64}')
+    b_hash=$(echo "$output" | grep 'sub_b/$' | grep -oE '[0-9a-f]{64}')
+    [ -n "$a_hash" ]
+    [ -n "$b_hash" ]
+
+    local clone1 clone2
+    clone1="$(mktemp -d)"
+    clone2="$(mktemp -d)"
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" "$clone1"
+    [ "$status" -eq 0 ]
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" "$clone2"
+    [ "$status" -eq 0 ]
+
+    local obj1a obj1b obj2a obj2b
+    obj1a=$(find "$clone1/.omemfs/objects" -type f -name "*${a_hash: -40}" | head -1)
+    obj1b=$(find "$clone1/.omemfs/objects" -type f -name "*${b_hash: -40}" | head -1)
+    obj2a=$(find "$clone2/.omemfs/objects" -type f -name "*${a_hash: -40}" | head -1)
+    obj2b=$(find "$clone2/.omemfs/objects" -type f -name "*${b_hash: -40}" | head -1)
+    [ -n "$obj1a" ] && [ -n "$obj1b" ] && [ -n "$obj2a" ] && [ -n "$obj2b" ]
+    rm -f "$obj1a" "$obj1b" "$obj2a" "$obj2b"
+
+    echo "a changed" > "$clone1/sub_a/a.txt"
+    echo "b changed" > "$clone1/sub_b/b.txt"
+    echo "a changed" > "$clone2/sub_a/a.txt"
+    echo "b changed" > "$clone2/sub_b/b.txt"
+
+    OMEMFS_TRANSFER_CONCURRENCY=1 run bash -c "cd '$clone1' && '$OMEMFS' restore"
+    [ "$status" -eq 0 ]
+    local output_serial="$output"
+    [ "$(cat "$clone1/sub_a/a.txt")" = "a content" ]
+    [ "$(cat "$clone1/sub_b/b.txt")" = "b content" ]
+
+    OMEMFS_TRANSFER_CONCURRENCY=8 run bash -c "cd '$clone2' && '$OMEMFS' restore"
+    [ "$status" -eq 0 ]
+    [ "$(cat "$clone2/sub_a/a.txt")" = "a content" ]
+    [ "$(cat "$clone2/sub_b/b.txt")" = "b content" ]
+
+    [ "$output" = "$output_serial" ]
+
+    rm -rf "$clone1" "$clone2"
+}
+
+# ---------------------------------------------------------------------------
+# M7: the repository root's path is rendered as "." in action lines
+# ---------------------------------------------------------------------------
+
+@test "restore: missing root clone_root tree object is reported as 'unavailable: .' (M7)" {
+    local root_hash root_obj
+    root_hash="$(get_clone_root)"
+    root_obj=$(find .omemfs/objects -type f -name "*${root_hash: -40}" | head -1)
+    [ -n "$root_obj" ]
+    rm -f "$root_obj"
+
+    run "$OMEMFS" restore --no-remote
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"unavailable: ."* ]]
+    # Never a bare "unavailable:" with nothing (or just whitespace) after it.
+    ! echo "$output" | grep -qE '^unavailable: *$'
+}
+
+@test "restore: --dry-run reports missing root clone_root tree object as 'would fetch: .' (M7)" {
+    local root_hash root_obj
+    root_hash="$(get_clone_root)"
+    root_obj=$(find .omemfs/objects -type f -name "*${root_hash: -40}" | head -1)
+    [ -n "$root_obj" ]
+    rm -f "$root_obj"
+
+    run "$OMEMFS" restore --dry-run
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"would fetch: ."* ]]
+    ! echo "$output" | grep -qE '^would fetch: *$'
+}
+
+# ---------------------------------------------------------------------------
+# L3: fetch-failure warning is backend-dependent by design
+# ---------------------------------------------------------------------------
+
+@test "restore: unreachable remote on the local-directory backend prints no fetch-failure warning (L3)" {
+    printf 'x%.0s' {1..100} > big.bin
+    echo "hi" > file.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    local CLONE2
+    CLONE2="$(mktemp -d)"
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" --stub-threshold 10 "$CLONE2"
+    [ "$status" -eq 0 ]
+
+    cd "$CLONE2"
+    rm big.bin.omemfs-stub
+    echo "local edit" > file.txt
+
+    disable_remote
+
+    run "$OMEMFS" restore
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"unavailable:"* ]]
+    # L3: on the local-directory backend, an unreachable remote maps to an
+    # ordinary I/O error, which is treated as an unremarkable cache miss --
+    # no extra "warning: fetch from ..." line, unlike a cloud backend's own
+    # transport error (not exercised here; requires live cloud credentials).
+    [[ "$output" != *"warning: fetch from"* ]]
+
+    reenable_remote
+    rm -rf "$CLONE2"
+}
+
+# ---------------------------------------------------------------------------
+# L4: duplicate hashes in the fetch-pending set
+# ---------------------------------------------------------------------------
+
+@test "restore: two files with identical missing content are both restored via a single fetch (L4)" {
+    # L4: the plan's pending-fetch set is deduplicated by hash, so two paths
+    # that share identical (still-missing) content queue one fetch, not two.
+    # The "N object(s) fetched" phase-2 summary this fixes is TTY-only
+    # output and not observable through a captured, non-interactive `bats
+    # run` (progress::begin_phase returns a no-op PhaseHandle whenever
+    # stdout is not a TTY) -- the count itself is covered by the
+    # `plan_pending_has_one_entry_when_two_paths_share_identical_missing_content`
+    # unit test in src/commands/restore.rs. This bats test instead pins the
+    # user-visible correctness guarantee: both paths still restore correctly.
+    echo "identical shared content" > a.txt
+    echo "identical shared content" > b.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    local CLONE2
+    CLONE2="$(mktemp -d)"
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" --stub-threshold 10 "$CLONE2"
+    [ "$status" -eq 0 ]
+    [ -f "$CLONE2/a.txt.omemfs-stub" ]
+    [ -f "$CLONE2/b.txt.omemfs-stub" ]
+
+    cd "$CLONE2"
+    rm a.txt.omemfs-stub b.txt.omemfs-stub
+
+    run "$OMEMFS" restore
+    [ "$status" -eq 0 ]
+    [ "$(cat a.txt)" = "identical shared content" ]
+    [ "$(cat b.txt)" = "identical shared content" ]
+
+    rm -rf "$CLONE2"
+}
+
+# ---------------------------------------------------------------------------
+# L5 / L7: one failing action does not abort the rest of Apply
+# ---------------------------------------------------------------------------
+
+@test "restore: an unrelated I/O failure on one path does not abort restoring other paths (L5, L7)" {
+    # A stale FILE-type stub record for "badpath.txt" (clone_root has no
+    # entry for it at all), whose on-disk path has since become a
+    # NON-EMPTY directory: L7 says this must never be turned into a
+    # recursive delete, so it fails as a single path; L5 says that failure
+    # must not take the two other, unrelated, otherwise-healthy paths down
+    # with it.
+    echo "hello good1" > good1.txt
+    echo "hello good2" > good2.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    echo '{"target_type":"blob","hash":"0000000000000000000000000000000000000000000000000000000000000000","size":0,"mtime":null}' \
+        > badpath.txt.omemfs-stub
+    mkdir -p badpath.txt
+    echo "still here" > badpath.txt/inner.txt
+
+    echo "modified good1" > good1.txt
+    echo "modified good2" > good2.txt
+
+    # Name all three paths explicitly: `Action::DeleteAbsent` (L7's fix
+    # target) is only planned by `plan_path` for an explicitly-requested
+    # path, not by the generic whole-tree "extra file" scan (which instead
+    # plans `DeleteOrphanFileStub`/`DeleteAddedDir` for an unrequested stray
+    # stub + directory pair).
+    run "$OMEMFS" restore good1.txt good2.txt badpath.txt
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"failed: badpath.txt:"* ]]
+    [[ "$output" == *"path(s) failed"* ]]
+
+    # Both unrelated, healthy paths were still restored.
+    [ "$(cat good1.txt)" = "hello good1" ]
+    [ "$(cat good2.txt)" = "hello good2" ]
+
+    # The non-empty directory and its contents are left completely untouched
+    # -- restore must never turn a "delete one file" action into a recursive
+    # directory delete.
+    [ -d badpath.txt ]
+    [ -f badpath.txt/inner.txt ]
+    [ "$(cat badpath.txt/inner.txt)" = "still here" ]
+}
+
+@test "restore: stale FILE-type stub whose path is now an EMPTY directory is removed and reported as deleted (L7)" {
+    echo "hello" > file.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    echo '{"target_type":"blob","hash":"0000000000000000000000000000000000000000000000000000000000000000","size":0,"mtime":null}' \
+        > badpath.txt.omemfs-stub
+    mkdir -p badpath.txt
+
+    # See the comment in the previous test: name the path explicitly so this
+    # goes through `plan_path` / `Action::DeleteAbsent`.
+    run "$OMEMFS" restore badpath.txt
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"deleted:"* ]]
+    [[ "$output" == *"badpath.txt"* ]]
+    [ ! -e badpath.txt ]
+    [ ! -e badpath.txt.omemfs-stub ]
+}
+
 @test "restore: stub reconcile still works when the remote is unreachable" {
     # Regression guard for the stub-under-restore tests above: stub-only
     # paths must never even attempt remote access, so they keep working with

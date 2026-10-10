@@ -15,7 +15,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
 use crate::object::Hash;
-use crate::store::local::atomic_write;
 
 /// Suffix appended to the original filename to form a file stub filename.
 pub const STUB_SUFFIX: &str = ".omemfs-stub";
@@ -79,7 +78,7 @@ fn dir_stub_abs(work_dir: &Path, rel_path: &str) -> PathBuf {
 }
 
 fn rel_to_abs(work_dir: &Path, rel_path: &str) -> PathBuf {
-    let trimmed = rel_path.trim_start_matches('/').replace('\\', "/");
+    let trimmed = rel_path.trim_start_matches('/');
     let mut p = work_dir.to_path_buf();
     for component in trimmed.split('/') {
         if !component.is_empty() {
@@ -200,21 +199,23 @@ fn read_from_path(path: &Path) -> Result<Option<StubRecord>, Error> {
 
 /// Write a file stub record for `rel_path`.
 pub fn write(work_dir: &Path, rel_path: &str, record: &StubRecord) -> Result<(), Error> {
-    write_to_path(&file_stub_abs(work_dir, rel_path), record)
+    write_to_path(work_dir, &file_stub_abs(work_dir, rel_path), record)
 }
 
 /// Write a directory stub record for `rel_path`.
 pub fn write_dir_stub(work_dir: &Path, rel_path: &str, record: &StubRecord) -> Result<(), Error> {
-    write_to_path(&dir_stub_abs(work_dir, rel_path), record)
+    write_to_path(work_dir, &dir_stub_abs(work_dir, rel_path), record)
 }
 
-fn write_to_path(path: &Path, record: &StubRecord) -> Result<(), Error> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+fn write_to_path(work_dir: &Path, path: &Path, record: &StubRecord) -> Result<(), Error> {
+    // Same guard as blob/symlink materialisation (design/03_sync_model.md,
+    // "Write safety: the working-tree write boundary"): a stub record is
+    // still a write into the working tree, and must not follow a directory
+    // that has been swapped for a symlink pointing outside `work_dir`.
+    // `atomic_write_durable` (fsync file + dir) matches the previous
+    // `store::local::atomic_write` call this replaces.
     let json = serde_json::to_string(record).map_err(Error::Json)?;
-    atomic_write(path, json.as_bytes())?;
-    Ok(())
+    crate::fsguard::atomic_write_durable(work_dir, path, json.as_bytes())
 }
 
 // ---------------------------------------------------------------------------
@@ -223,20 +224,12 @@ fn write_to_path(path: &Path, record: &StubRecord) -> Result<(), Error> {
 
 /// Remove the file stub for `rel_path` (no-op if it does not exist).
 pub fn remove(work_dir: &Path, rel_path: &str) -> Result<(), Error> {
-    remove_path(&file_stub_abs(work_dir, rel_path))
+    crate::fsguard::remove_file_tolerant(work_dir, &file_stub_abs(work_dir, rel_path))
 }
 
 /// Remove the directory stub for `rel_path` (no-op if it does not exist).
 pub fn remove_dir_stub(work_dir: &Path, rel_path: &str) -> Result<(), Error> {
-    remove_path(&dir_stub_abs(work_dir, rel_path))
-}
-
-fn remove_path(path: &Path) -> Result<(), Error> {
-    match fs::remove_file(path) {
-        Ok(_) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(Error::Io(e)),
-    }
+    crate::fsguard::remove_file_tolerant(work_dir, &dir_stub_abs(work_dir, rel_path))
 }
 
 // ---------------------------------------------------------------------------
@@ -275,7 +268,7 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<(String, StubRecord)>) -> Resu
             if let Ok(Some(record)) = read_from_path(&path) {
                 let rel = dir
                     .strip_prefix(root)
-                    .map(|p| p.to_string_lossy().replace('\\', "/"))
+                    .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_default();
                 if !rel.is_empty() {
                     out.push((rel, record));
@@ -295,7 +288,7 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<(String, StubRecord)>) -> Resu
             let logical_path = path.with_file_name(&name[..name.len() - STUB_SUFFIX.len()]);
             let rel = logical_path
                 .strip_prefix(root)
-                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default();
             if rel.is_empty() {
                 continue;

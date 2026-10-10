@@ -13,4 +13,18 @@ if [[ ! -x "$OMEMFS" ]]; then
     exit 1
 fi
 
-exec bats "$@" "${SCRIPT_DIR}/tests"
+# Run test files in parallel by default (bats -j) since tests are isolated
+# via per-test mktemp dirs. Override with OMEMFS_TEST_JOBS=1 for serial
+# execution, or pass -j/--jobs explicitly to take full control.
+jobs_opts=()
+has_jobs_opt=0
+for arg in "$@"; do
+    case "$arg" in
+        -j|--jobs) has_jobs_opt=1 ;;
+    esac
+done
+if [[ "$has_jobs_opt" -eq 0 ]]; then
+    jobs_opts=(-j "${OMEMFS_TEST_JOBS:-$(nproc)}")
+fi
+
+exec bats "${jobs_opts[@]}" "$@" "${SCRIPT_DIR}/tests"

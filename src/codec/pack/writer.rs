@@ -69,6 +69,14 @@ pub struct PackWriter {
     /// lookup cost on the push path"). Purely an in-memory addition -- it
     /// changes no on-disk or on-wire format.
     indexes: Mutex<HashMap<Hash, Arc<IndexFile>>>,
+    /// Serialises cache-miss `load_index_file` calls so concurrent lookups
+    /// (`route()`'s "maybe present" check runs from multiple parallel
+    /// transfer worker threads, same as `PackReader`) for the SAME hash
+    /// fetch and deserialise it at most once, mirroring
+    /// `PackReader::index_load` (design/02 "Index lookup cost on the push
+    /// path"). Held only across the fetch+deserialise on a genuine cache
+    /// miss, never while serving an already-cached hash.
+    index_load: Mutex<()>,
     /// Backend-pluggable index-root pointer. Captured once at construction (its
     /// `read` provides the push-start snapshot + CAS token) and reused at
     /// `finish()` for the CAS write — both ends of the CAS go through this single
@@ -160,6 +168,7 @@ impl PackWriter {
             remote,
             objcache,
             indexes: Mutex::new(HashMap::new()),
+            index_load: Mutex::new(()),
             root_pointer,
             remote_key,
             delta: Mutex::new(IndexFile::new()),
@@ -489,7 +498,21 @@ impl PackWriter {
     /// maps to the same plaintext. The objcache stores plaintext
     /// (unencrypted); decryption is performed once on the first remote
     /// fetch, mirroring PackReader.
+    ///
+    /// Single-flighted via `index_load`, mirroring
+    /// `PackReader::load_index_file`: the first cache-miss caller to acquire
+    /// `index_load` fetches and deserialises; every other concurrent caller
+    /// for any hash blocks on the same lock, then re-checks `self.indexes`
+    /// (now populated if it was fetching this exact hash) before falling
+    /// through to its own fetch otherwise. This bounds concurrent fetches for
+    /// the SAME hash to one, at the cost of serialising cache-miss loads
+    /// across different hashes too -- the same trade-off `PackReader` already
+    /// makes.
     fn load_index_file(&self, hash: &Hash) -> Result<Arc<IndexFile>, Error> {
+        if let Some(index) = self.indexes.lock().unwrap().get(hash).cloned() {
+            return Ok(index);
+        }
+        let _loading = self.index_load.lock().unwrap();
         if let Some(index) = self.indexes.lock().unwrap().get(hash).cloned() {
             return Ok(index);
         }
@@ -547,16 +570,21 @@ impl PackWriter {
 /// at all:
 ///   - there is no snapshot, or `bloom_hash` is all-zero (never generated), or
 ///   - the stored filter cannot be fetched / decrypted / deserialised, or
-///   - the stored filter is structurally unusable (`num_bits == 0`, which
-///     would divide by zero inside `may_contain`, or `num_hash_functions ==
-///     0`, which is well-defined but useless).
+///   - the stored filter is structurally unusable per
+///     `BloomFilter::structural_defect()` (`num_bits == 0`, which would
+///     divide by zero inside `may_contain`, or `num_hash_functions == 0`,
+///     which is well-defined but useless).
 ///
 /// The fresh filter's capacity hint is `capacity_for(loaded.element_count)`
 /// when a filter WAS read but rejected for being structurally unusable (its
 /// `element_count` field is still meaningful even though its bit array is
 /// not); otherwise (nothing could be read at all) the hint is `0`, which
 /// `capacity_for` floors at `MIN_CAPACITY` -- the same size the old fixed
-/// constant always produced.
+/// constant always produced. `loaded.element_count` is an 8-byte field fully
+/// controlled by whoever wrote the remote object, so it is passed to
+/// `capacity_for` unclamped -- the bound (`bloom::MAX_CAPACITY`) is enforced
+/// inside `capacity_for` itself, not here (design/02 "Bounding the capacity
+/// (hostile and corrupt filters)").
 fn load_remote_bloom(
     remote: &dyn ObjectStore,
     snapshot_root: Option<&IndexRoot>,
@@ -591,8 +619,16 @@ fn load_remote_bloom(
 
     // Structurally unusable: rebuild fresh, using the just-read filter's
     // element_count (still meaningful even though its bit array is not) as
-    // the capacity hint.
-    if loaded.num_bits == 0 || loaded.num_hash_functions == 0 {
+    // the capacity hint. `fresh` -> `bloom::sized_for` -> `capacity_for`
+    // clamps that hint to `MAX_CAPACITY`, so a hostile/corrupt element_count
+    // cannot demand an unbounded allocation here.
+    if let Some(reason) = loaded.structural_defect() {
+        dlog_l6!(
+            "load_remote_bloom: rejecting structurally defective filter ({}), \
+             rebuilding fresh from element_count={}",
+            reason,
+            loaded.element_count
+        );
         return fresh(loaded.element_count);
     }
 
@@ -1175,6 +1211,127 @@ mod tests {
         );
     }
 
+    /// `ObjectStore` wrapper that delays every `open_read` and counts how many
+    /// times it was called, to make a `load_index_file` race window
+    /// observable deterministically rather than relying on scheduler luck.
+    /// Because a successful `crate::codec::pack::load_index_file` call
+    /// performs exactly one `open_read` immediately followed by one
+    /// `IndexFile::deserialise` on a cold objcache (see
+    /// `load_cached_plaintext`), counting `open_read` calls here is
+    /// equivalent to counting deserialisations for this test's setup (an
+    /// empty objcache, a single hash never written to objcache by anything
+    /// else).
+    struct DelayedCountingStore {
+        inner: LocalStore,
+        delay: std::time::Duration,
+        open_read_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ObjectStore for DelayedCountingStore {
+        fn exists(&self, hash: &Hash) -> Result<bool, Error> {
+            self.inner.exists(hash)
+        }
+        fn size(&self, hash: &Hash) -> Result<u64, Error> {
+            self.inner.size(hash)
+        }
+        fn list_with_sizes(&self) -> Result<Vec<(String, u64)>, Error> {
+            self.inner.list_with_sizes()
+        }
+        fn open_read(&self, hash: &Hash) -> Result<Box<dyn io::Read>, Error> {
+            self.open_read_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(self.delay);
+            self.inner.open_read(hash)
+        }
+        fn write_from(&self, hash: &Hash, reader: &mut dyn io::Read) -> Result<(), Error> {
+            self.inner.write_from(hash, reader)
+        }
+    }
+
+    /// Regression test for design/02 "Index lookup cost on the push path":
+    /// when several threads call `load_index_file` for the SAME hash
+    /// concurrently while it is not yet cached (neither in `self.indexes` nor
+    /// on local disk), the underlying fetch + deserialise must happen exactly
+    /// once -- the rest must block on the single-flight guard and reuse the
+    /// result, mirroring `PackReader::load_index_file`'s `index_load` guard.
+    #[test]
+    fn load_index_file_single_flights_concurrent_misses() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        use std::time::Duration;
+
+        let tmp = TempDir::new().unwrap();
+        let base = make_remote_base(&tmp);
+
+        // Produce a real delta index on the remote via a normal push.
+        let data = vec![0x33u8; 100];
+        let hash = make_hash_from_data(&data);
+        {
+            let mut w1 = PackWriter::new(
+                Box::new(LocalStore::for_remote(&base)),
+                Box::new(LocalRootPointer::new(base.clone(), None)),
+                LocalStore::for_cache(tmp.path().join("objcache_write")),
+                None,
+            )
+            .unwrap();
+            w1.write_from(&hash, &mut io::Cursor::new(&data)).unwrap();
+            w1.finish(&Hash::compute(b"root")).unwrap();
+        }
+
+        // A second writer, backed by the delaying/counting store, with a
+        // FRESH (empty) objcache so the first load of the delta index is a
+        // genuine cache miss for every racing thread below.
+        let open_read_calls = Arc::new(AtomicUsize::new(0));
+        let delayed_store = DelayedCountingStore {
+            inner: LocalStore::for_remote(&base),
+            delay: Duration::from_millis(150),
+            open_read_calls: Arc::clone(&open_read_calls),
+        };
+        let w2 = Arc::new(
+            PackWriter::new(
+                Box::new(delayed_store),
+                Box::new(LocalRootPointer::new(base.clone(), None)),
+                LocalStore::for_cache(tmp.path().join("objcache_read")),
+                None,
+            )
+            .unwrap(),
+        );
+
+        let delta_hash = w2
+            .snapshot_root
+            .as_ref()
+            .unwrap()
+            .delta_hashes_as_hashes()
+            .into_iter()
+            .next()
+            .expect("push must have produced one delta index");
+
+        // `PackWriter::new` itself issued one `open_read` above (fetching the
+        // Bloom filter written by `w1.finish()`) -- baseline it away so the
+        // assertion below counts only the concurrent `load_index_file` calls.
+        let baseline = open_read_calls.load(SeqCst);
+
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let w2 = Arc::clone(&w2);
+                    let delta_hash = delta_hash.clone();
+                    scope.spawn(move || w2.load_index_file(&delta_hash).unwrap())
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+        });
+
+        assert_eq!(
+            open_read_calls.load(SeqCst) - baseline,
+            1,
+            "concurrent load_index_file callers for the same hash must \
+             single-flight: only one may reach the remote fetch + \
+             deserialise, the rest must block and reuse the cached IndexFile"
+        );
+    }
+
     /// Regression guard for the stats "unknown" misclassification: index files
     /// (remote magic ED E2) must be cached in the dedicated objcache directory,
     /// NOT in the logical-object cache (objects/ / local_cache). If an index file
@@ -1538,6 +1695,62 @@ mod tests {
             "the fresh filter's capacity must be sized from the rejected \
              filter's element_count, not MIN_CAPACITY"
         );
+    }
+
+    /// Regression test for design/02 "Bounding the capacity (hostile and
+    /// corrupt filters)": a structurally unusable filter (`num_bits == 0`)
+    /// whose `element_count` is a hostile/corrupt 8-byte value far beyond any
+    /// real repository must not be used unclamped as a capacity hint.
+    ///
+    /// CAUTION: on unfixed code this test tries to allocate a bit array sized
+    /// for ~1.6 TiB (`capacity_for(10^12)` with no `MAX_CAPACITY` clamp) and
+    /// will abort the process. Only run this after `MAX_CAPACITY` clamping is
+    /// implemented in `capacity_for` -- run the rest of the suite first.
+    #[test]
+    fn load_remote_bloom_clamps_hostile_element_count_to_max_capacity() {
+        let tmp = TempDir::new().unwrap();
+        let base = make_remote_base(&tmp);
+
+        // num_bits == 0 (structurally unusable) + element_count = 10^12
+        // (fully remote-controlled, no range check at deserialise time).
+        let hostile = BloomFilter::from_parts(7, 0, 1_000_000_000_000u64, vec![]).unwrap();
+        let bytes = hostile.serialise();
+        assert_eq!(
+            bytes.len(),
+            20,
+            "num_bits == 0 means an empty bit array -- 20-byte header only"
+        );
+        let bloom_hash = Hash::compute(&bytes);
+        LocalStore::for_remote(&base)
+            .write_from(&bloom_hash, &mut io::Cursor::new(&bytes))
+            .unwrap();
+
+        let mut root = IndexRoot::new_empty();
+        root.bloom_hash = *bloom_hash.as_bytes_array();
+        publish_raw_index_root(&base, &root);
+
+        let writer = PackWriter::new(
+            Box::new(LocalStore::for_remote(&base)),
+            Box::new(LocalRootPointer::new(base.clone(), None)),
+            LocalStore::for_cache(tmp.path().join("objcache")),
+            None,
+        )
+        .unwrap();
+
+        let loaded = writer.bloom.lock().unwrap();
+        assert!(
+            loaded.num_bits >= 1,
+            "the fresh fallback must never have num_bits == 0"
+        );
+        assert!(
+            crate::codec::pack::bloom::designed_capacity(loaded.num_bits)
+                <= crate::codec::pack::bloom::MAX_CAPACITY,
+            "a hostile element_count must not inflate the fresh filter's \
+             capacity past MAX_CAPACITY"
+        );
+        // Must not panic when used.
+        let probe = make_hash_from_data(b"hostile-element-count-probe");
+        let _ = loaded.may_contain(&probe);
     }
 
     #[test]
