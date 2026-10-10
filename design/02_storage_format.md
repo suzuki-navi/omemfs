@@ -210,6 +210,8 @@ Each two-char subdirectory is an independent shard that tracks its own depth. So
 
 The `objects/` directory is a **local cache** of remote objects. Any object present in the remote backend can be safely deleted locally and re-fetched on demand.
 
+**Future work**: each `exists()`/`find_in` call re-reads the target directory's `.depth` marker and probes `.migrating` freshly (`src/store/objects_dir.rs`), which is several filesystem syscalls per call rather than one. An in-process per-directory memoisation of these two markers (invalidated when a migration is observed) would reduce this further, independently of the STAT_CACHE seal work above — not designed or implemented as part of this pass; see STATUS.md.
+
 ## Remote backend layout
 
 Remote backends (local directory, S3, GCS, Azure) use a common key structure under `<prefix>/`. The exact layout depends on whether encryption is configured.
@@ -1162,6 +1164,9 @@ logic. Without this cache, repeated pushes re-fetch all delta index files from
 the remote on every push (reads grow linearly with the accumulated delta count,
 e.g. 24→79 reads over 6 pushes). With the cache, subsequent pushes find the
 same delta indexes in `.omemfs/objects/` and issue zero remote GETs for them.
+This disk cache avoids a remote fetch, but it does not by itself avoid
+re-deserialising the cached bytes on every call — see "Index lookup cost on
+the push path" below.
 
 On the **push** path, the Bloom filter itself is not cached this way: it is
 loaded once per `PackWriter` construction (`load_remote_bloom`, a single
@@ -1379,11 +1384,18 @@ magic             : 2 bytes   (ED E4)
 version           : 1 byte    (0x01)
 num_hash_functions: 1 byte    (recommended: 7)
 num_bits          : 8 bytes   (big-endian, u64)
-element_count     : 8 bytes   (big-endian, u64 — for fill-rate monitoring)
+element_count     : 8 bytes   (big-endian, u64 — for fill-rate monitoring and capacity estimation; an upper bound on the distinct element count, since re-inserting an already-present hash still increments it)
 bits              : ceil(num_bits / 8) bytes
 ```
 
 The index root's `bloom_hash` field holds the hash of the current Bloom filter file. An all-zero `bloom_hash` indicates that no Bloom filter has been generated yet; in that case the full index lookup is used unconditionally.
+
+Because `num_hash_functions` and `num_bits` travel with the filter itself, a
+Bloom filter is **self-describing**: `insert`/`may_contain` only ever read
+`self`'s own fields, never an external "expected size" setting. This is what
+makes the acceptance rule in "Filter sizing" below possible — a filter's
+membership answers are correct regardless of what capacity it happens to have
+been built for.
 
 **Size at p = 1% false-positive rate**
 
@@ -1398,7 +1410,9 @@ The index root's `bloom_hash` field holds the hash of the current Bloom filter f
 
 ```
 push:
-  1. Fetch the index root → load Bloom filter (local cache or S3 GET).
+  1. Fetch the index root → load Bloom filter (local cache or S3 GET). Any
+     structurally valid filter is accepted regardless of its size relative to
+     the current design target — see "Filter sizing" below.
   2. For each object to push:
        Bloom filter → "definitely absent" → include in push batch.
        Bloom filter → "maybe present"     → verify via index / HEAD; skip if already present.
@@ -1409,7 +1423,134 @@ push:
 
 **Maintenance**
 
-`omemfs pack` regenerates the Bloom filter from scratch (all entries in hot index, cold shards, and standalone objects) to eliminate accumulated false positives. The old Bloom filter file becomes unreferenced and is reclaimed only via the backup-reclone cycle described above.
+`omemfs pack` regenerates the Bloom filter from scratch (all entries in hot index, cold shards, and standalone objects) to eliminate accumulated false positives. `omemfs pack` is also the **only** operation that resizes the filter (see "Filter sizing" below); push only ever appends to whatever filter it loaded. The old Bloom filter file becomes unreferenced and is reclaimed only via the backup-reclone cycle described above.
+
+### Filter sizing
+
+**Push never rebuilds an empty filter merely because the loaded filter's size
+does not match the current design target.** A structurally valid filter —
+`num_bits >= 1` and `num_hash_functions >= 1`, successfully fetched, decrypted,
+and deserialised — is accepted and used as-is, whatever its `(num_bits,
+num_hash_functions)` happen to be. A fresh (empty) filter is only constructed
+when there is nothing valid to load at all: no snapshot, an all-zero
+`bloom_hash`, a fetch/decrypt/deserialise failure, or a structurally unusable
+filter (`num_bits == 0`, which would divide by zero inside `may_contain`, or
+`num_hash_functions == 0`, which is well-defined but useless).
+
+This is a deliberate narrowing of the older rule ("rebuild on any size
+mismatch"), which had a sharp edge: rebuilding an empty filter for a remote
+that already holds a large number of objects makes every one of them look
+"definitely absent" until the next `pack`, so it gets re-uploaded. Accepting
+any structurally valid filter regardless of size removes that edge entirely —
+there is no longer a "resize the target" step that can trigger it — while
+changing nothing about correctness, since membership answers never depended on
+matching the local target in the first place.
+
+**Choosing a capacity (when a fresh filter must be built).** The designed
+capacity for `n` known elements is:
+
+```
+capacity_for(n) = ladder_ceil(max(n, 1) * 3 / 2), floored at MIN_CAPACITY = 100_000
+ladder = {1, 2, 5} × 10^k   (100_000, 200_000, 500_000, 1_000_000, 2_000_000, ...)
+```
+
+at a fixed false-positive target `FP_RATE = 0.01` (unchanged — see "Rejected
+alternatives" below for why `p` itself is not made a knob). The ×1.5 margin
+means a filter stays at its designed false-positive rate until the element
+count it was built for grows by 50% — since only `omemfs pack` resizes,
+that's "until the next `pack` after a 50% growth in objects," not "until the
+next push." The 1-2-5 ladder keeps `pack` idempotent (re-running it against an
+unchanged element count reproduces the same `num_bits`) and bounds the
+over-provisioning from quantisation to at most ~1.67×.
+
+- **`omemfs pack`** (`regenerate_bloom`) knows the exact element count it is
+  about to insert (hot index entries + cold shard entries) and calls
+  `capacity_for` directly.
+- **Push's fallback fresh filter** (reached only in the narrow cases above) has
+  no exact count to hand. When a filter *was* read but rejected for being
+  structurally unusable, its `element_count` field is used as the estimate
+  (`capacity_for(loaded.element_count)`); the fill-rate/capacity field described
+  above is repurposed for this. When no filter could be read at all, the
+  fallback is `MIN_CAPACITY` — the same size this constant has always produced.
+
+This sizing logic lives in one place — `codec::pack::bloom` (constants
+`FP_RATE`, `MIN_CAPACITY`, and the `capacity_for`/`sized_for` functions) —
+rather than being duplicated between the push path and `omemfs pack`, since the
+Bloom file format is owned by that module and both callers already depend on
+it. Unlike `PACK_TARGET`/`PACK_MAX` (a pack-shape convention that happens to be
+shared by two call sites), a divergence here would matter even after the
+size-mismatch rejection is removed: `capacity_for` is also what a diagnostic
+tool would use to report how far a filter is from its designed capacity (see
+"Fill-rate reporting" below), so it must mean the same thing everywhere it is
+read as well as everywhere it is written.
+
+**Safe migration.** The size-mismatch rejection removal (this section) and the
+dynamic sizing (the formula above) must ship together, or in that order — never
+sizing first without the rejection-removal, since a fluctuating per-push target
+computed from a smoothly growing element count would otherwise trigger the
+same empty-filter rebuild on every push that crosses a threshold. With the
+rejection removed first (or simultaneously), the very first push after
+upgrading simply accepts whatever filter is already on the remote — including
+one sized by the old fixed `100_000` constant — with no rebuild and no
+re-upload. The next `omemfs pack` then resizes it, using the formula above,
+from the actual element count observed at that time.
+
+**Fill-rate reporting.** Because `element_count` is already recorded and
+`capacity_for`'s bit computation can be inverted to recover the capacity a
+given `num_bits` was designed for, a loaded filter's fill state can be reported
+without any format change: `omemfs cat <bloom-hash>` and `omemfs stats` can
+show `element_count` against the filter's designed capacity and an estimated
+current false-positive rate, and `push` can emit a one-line warning when a
+filter is over capacity, suggesting `omemfs pack`.
+
+**Rejected alternatives**:
+
+- *Raise the fixed constant (e.g. 100 000 → 500 000) without changing the
+  rejection rule.* Only pushes the same cliff further out and leaves it
+  reachable by any repository that keeps growing, or by an older client
+  pushing against a filter a newer client resized upward.
+- *Resize opportunistically inside push's `finish()`* by re-reading the full
+  snapshot index and re-inserting every hash. Technically possible (`finish()`
+  already has snapshot access) but loads an unbounded amount of index/cold-shard
+  data into every push and duplicates `omemfs pack`'s own responsibility; also
+  lengthens the time the CAS token from push-start remains valid against.
+- *Layered/scalable Bloom filters* (stack a new filter and OR the answers) would
+  let push grow capacity without a format version bump in the *logic*, but
+  does require storing a list of filters instead of one, which is a format
+  change. Left as a future option if resizing only at `pack` time proves
+  insufficient in practice.
+- *Lower `FP_RATE` instead of sizing dynamically.* `DEFAULT_NUM_HASH_FUNCTIONS =
+  7` is the optimal hash count for `p = 0.01`; moving `p` alone without
+  recomputing `k` stops being optimal, and the cost of the current 1%-target
+  false positive (one extra index lookup, never data loss) does not justify
+  the larger filters a materially lower `p` would need.
+
+**Known incompatibility.** After `omemfs pack` has resized a filter upward, a
+push from an older binary that still checks against the fixed `100_000`
+target would see a size mismatch and (under the old rejection rule) rebuild an
+empty filter, re-uploading everything reachable. This is an accepted,
+documented incompatibility between old and new binaries against the same
+remote — consistent with this project's "pre-production, compatibility breaks
+are acceptable" stance (see STATUS.md) — not a runtime check.
+
+### Index lookup cost on the push path (`PackWriter`)
+
+`PackReader` (the read path) keeps every index file it has parsed resident in
+memory for the lifetime of one snapshot (`indexes: Mutex<HashMap<Hash,
+Arc<IndexFile>>>` — see "Snapshot read path" above), so a given index is
+deserialised at most once per reader. `PackWriter::load_index_file`, used by
+`index_contains` for the "maybe present" branch above, only caches the
+*decrypted bytes* on local disk (`.omemfs/objcache/`, per "Index file local
+caching" below) — it re-deserialises those bytes into an `IndexFile` on every
+call. Every "maybe present" check against the hot index (true positives
+included, not just false positives) therefore pays a full hot-index
+deserialisation, independent of the Bloom filter's false-positive rate. Fixing
+the Bloom filter's capacity narrows how often "maybe present" is reached at
+all, but does not remove this per-call cost once it is. `PackWriter` should
+gain the same kind of resident, per-run `IndexFile` cache `PackReader` already
+has, so a hot/cold index loaded once during a push is deserialised once. This
+is purely an in-memory addition on top of the existing disk cache — it changes
+no on-disk or on-wire format.
 
 ---
 

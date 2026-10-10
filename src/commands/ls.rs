@@ -155,6 +155,7 @@ pub fn run(mut opts: LsOptions) -> Result<(), Error> {
                 stat_cache_dirty,
                 &scan_result_dirty.files,
                 &omemfs_dir_dirty,
+                false, // ls is always a read-only, write_blobs = false scan
             ),
         }
         let working_hash = scan_result_dirty.root_hash;
@@ -312,7 +313,12 @@ pub fn run(mut opts: LsOptions) -> Result<(), Error> {
             &omemfs_dir,
             prefix,
         ),
-        None => refresh_stat_cache(stat_cache, &scan_result.files, &omemfs_dir),
+        None => refresh_stat_cache(
+            stat_cache,
+            &scan_result.files,
+            &omemfs_dir,
+            false, // ls is always a read-only, write_blobs = false scan
+        ),
     }
 
     let target_paths: Vec<PathBuf> = if opts.paths.is_empty() {
@@ -1286,12 +1292,28 @@ fn scan_scoped_for_ls(
                 blob_count,
             }
         } else {
-            // Single file: hash only (no blob write), then build its entry.
-            let hash = codec::chunk::hash_file(&abs)?;
+            // Single file: consult STAT_CACHE first, exactly like
+            // `process_file_job`'s cache-hit branch (design/07). A matching
+            // entry skips the read + hash, AND -- just as importantly --
+            // carries its `sealed` bit forward unchanged instead of
+            // unconditionally clearing it. Without this check, every scoped
+            // `ls <file>` would report `cache_hit: false` regardless of
+            // STAT_CACHE, and `apply_scanned` would then overwrite an
+            // already-sealed entry with `sealed = false` on every such call
+            // -- silently undoing `push`'s sealing for a file nobody actually
+            // changed (design/07 "Implementation notes": a read-only scan
+            // must carry seal state forward, never clear it).
             let meta = std::fs::metadata(&abs)?;
             let size = meta.len();
             let mode = crate::fsmeta::mode_from_metadata(&meta);
             let fs_mtime = meta.modified().ok();
+            let cached = fs_mtime.and_then(|t| stat_cache.lookup_current_entry(&rel_str, t, size));
+            let (hash, cache_hit, blob_sealed) = match cached {
+                Some(entry) => (entry.hash.clone(), true, entry.sealed),
+                // This whole function only ever scans with WRITE_BLOBS =
+                // false (ls is read-only), so a cache miss is never sealed.
+                None => (codec::chunk::hash_file(&abs)?, false, false),
+            };
             let mtime = crate::fsmeta::mtime_from_metadata(&meta);
             if let Some(fs_mtime) = fs_mtime {
                 files.insert(
@@ -1300,8 +1322,9 @@ fn scan_scoped_for_ls(
                         fs_mtime,
                         fs_size: size,
                         hash: hash.clone(),
-                        cache_hit: false,
+                        cache_hit,
                         fallback_hit: false,
+                        blob_sealed,
                     },
                 );
             }
@@ -2545,6 +2568,73 @@ mod tests {
     /// Build and store a tree object from `entries`, returning its hash.
     fn store_tree(entries: Vec<TreeEntry>, store: &LocalStore) -> Hash {
         crate::tree_ops::build_and_store(entries, store).unwrap()
+    }
+
+    /// Regression test (design/07 "Seal invalidation"): the single-file
+    /// branch of `scan_scoped_for_ls` must consult STAT_CACHE like
+    /// `process_file_job` does, rather than unconditionally reporting
+    /// `cache_hit: false`. Before this fix, every scoped `ls <file>` on an
+    /// unchanged, already-*sealed* file silently overwrote its STAT_CACHE
+    /// entry with `sealed = false` (via `apply_scanned`'s cache-miss path),
+    /// even though nothing about the file had changed -- defeating the whole
+    /// point of sealing for any file a user happens to `ls` individually.
+    #[test]
+    fn scan_scoped_for_ls_single_file_preserves_cache_hit_and_sealed_bit() {
+        use crate::stat_cache::RACY_THRESHOLD_SECS;
+        use std::time::{Duration, SystemTime};
+
+        let dir = TempDir::new().unwrap();
+        let work = dir.path();
+        let content = b"hello from ls";
+        std::fs::write(work.join("a.txt"), content).unwrap();
+        // Backdate outside the racy window so the STAT_CACHE lookup is a
+        // deterministic hit (design/07 "Racily clean detection").
+        let old = SystemTime::now() - Duration::from_secs(RACY_THRESHOLD_SECS + 100);
+        filetime::set_file_mtime(
+            work.join("a.txt"),
+            filetime::FileTime::from_system_time(old),
+        )
+        .unwrap();
+
+        let store = LocalStore::for_cache(dir.path().join("objects"));
+        let meta = std::fs::metadata(work.join("a.txt")).unwrap();
+        let fs_mtime = meta.modified().unwrap();
+        let hash = Hash::compute(content);
+
+        // Simulate STAT_CACHE state as `push` would have left it: a sealed
+        // entry whose (mtime, size) match the file on disk exactly.
+        let mut stat_cache = StatCache::default();
+        stat_cache.update(
+            "a.txt".to_string(),
+            fs_mtime,
+            content.len() as u64,
+            hash.clone(),
+            true, // sealed
+        );
+
+        let result = scan_scoped_for_ls(
+            work,
+            &[work.join("a.txt")],
+            None,
+            None,
+            &store,
+            &stat_cache,
+        )
+        .unwrap();
+
+        let sf = result.files.get("a.txt").expect("a.txt scanned");
+        assert!(
+            sf.cache_hit,
+            "a matching STAT_CACHE entry must be reported as a cache hit, \
+             not unconditionally re-hashed"
+        );
+        assert!(
+            sf.blob_sealed,
+            "the entry's existing sealed bit must be carried forward, not \
+             reset to false, so a later push does not lose trust in a file \
+             nobody changed"
+        );
+        assert_eq!(sf.hash, hash);
     }
 
     /// This is the crux of the fix: a `base` (clone-root) subtree whose own

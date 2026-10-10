@@ -76,7 +76,10 @@ fn push_full(
         None => None,
     };
     let omemfs_dir = repo.work_dir.join(".omemfs");
-    let stat_cache = StatCache::read(&omemfs_dir);
+    let mut stat_cache = StatCache::read(&omemfs_dir);
+    // push is always a blob-writing scan: compute seal trust once, right after
+    // loading, before any file is scanned (design/07 "Implementation notes").
+    stat_cache.compute_seals_trusted(&omemfs_dir, local);
     let (new_root_hash, conflict_paths, unstable_paths) = {
         let phase = crate::progress::begin_phase("Scan working tree");
         let _t = dtimer_l1!("scan working tree");
@@ -92,7 +95,7 @@ fn push_full(
         let file_count = scan_result.files.len();
         let conflict_paths = scan_result.side.conflict_paths;
         let unstable_paths = scan_result.side.unstable_paths;
-        refresh_stat_cache(stat_cache, &scan_result.files, &omemfs_dir);
+        refresh_stat_cache(stat_cache, &scan_result.files, &omemfs_dir, true);
         dlog_l1!("working tree root: {}", &h.as_str()[..8]);
         phase.complete(format!("{} files", file_count));
         (h, conflict_paths, unstable_paths)
@@ -138,7 +141,8 @@ fn push_full(
         &new_root_hash,
         remote_key.as_ref(),
         &io_record,
-    )?;
+    )
+    .map_err(|e| recover_from_missing_object_if_applicable(&omemfs_dir, e))?;
     repo.write_clone_root(&new_root_hash)?;
 
     {
@@ -226,6 +230,9 @@ fn push_scoped(
     } else {
         StatCache::read(&omemfs_dir)
     };
+    // push is always a blob-writing scan: compute seal trust once, right after
+    // loading, before any path is scanned (design/07 "Implementation notes").
+    stat_cache.compute_seals_trusted(&omemfs_dir, local);
 
     // Scan each path and compute its new hash.
     struct ScopedResult {
@@ -333,16 +340,12 @@ fn push_scoped(
                 Err(e) => return Err(e),
             };
             let count = scan_result.files.len();
-            for (path, scanned) in &scan_result.files {
-                if !scanned.cache_hit {
-                    stat_cache.update(
-                        path.clone(),
-                        scanned.fs_mtime,
-                        scanned.fs_size,
-                        scanned.hash.clone(),
-                    );
-                }
-            }
+            // Shared with `refresh_stat_cache`/`refresh_stat_cache_scoped` so
+            // this third writeback call site cannot drift from the other two
+            // (design/07 "Usage in scan_and_store"): a cache miss gets a
+            // fresh `update`, and a cache hit whose blob this scan verified
+            // gets `mark_sealed`.
+            crate::scan::apply_scanned(&mut stat_cache, &scan_result.files);
             conflict_paths.extend(scan_result.side.conflict_paths);
             unstable_paths.extend(scan_result.side.unstable_paths);
             phase.complete(format!("{} files", count));
@@ -402,6 +405,11 @@ fn push_scoped(
         sorted.sort();
         return Err(report_unresolved_conflicts(sorted));
     }
+
+    // push is always a blob-writing scan: if compute_seals_trusted found a
+    // whole-epoch mismatch earlier, rotate and persist a fresh epoch now
+    // (design/07 "Seal epoch"). A no-op when trust already held.
+    stat_cache.finalize_seal_epoch(&omemfs_dir);
 
     // STAT_CACHE is a pure acceleration cache (design/07): a write failure must
     // not abort the command. Emit a warning and continue. A single-path push
@@ -595,7 +603,8 @@ fn push_scoped(
         &new_root_hash,
         remote_key.as_ref(),
         &io_record,
-    )?;
+    )
+    .map_err(|e| recover_from_missing_object_if_applicable(&omemfs_dir, e))?;
     repo.write_clone_root(&new_clone_root)?;
 
     {
@@ -678,6 +687,42 @@ fn report_unresolved_conflicts<'a>(paths: impl IntoIterator<Item = &'a String>) 
         eprintln!("  {}", p);
     }
     Error::Other("unresolved conflicts".to_string())
+}
+
+/// L3 upload-failure recovery, the final backstop of design/07 "Seal
+/// invalidation": if an upload step still finds a referenced local blob
+/// missing (`Error::ObjectNotFound` while reading it out of
+/// `.omemfs/objects/` to transfer it), push must not fail silently or upload a
+/// tree that references a missing object. Instead:
+///
+/// 1. Clear the `SEALED` bit on every STAT_CACHE entry and write the cache
+///    back (hashes are untouched — nothing needs to be re-hashed).
+/// 2. Return an error directing the user to run `push` again; the retry then
+///    behaves exactly like today's push (every entry re-verified via
+///    `store.exists()`, missing blobs recaptured from the working tree).
+///
+/// Any other error is passed through unchanged.
+fn recover_from_missing_object_if_applicable(omemfs_dir: &std::path::Path, err: Error) -> Error {
+    if !matches!(err, Error::ObjectNotFound(_)) {
+        return err;
+    }
+    let mut cache = StatCache::read(omemfs_dir);
+    cache.clear_all_sealed();
+    // STAT_CACHE is a pure acceleration cache (design/07): a write failure
+    // here must not mask the original error or escalate; warn and continue --
+    // the retry's own scan will simply re-verify every entry via
+    // store.exists() regardless of whether this clear was persisted.
+    if let Err(e) = cache.write_if_dirty(omemfs_dir) {
+        eprintln!(
+            "warning: failed to write STAT_CACHE while recovering from a missing object: {}",
+            e
+        );
+    }
+    Error::Other(format!(
+        "upload failed: a referenced local object is missing ({}).\n\
+         STAT_CACHE seal state has been cleared; run 'omemfs push' again to recapture and retry.",
+        err
+    ))
 }
 
 fn report_unstable_paths(paths: &std::collections::HashSet<String>) {

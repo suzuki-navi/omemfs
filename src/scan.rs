@@ -32,6 +32,16 @@ pub struct ScannedFile {
     /// the next scan hits the cache directly instead of repeating the fallback
     /// (design/07 "Clone-root fallback").
     pub fallback_hit: bool,
+    /// True when this scan wrote or verified the local object referenced by
+    /// `hash` — i.e. `write_blobs` was `true` for the scan that produced this
+    /// record, regardless of which of the three branches in `process_file_job`
+    /// resolved it (cache hit, clone-root fallback, or full read+hash all only
+    /// reach a `ScannedFile` when the local blob is confirmed present under
+    /// `write_blobs = true`). Drives the STAT_CACHE writeback in
+    /// `apply_scanned`: a cache miss is `update`d with `sealed = blob_sealed`,
+    /// and a cache hit with `blob_sealed = true` gets `mark_sealed` (design/07
+    /// "Usage in scan_and_store").
+    pub blob_sealed: bool,
 }
 
 /// Side data collected while walking the working tree during a scan.
@@ -210,20 +220,20 @@ fn scan_thread_count() -> usize {
     nproc.clamp(1, 4)
 }
 
-/// Update `cache` with any files that were not a cache hit, then persist it.
-pub fn refresh_stat_cache(
-    mut cache: StatCache,
-    files: &HashMap<String, ScannedFile>,
-    omemfs_dir: &std::path::Path,
-) {
+/// Apply one scan's per-file results onto `cache`: a cache miss (including a
+/// clone-root fallback hit) is recorded with a fresh `update`, and a cache hit
+/// whose local blob was written or verified this scan (`blob_sealed`) gets
+/// `mark_sealed`. Shared by `refresh_stat_cache`, `refresh_stat_cache_scoped`,
+/// and `push`'s multi-path scoped loop so the writeback logic cannot drift
+/// across call sites (design/07 "Usage in scan_and_store").
+pub fn apply_scanned(cache: &mut StatCache, files: &HashMap<String, ScannedFile>) {
     for (path, scanned) in files {
-        // Update entries that were re-hashed (full read) and entries accepted
-        // via the clone-root fallback (`fallback_hit`): both have
-        // `cache_hit == false`. Direct STAT_CACHE hits are skipped because the
-        // entry already matches. Recording fallback hits means the next scan
-        // gets a direct cache hit instead of repeating the clone-root lookup
-        // (design/07 "Clone-root fallback").
         if !scanned.cache_hit {
+            // Update entries that were re-hashed (full read) and entries
+            // accepted via the clone-root fallback (`fallback_hit`): both have
+            // `cache_hit == false`. Recording fallback hits means the next
+            // scan gets a direct cache hit instead of repeating the
+            // clone-root lookup (design/07 "Clone-root fallback").
             if scanned.fallback_hit {
                 dlog_l1!("stat cache: record clone-root fallback hit {}", path);
             }
@@ -232,8 +242,32 @@ pub fn refresh_stat_cache(
                 scanned.fs_mtime,
                 scanned.fs_size,
                 scanned.hash.clone(),
+                scanned.blob_sealed,
             );
+        } else if scanned.blob_sealed {
+            // A direct STAT_CACHE hit whose local blob this scan wrote or
+            // verified: seal it so a later blob-writing scan can skip its own
+            // local-existence check (design/07 "Seal invalidation"). A no-op
+            // when the entry was already sealed (keeps the cache clean).
+            cache.mark_sealed(path);
         }
+    }
+}
+
+/// Update `cache` with any files that were not a cache hit, then persist it.
+/// `write_blobs` must match the scan that produced `files`: only a
+/// blob-writing scan (`push`, `stub`) ever needs to rotate the seal epoch
+/// (design/07 "Seal epoch"); a read-only scan (`ls`, `pull`) always passes
+/// `false` and simply carries its loaded `seal_epoch` forward unchanged.
+pub fn refresh_stat_cache(
+    mut cache: StatCache,
+    files: &HashMap<String, ScannedFile>,
+    omemfs_dir: &std::path::Path,
+    write_blobs: bool,
+) {
+    apply_scanned(&mut cache, files);
+    if write_blobs {
+        cache.finalize_seal_epoch(omemfs_dir);
     }
     // STAT_CACHE is a pure acceleration cache (design/07): a write failure must
     // not abort the command. Emit a warning and continue. The write is skipped
@@ -252,25 +286,17 @@ pub fn refresh_stat_cache(
 /// the in-scope entries. The writeback re-reads the full file fresh and overlays
 /// the in-scope updates so out-of-scope entries survive byte-for-byte
 /// (design/07 "Read optimisation: scope-limited load").
+///
+/// Only used by `ls` (always a read-only, `write_blobs = false` scan), so
+/// there is no `write_blobs` parameter and no seal-epoch rotation here; the
+/// loaded `seal_epoch` is carried forward unchanged by `write_scoped_merge`.
 pub fn refresh_stat_cache_scoped(
     mut cache: StatCache,
     files: &HashMap<String, ScannedFile>,
     omemfs_dir: &std::path::Path,
     scope_prefix: &str,
 ) {
-    for (path, scanned) in files {
-        if !scanned.cache_hit {
-            if scanned.fallback_hit {
-                dlog_l1!("stat cache: record clone-root fallback hit {}", path);
-            }
-            cache.update(
-                path.clone(),
-                scanned.fs_mtime,
-                scanned.fs_size,
-                scanned.hash.clone(),
-            );
-        }
-    }
+    apply_scanned(&mut cache, files);
     // STAT_CACHE is a pure acceleration cache (design/07): a write failure must
     // not abort the command. The merge re-reads the full file and overlays the
     // in-scope updates; a no-change scoped scan skips the write entirely.
@@ -854,13 +880,26 @@ fn process_file_job(job: &FileJob, cfg: &FileJobConfig<'_>) -> Result<FileJobRes
     let mode = job.mode.clone();
 
     // STAT_CACHE lookup: skip hash computation when (mtime, size) match.
+    //
+    // Skip condition on a hit (design/07 "process_file_job's exact skip
+    // condition"):
+    //   write_blobs == false                     -- read-only scan never
+    //                                                needed the blob
+    //     OR (entry.sealed AND seals_trusted)     -- verified-present, and
+    //                                                that verification is
+    //                                                still trustworthy
+    //     OR store.exists(entry.hash)             -- fall back to the check
+    //                                                this replaces
+    // Only the middle branch is new; it never changes what a scan accepts, it
+    // only skips a `store.exists()` call whose answer is already known.
     if let Some(cache) = cfg.stat_cache
         && let Some(fs_mtime_sys) = fs_mtime_st
-        && let Some(cached_hash) = cache.lookup_current(rel_path, fs_mtime_sys, file_size)
-        // Push must seal every referenced blob before upload. A read-only scan
-        // may have populated STAT_CACHE without writing the local object.
-        && (!cfg.write_blobs || cfg.store.exists(cached_hash)?)
+        && let Some(cached_entry) = cache.lookup_current_entry(rel_path, fs_mtime_sys, file_size)
+        && (!cfg.write_blobs
+            || (cached_entry.sealed && cache.seals_trusted())
+            || cfg.store.exists(&cached_entry.hash)?)
     {
+        let cached_hash = &cached_entry.hash;
         let mtime = mtime_stable(
             mtime_for_entry(cfg.clone_root_entries, rel_path, cached_hash),
             fs_mtime,
@@ -871,6 +910,11 @@ fn process_file_job(job: &FileJob, cfg: &FileJobConfig<'_>) -> Result<FileJobRes
             hash: cached_hash.clone(),
             cache_hit: true,
             fallback_hit: false,
+            // The blob is confirmed present exactly when write_blobs is true:
+            // either it was already sealed-and-trusted, or store.exists() was
+            // just called and returned true (the && chain above short-circuits
+            // otherwise). A read-only scan never checked, so it is not sealed.
+            blob_sealed: cfg.write_blobs,
         };
         let entry = TreeEntry::Blob {
             name,
@@ -903,6 +947,9 @@ fn process_file_job(job: &FileJob, cfg: &FileJobConfig<'_>) -> Result<FileJobRes
                     // next scan hits the cache directly.
                     cache_hit: false,
                     fallback_hit: true,
+                    // Present exactly when write_blobs is true (the && chain
+                    // above required store.exists() == true in that case).
+                    blob_sealed: cfg.write_blobs,
                 },
             )
         });
@@ -973,6 +1020,10 @@ fn process_file_job(job: &FileJob, cfg: &FileJobConfig<'_>) -> Result<FileJobRes
                 hash: hash.clone(),
                 cache_hit: false,
                 fallback_hit: false,
+                // The blob was just written to `cfg.store` above when
+                // write_blobs is true (store_file_snapshot); a read-only scan
+                // never writes it.
+                blob_sealed: cfg.write_blobs,
             },
         )
     });
@@ -1382,7 +1433,13 @@ mod tests {
         let mut cache = StatCache::default();
         for (path, sf) in &result.files {
             if !sf.cache_hit {
-                cache.update(path.clone(), sf.fs_mtime, sf.fs_size, sf.hash.clone());
+                cache.update(
+                    path.clone(),
+                    sf.fs_mtime,
+                    sf.fs_size,
+                    sf.hash.clone(),
+                    sf.blob_sealed,
+                );
             }
         }
         assert!(cache.is_dirty(), "captured file must make the cache dirty");
@@ -1639,5 +1696,302 @@ mod tests {
             blob_count as usize, n,
             "aggregate blob_count matches file count"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // SEALED skip (design/07 "Seal invalidation")
+    // -----------------------------------------------------------------------
+
+    /// A store wrapper that counts calls to `exists()`, so a test can assert
+    /// exactly how many local-existence checks a scan performed -- the
+    /// observable effect of the SEALED-skip optimisation.
+    /// `exists_calls` counts every call (tree objects included: `build_and_store`
+    /// calls `store.exists()` once per directory level for its own dedup check,
+    /// entirely unrelated to STAT_CACHE sealing). `exists_hashes` additionally
+    /// records which hashes were checked, so a test can assert something more
+    /// precise than a raw count -- specifically, that a given *blob* hash was
+    /// (or was not) passed to `exists()`, independent of how many tree-object
+    /// checks happened alongside it.
+    struct CountingExistsStore {
+        inner: LocalStore,
+        exists_calls: std::sync::atomic::AtomicUsize,
+        exists_hashes: std::sync::Mutex<HashSet<Hash>>,
+    }
+
+    impl CountingExistsStore {
+        fn new(inner: LocalStore) -> Self {
+            CountingExistsStore {
+                inner,
+                exists_calls: std::sync::atomic::AtomicUsize::new(0),
+                exists_hashes: std::sync::Mutex::new(HashSet::new()),
+            }
+        }
+
+        fn reset(&self) {
+            self.exists_calls
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+            self.exists_hashes.lock().unwrap().clear();
+        }
+
+        fn was_checked(&self, hash: &Hash) -> bool {
+            self.exists_hashes.lock().unwrap().contains(hash)
+        }
+    }
+
+    impl crate::store::ObjectStore for CountingExistsStore {
+        fn exists(&self, hash: &Hash) -> Result<bool, Error> {
+            self.exists_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.exists_hashes.lock().unwrap().insert(hash.clone());
+            self.inner.exists(hash)
+        }
+        fn size(&self, hash: &Hash) -> Result<u64, Error> {
+            self.inner.size(hash)
+        }
+        fn list_with_sizes(&self) -> Result<Vec<(String, u64)>, Error> {
+            self.inner.list_with_sizes()
+        }
+        fn open_read(&self, hash: &Hash) -> Result<Box<dyn std::io::Read>, Error> {
+            self.inner.open_read(hash)
+        }
+        fn write_from(&self, hash: &Hash, reader: &mut dyn std::io::Read) -> Result<(), Error> {
+            self.inner.write_from(hash, reader)
+        }
+    }
+
+    /// Backdate every regular file directly under `dir` outside the racy
+    /// window, so a STAT_CACHE hit is deterministic in a test (no sleep).
+    fn backdate_files(dir: &Path) {
+        let ft = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+        for entry in fs::read_dir(dir).unwrap().flatten() {
+            if entry.file_type().unwrap().is_file() {
+                filetime::set_file_mtime(entry.path(), ft).unwrap();
+            }
+        }
+    }
+
+    /// Run one "push-shaped" scan-and-refresh cycle exactly the way
+    /// `push_full` does: load happens by the caller (so it can inspect
+    /// `seals_trusted`), this helper covers compute -> scan -> apply_scanned
+    /// -> finalize -> write.
+    fn run_push_like_scan(
+        work: &Path,
+        store: &dyn ObjectStore,
+        omemfs_dir: &Path,
+        write_blobs: bool,
+    ) -> ScanResult {
+        let mut cache = StatCache::read(omemfs_dir);
+        if write_blobs {
+            cache.compute_seals_trusted(omemfs_dir, store);
+        }
+        let result = scan_and_store_with_cache(work, work, store, None, &cache, write_blobs)
+            .unwrap();
+        apply_scanned(&mut cache, &result.files);
+        if write_blobs {
+            cache.finalize_seal_epoch(omemfs_dir);
+        }
+        cache.write_if_dirty(omemfs_dir).unwrap();
+        result
+    }
+
+    /// Run `f` with `OMEMFS_SEAL_SAMPLE=0` (sampling disabled) for its
+    /// duration, holding `stat_cache::SEAL_SAMPLE_ENV_LOCK` so concurrent
+    /// tests -- in this module AND in `stat_cache.rs`, which reads/mutates the
+    /// same process-global env var -- cannot observe a different value.
+    /// Sampling itself calls `store.exists()` on up to `OMEMFS_SEAL_SAMPLE`
+    /// sealed entries on every blob-writing scan where the epoch matches
+    /// (design/07 "Sampling verification") -- setting it to `0` isolates the
+    /// per-file skip condition these tests are about, so the count they
+    /// assert reflects only `process_file_job`, not sampling.
+    fn with_seal_sampling_disabled<R>(f: impl FnOnce() -> R) -> R {
+        let _guard = crate::stat_cache::SEAL_SAMPLE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("OMEMFS_SEAL_SAMPLE", "0");
+        }
+        let result = f();
+        unsafe {
+            std::env::remove_var("OMEMFS_SEAL_SAMPLE");
+        }
+        result
+    }
+
+    /// End-to-end regression for design/07 "Seal invalidation" and the
+    /// "process_file_job's exact skip condition": pushing the same unchanged
+    /// tree twice must not call `store.exists()` with either file's *blob*
+    /// hash on the second pass. Mirrors `push`'s own sequence (StatCache::read
+    /// -> compute_seals_trusted -> scan -> apply_scanned -> finalize_seal_epoch
+    /// -> write) without going through the `push` command. Sampling is
+    /// disabled (see `with_seal_sampling_disabled`) so the assertion isolates
+    /// the per-file skip condition rather than sampling's own bounded
+    /// exists() calls. `store.exists()` is still called once per directory
+    /// level for the (unrelated) tree-object dedup check in
+    /// `tree_ops::build_and_store` -- that is not what this test is about, so
+    /// it asserts on specific blob hashes rather than a raw call count.
+    #[test]
+    fn seal_skips_store_exists_on_unchanged_second_scan() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let work = dir.path();
+        fs::write(work.join("a.txt"), b"hello world").unwrap();
+        fs::write(work.join("b.txt"), b"foo bar baz quux").unwrap();
+        backdate_files(work);
+
+        let omemfs_dir = work.join(".omemfs");
+        fs::create_dir_all(omemfs_dir.join("objects")).unwrap();
+        let store = CountingExistsStore::new(LocalStore::for_cache(omemfs_dir.join("objects")));
+
+        with_seal_sampling_disabled(|| {
+            // First "push": no cache yet, everything is hashed and written fresh.
+            let result1 = run_push_like_scan(work, &store, &omemfs_dir, true);
+            assert_eq!(result1.files.len(), 2);
+            let a_hash = result1.files["a.txt"].hash.clone();
+            let b_hash = result1.files["b.txt"].hash.clone();
+
+            // Second "push" over the identical, unchanged tree.
+            store.reset();
+            let result2 = run_push_like_scan(work, &store, &omemfs_dir, true);
+            assert_eq!(result2.files.len(), 2);
+
+            assert!(
+                !store.was_checked(&a_hash),
+                "an unchanged, fully-sealed second scan must never call \
+                 store.exists() on a.txt's blob hash"
+            );
+            assert!(
+                !store.was_checked(&b_hash),
+                "an unchanged, fully-sealed second scan must never call \
+                 store.exists() on b.txt's blob hash"
+            );
+        });
+    }
+
+    /// A file discovered by a read-only scan (`ls`, `write_blobs = false`) is
+    /// cached but not sealed. The next blob-writing scan (`push`) must still
+    /// verify it via `store.exists()` (or capture it, since the blob was never
+    /// written) -- but the scan AFTER that, over the same unchanged tree, must
+    /// skip the check entirely once the file is sealed. Sampling is disabled
+    /// (see `with_seal_sampling_disabled`) for the final assertion so it
+    /// isolates the per-file skip condition. `store.exists()` is still called
+    /// once per directory level for the (unrelated) tree-object dedup check in
+    /// `tree_ops::build_and_store`, so assertions target `c.txt`'s specific
+    /// blob hash rather than a raw call count.
+    #[test]
+    fn ls_then_push_seals_and_a_third_push_skips_exists() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let work = dir.path();
+        fs::write(work.join("c.txt"), b"new content").unwrap();
+        backdate_files(work);
+
+        let omemfs_dir = work.join(".omemfs");
+        fs::create_dir_all(omemfs_dir.join("objects")).unwrap();
+        let store = CountingExistsStore::new(LocalStore::for_cache(omemfs_dir.join("objects")));
+
+        with_seal_sampling_disabled(|| {
+            // "ls": read-only scan, hashes the file but writes no blob and
+            // never seals it.
+            let ls_result = run_push_like_scan(work, &store, &omemfs_dir, false);
+            let sf = ls_result.files.get("c.txt").expect("c.txt scanned by ls");
+            let c_hash = sf.hash.clone();
+            assert!(!sf.blob_sealed, "a read-only scan must never seal");
+            assert!(
+                !store.inner.exists(&c_hash).unwrap(),
+                "ls must not have written the blob"
+            );
+
+            // "push": blob-writing scan over the STAT_CACHE entry ls just left
+            // behind (cache_hit=true, but not sealed) -- must consult
+            // store.exists() (branch 3 of the skip condition), find it
+            // missing, and fall through to a full capture that writes the
+            // blob and seals it.
+            store.reset();
+            let push_result = run_push_like_scan(work, &store, &omemfs_dir, true);
+            assert!(
+                store.was_checked(&c_hash),
+                "the first blob-writing scan over an unsealed cache hit must call \
+                 store.exists() on c.txt's blob hash"
+            );
+            let sf = push_result
+                .files
+                .get("c.txt")
+                .expect("c.txt scanned by push");
+            assert_eq!(sf.hash, c_hash, "content is unchanged, so the hash is stable");
+            assert!(
+                store.inner.exists(&c_hash).unwrap(),
+                "push must capture the blob"
+            );
+
+            // A second "push" over the now-sealed, unchanged tree must skip
+            // store.exists() for c.txt's blob hash entirely.
+            store.reset();
+            run_push_like_scan(work, &store, &omemfs_dir, true);
+            assert!(
+                !store.was_checked(&c_hash),
+                "a scan following a sealed, trusted, unchanged tree must skip \
+                 store.exists() on c.txt's blob hash"
+            );
+        });
+    }
+
+    /// Sampling verification (design/07 "Sampling verification"): when a
+    /// sealed entry's local object goes missing but `.seal_epoch` is
+    /// untouched (a partial loss, not a whole-directory reset), the next
+    /// blob-writing scan must detect it via sampling, downgrade
+    /// `seals_trusted` for that whole scan, and recapture the missing blob
+    /// (never silently skip it). Relies on the ambient (default) sampling
+    /// size, so it holds `stat_cache::SEAL_SAMPLE_ENV_LOCK` for mutual
+    /// exclusion with the tests (here and in `stat_cache.rs`) that override
+    /// `OMEMFS_SEAL_SAMPLE`.
+    #[test]
+    fn sampling_detects_partial_loss_and_falls_back_to_full_verification() {
+        let _guard = crate::stat_cache::SEAL_SAMPLE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(
+            std::env::var("OMEMFS_SEAL_SAMPLE").is_err(),
+            "ambient OMEMFS_SEAL_SAMPLE would invalidate this test's default-sampling assumption"
+        );
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let work = dir.path();
+        fs::write(work.join("a.txt"), b"hello world").unwrap();
+        fs::write(work.join("b.txt"), b"foo bar baz quux").unwrap();
+        backdate_files(work);
+
+        let omemfs_dir = work.join(".omemfs");
+        fs::create_dir_all(omemfs_dir.join("objects")).unwrap();
+        let store = CountingExistsStore::new(LocalStore::for_cache(omemfs_dir.join("objects")));
+        let _ = run_push_like_scan(work, &store, &omemfs_dir, true);
+
+        // Simulate a partial loss: delete one blob's local object file, but
+        // leave `.seal_epoch` (and every other object) untouched.
+        let cache = StatCache::read(&omemfs_dir);
+        let a_hash = cache.lookup_current(
+            "a.txt",
+            fs::metadata(work.join("a.txt")).unwrap().modified().unwrap(),
+            fs::metadata(work.join("a.txt")).unwrap().len(),
+        );
+        let a_hash = a_hash.expect("a.txt must be a direct cache hit").clone();
+        assert!(store.inner.exists(&a_hash).unwrap());
+        let object_path = omemfs_dir.join("objects").join(a_hash.as_str());
+        fs::remove_file(&object_path).expect("remove a.txt's local object");
+
+        // The default OMEMFS_SEAL_SAMPLE (256) covers every sealed entry in
+        // this 2-file cache, so sampling must catch the loss deterministically
+        // (no env var override needed).
+        store.reset();
+        let result = run_push_like_scan(work, &store, &omemfs_dir, true);
+
+        assert!(
+            store.was_checked(&a_hash),
+            "sampling must have downgraded trust, forcing a real store.exists() \
+             check on a.txt's blob hash"
+        );
+        assert!(
+            store.inner.exists(&a_hash).unwrap(),
+            "the missing blob must have been recaptured, not silently skipped"
+        );
+        let sf = result.files.get("a.txt").expect("a.txt rescanned");
+        assert_eq!(sf.hash, a_hash, "content is unchanged, so the hash is stable");
     }
 }

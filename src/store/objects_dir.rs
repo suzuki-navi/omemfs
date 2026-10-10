@@ -334,6 +334,49 @@ mod tests {
         }
     }
 
+    /// design/07 "Seal epoch": `.seal_epoch` is a dotfile directly inside
+    /// `.omemfs/objects/`, at the same level as `.depth` / `.migrating`. Every
+    /// existing directory-walk helper in this module already skips dotfiles
+    /// (`name.starts_with('.')`), so a `.seal_epoch` marker must be invisible
+    /// to `iter_hashes`, `count_objects` (migration threshold), and migration
+    /// itself -- no enumeration path needs to change to accommodate it.
+    #[test]
+    fn seal_epoch_marker_is_invisible_to_directory_walks() {
+        let tmp = TempDir::new().unwrap();
+        let od = ObjectsDir::new(tmp.path());
+
+        // Write a couple of real objects plus the seal_epoch marker directly
+        // alongside them, exactly where StatCache places it.
+        write(&od, &make_hex(0x01), b"a");
+        write(&od, &make_hex(0x02), b"b");
+        fs::write(tmp.path().join(".seal_epoch"), [0x42u8; 16]).unwrap();
+
+        // iter_hashes (used by `cat`'s prefix search) must not surface it.
+        let hashes = od.iter_hashes();
+        assert_eq!(hashes.len(), 2, "the marker must not be counted as an object");
+        assert!(!hashes.iter().any(|h| h.starts_with(".seal_epoch")));
+
+        // count_objects (migration threshold) must not count it either: write
+        // exactly THRESHOLD more real objects and confirm migration triggers
+        // at the same point it would without the marker present.
+        for i in 3u32..=(THRESHOLD as u32 + 1) {
+            write(&od, &format!("{:064x}", i), b"x");
+        }
+        assert_eq!(
+            shard_depth(tmp.path()),
+            1,
+            "migration threshold must be reached by real objects alone"
+        );
+
+        // The marker must survive migration untouched (do_migration also
+        // skips dotfiles) and must never be moved into a shard subdirectory.
+        assert_eq!(
+            fs::read(tmp.path().join(".seal_epoch")).unwrap(),
+            vec![0x42u8; 16],
+            "the marker must survive migration in place, unmoved"
+        );
+    }
+
     #[test]
     fn crash_resume_migration() {
         let tmp = TempDir::new().unwrap();

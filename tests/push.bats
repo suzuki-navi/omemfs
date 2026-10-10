@@ -895,3 +895,133 @@ PY
     [ "$status" -eq 0 ]
     [[ "${output,,}" == *"nothing to push"* ]]
 }
+
+# ---------------------------------------------------------------------------
+# push: STAT_CACHE SEALED flag / seal epoch (design/07 "Seal invalidation")
+# ---------------------------------------------------------------------------
+
+@test "push: deleting every blob object plus the epoch marker forces full recapture on the next push" {
+    # This deletes every *blob* object plus the .seal_epoch marker -- a
+    # whole-epoch mismatch exactly like design/07's "rm -rf .omemfs/objects"
+    # scenario -- but deliberately keeps tree objects intact. Actually
+    # deleting the whole objects/ directory also destroys the root's own tree
+    # object, which a plain `push` cannot recover from on its own (push_full's
+    # clone-root flatten reads it from the *local* store with no remote
+    # fallback, unlike pull/clone's lazy tree store) -- a pre-existing gap
+    # unrelated to STAT_CACHE sealing. Deleting only blob objects exercises
+    # exactly what design/07 promises: every SEALED entry is re-verified via
+    # store.exists(), found missing, and recaptured.
+    mkdir -p sealtest
+    echo "alpha" > sealtest/a.txt
+    echo "beta" > sealtest/b.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    # Collect every blob hash (skip the root self-row "." and any directory
+    # summary row, which report a *tree* hash, not a blob hash).
+    mapfile -t blob_hashes < <("$OMEMFS" ls -r --full-hash | awk '$NF != "." && $NF !~ /\/$/ {print $1}')
+    [ "${#blob_hashes[@]}" -gt 0 ]
+    for h in "${blob_hashes[@]}"; do
+        [ -f ".omemfs/objects/${h}" ]
+        rm -f ".omemfs/objects/${h}"
+    done
+    rm -f .omemfs/objects/.seal_epoch
+
+    # The working tree itself did not change, so the recomputed root hash
+    # still equals clone_root and push reports "Nothing to push." -- but the
+    # scan that runs before that check must still have re-verified every file
+    # (a fresh seal_epoch mismatch: no marker at all) and recaptured every
+    # blob.
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    for h in "${blob_hashes[@]}"; do
+        [ -f ".omemfs/objects/${h}" ]
+    done
+    [ -f .omemfs/objects/.seal_epoch ]
+}
+
+@test "push: deleting only the .seal_epoch marker forces re-verification without a full re-hash" {
+    mkdir -p sealtest
+    echo "alpha" > sealtest/a.txt
+    touch -d "2020-01-01 00:00:00" sealtest/a.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    [ -f .omemfs/objects/.seal_epoch ]
+    old_epoch="$(cat .omemfs/objects/.seal_epoch)"
+
+    # Partial marker loss only: every blob object is still present, only the
+    # epoch marker itself is gone (design/07 "no marker file" mismatch case).
+    rm -f .omemfs/objects/.seal_epoch
+
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    [[ "${output,,}" == *"nothing to push"* ]]
+
+    # A fresh marker must have been generated and persisted (the scan
+    # re-verified every entry via store.exists(), found everything present,
+    # and finalize_seal_epoch rotated a new epoch since none matched).
+    [ -f .omemfs/objects/.seal_epoch ]
+    new_epoch="$(cat .omemfs/objects/.seal_epoch)"
+    [ "$new_epoch" != "$old_epoch" ]
+}
+
+@test "push: L3 upload-failure recovery clears seals and a retry succeeds" {
+    # `push --dry-run` scans, hashes, writes every blob into the local cache,
+    # and seals STAT_CACHE exactly like a real push -- but returns before
+    # constructing a remote writer or uploading anything (push_full's
+    # dry_run check comes after the scan/STAT_CACHE-refresh block). This
+    # deliberately creates the exact gap design/07's L3 backstop is for: every
+    # file below is SEALED locally (local blob genuinely present) but the
+    # remote has never seen any of it (no INDEX_ROOT entry at all yet), so
+    # `remote.exists()` cannot short-circuit via the delta index/Bloom filter
+    # the way it would for previously-pushed content.
+    #
+    # Enough sealed files that a small OMEMFS_SEAL_SAMPLE will not sample all
+    # of them (design/07 "Sampling verification": up to OMEMFS_SEAL_SAMPLE
+    # entries, at a fixed stride across the *sorted* path list).
+    mkdir -p sealtest
+    for i in 1 2 3 4 5; do
+        echo "content $i" > "sealtest/f$i.txt"
+    done
+    touch -d "2020-01-01 00:00:00" sealtest/f*.txt
+    run "$OMEMFS" push --dry-run
+    [ "$status" -eq 0 ]
+
+    # OMEMFS_SEAL_SAMPLE=1 with the sorted sealed entries samples only index 0
+    # (".omemfs-filter" or "sealtest/f1.txt", whichever sorts first -- either
+    # way, not f2.txt); deleting f2.txt's *local* object only is missed by
+    # sampling and must surface only when upload actually tries to fetch it
+    # (remote never had it in the first place, courtesy of --dry-run above).
+    # Extract the hash by pattern rather than by column position: with no
+    # clone_root yet (this repo has never had a real push, only --dry-run),
+    # the status column shows 'A' (added), which shifts $1 away from the hash.
+    hash2="$("$OMEMFS" ls --full-hash sealtest/f2.txt | grep -oE '[0-9a-f]{64}' | head -1)"
+    [ -n "$hash2" ]
+    sum2_before="$(sha256sum sealtest/f2.txt | awk '{print $1}')"
+    [ -f ".omemfs/objects/${hash2}" ]
+    rm -f ".omemfs/objects/${hash2}"
+
+    # A real change (new file) so this push is not a "Nothing to push." no-op
+    # and actually reaches the upload step -- the upload walk still
+    # references f2.txt's missing blob because the scan trusted its SEALED
+    # bit (sampling missed it) and skipped verifying it.
+    echo "new" > sealtest/new.txt
+    run env OMEMFS_SEAL_SAMPLE=1 "$OMEMFS" push
+    [ "$status" -ne 0 ]
+    [[ "${output,,}" == *"push again"* || "${output,,}" == *"missing"* ]]
+
+    # Retry (default sampling again): STAT_CACHE's seal bits were cleared by
+    # the recovery path, so every entry is re-verified via store.exists();
+    # f2.txt's missing blob is recaptured from the working tree and the push
+    # succeeds.
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    [ -f ".omemfs/objects/${hash2}" ]
+
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" verify_seal_recovery
+    [ "$status" -eq 0 ]
+    sum2_after="$(sha256sum verify_seal_recovery/sealtest/f2.txt | awk '{print $1}')"
+    [ "$sum2_after" = "$sum2_before" ]
+    [ "$(cat verify_seal_recovery/sealtest/new.txt)" = "new" ]
+}

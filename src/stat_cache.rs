@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::dtimer_l1;
 use crate::error::Error;
 use crate::object::Hash;
+use crate::store::ObjectStore;
 use crate::store::local::{atomic_write_no_fsync, sync_local_objects_fs};
 
 // ---------------------------------------------------------------------------
@@ -19,6 +20,10 @@ pub struct StatCacheEntry {
     pub fs_size: u64,
     pub hash: Hash,
     pub is_unsafe: bool,
+    /// Set once a blob-writing scan has written or verified the local object
+    /// for `hash` (design/07 "Seal invalidation"). Lets a later blob-writing
+    /// scan skip a redundant `store.exists()` check when seal trust holds.
+    pub sealed: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -30,9 +35,22 @@ const VERSION: u32 = 1;
 const HEADER_LEN: usize = 32;
 const INDEX_ENTRY_LEN: usize = 8;
 const DATA_ENTRY_LEN: usize = 56; // i64 + u32 + u64 + [u8;32] + u32
-const DIGEST_LEN: usize = 32;
+const DIGEST_LEN: usize = 32; // also the TRAILER size (design/07 "TRAILER")
 const PATHS_ALIGN: usize = 8;
 const UNSAFE_FLAG: u32 = 0x0001;
+const SEALED_FLAG: u32 = 0x0002;
+
+/// Length of the `seal_epoch` sub-field within the 32-byte TRAILER; the
+/// remaining `DIGEST_LEN - SEAL_EPOCH_LEN` bytes stay reserved/zero
+/// (design/07 "TRAILER").
+const SEAL_EPOCH_LEN: usize = 16;
+/// All-zero epoch: "no epoch recorded" (design/07 "TRAILER").
+const NO_SEAL_EPOCH: [u8; SEAL_EPOCH_LEN] = [0u8; SEAL_EPOCH_LEN];
+/// Default sample size for `OMEMFS_SEAL_SAMPLE` (design/07 "Sampling verification").
+const DEFAULT_SEAL_SAMPLE: usize = 256;
+/// Dotfile marker inside `.omemfs/objects/`, at the same level as the existing
+/// `.depth` / `.migrating` markers (design/07 "Seal epoch").
+const SEAL_EPOCH_MARKER_FILE: &str = ".seal_epoch";
 
 /// Racy-window threshold in seconds. A file whose mtime is within this many
 /// seconds of "now" is treated as racily clean (its hash cannot be trusted as
@@ -56,6 +74,21 @@ pub struct StatCache {
     /// skip rewriting the cache file when nothing changed (design/07
     /// "Cache hits do not trigger a writeback unless something changed").
     dirty: bool,
+    /// Opaque epoch ID from the TRAILER, copied from `.omemfs/objects/.seal_epoch`
+    /// at the time this cache was last written by a blob-writing scan.
+    /// All-zero means "no epoch recorded" (design/07 "TRAILER").
+    seal_epoch: [u8; SEAL_EPOCH_LEN],
+    /// Computed once by [`compute_seals_trusted`](Self::compute_seals_trusted)
+    /// for a blob-writing scan; `false` until computed (safe default: every
+    /// `sealed` entry falls back to a real `store.exists()` check, exactly as
+    /// before this feature existed). Read-only scans never compute this and
+    /// never consult it (design/07 "Implementation notes").
+    seals_trusted: bool,
+    /// Set by `compute_seals_trusted` when the loaded `seal_epoch` did not
+    /// match the on-disk marker (or no epoch was recorded at all). Consumed by
+    /// [`finalize_seal_epoch`](Self::finalize_seal_epoch), which then
+    /// generates and persists a fresh marker ID (design/07 "Seal epoch").
+    needs_new_epoch: bool,
 }
 
 impl StatCache {
@@ -113,7 +146,7 @@ impl StatCache {
         let _t = dtimer_l1!("stat_cache write");
         sync_local_objects_fs(&omemfs_dir.join("objects"))?;
         let path = omemfs_dir.join("STAT_CACHE");
-        let bytes = encode_v1(&self.entries)?;
+        let bytes = encode_v1(&self.entries, &self.seal_epoch)?;
         atomic_write_no_fsync(&path, &bytes)?;
         self.dirty = false;
         Ok(())
@@ -167,6 +200,13 @@ impl StatCache {
         for (path, entry) in &self.entries {
             full.entries.insert(path.clone(), entry.clone());
         }
+        // Carry `self`'s seal_epoch forward, not the freshly re-read one: a
+        // blob-writing scoped scan may have just rotated it via
+        // `finalize_seal_epoch`, and that rotation must win over the (now
+        // stale) on-disk value (design/07 "Seal epoch"). For every other
+        // caller (no rotation happened) the two values are already identical,
+        // so this is a no-op overwrite.
+        full.seal_epoch = self.seal_epoch;
         full.dirty = true;
         full.write(omemfs_dir)?;
         self.dirty = false;
@@ -177,6 +217,21 @@ impl StatCache {
     /// entry is not unsafe. The caller determines whether the returned hash
     /// matches the clone root to decide modified/unchanged status.
     pub fn lookup_current(&self, path: &str, mtime: SystemTime, fs_size: u64) -> Option<&Hash> {
+        self.lookup_current_entry(path, mtime, fs_size)
+            .map(|entry| &entry.hash)
+    }
+
+    /// Like [`lookup_current`](Self::lookup_current), but returns the whole
+    /// entry (including `sealed`) instead of just the hash. `SEALED` and
+    /// `UNSAFE` are independent bits (design/07 "flags bit assignments"): an
+    /// unsafe entry is filtered out here exactly like `lookup_current`, so the
+    /// `sealed` bit of an unsafe entry is never observed by a caller.
+    pub fn lookup_current_entry(
+        &self,
+        path: &str,
+        mtime: SystemTime,
+        fs_size: u64,
+    ) -> Option<&StatCacheEntry> {
         let entry = self.entries.get(path)?;
         if entry.is_unsafe {
             return None;
@@ -188,12 +243,14 @@ impl StatCache {
         if entry.mtime_secs != secs || entry.mtime_nanos != nanos {
             return None;
         }
-        Some(&entry.hash)
+        Some(entry)
     }
 
     /// Insert or replace an entry. Sets `is_unsafe = true` when the file's
-    /// mtime falls within the current second (racily clean).
-    pub fn update(&mut self, path: String, mtime: SystemTime, fs_size: u64, hash: Hash) {
+    /// mtime falls within the current second (racily clean). `sealed` is set
+    /// directly from the caller (design/07 "Update": `sealed = write_blobs`
+    /// for the scan that produced this entry).
+    pub fn update(&mut self, path: String, mtime: SystemTime, fs_size: u64, hash: Hash, sealed: bool) {
         let (mtime_secs, mtime_nanos) = systemtime_to_parts(mtime);
         let is_unsafe = is_racily_clean(mtime_secs, SystemTime::now());
         let new_entry = StatCacheEntry {
@@ -202,6 +259,7 @@ impl StatCache {
             fs_size,
             hash,
             is_unsafe,
+            sealed,
         };
         // Only mark the cache dirty when the entry is genuinely new or changed,
         // so a no-change scan leaves the cache clean and skips the writeback.
@@ -215,6 +273,39 @@ impl StatCache {
         self.entries.insert(path, new_entry);
     }
 
+    /// Set the `SEALED` bit on an existing entry, leaving every other field
+    /// untouched (design/07 "Update"). Returns `true` (and marks the cache
+    /// dirty) only when the bit was not already set; a no-op on an
+    /// already-sealed entry or a missing path returns `false` and leaves the
+    /// cache clean.
+    pub fn mark_sealed(&mut self, path: &str) -> bool {
+        match self.entries.get_mut(path) {
+            Some(entry) if !entry.sealed => {
+                entry.sealed = true;
+                self.dirty = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Clear the `SEALED` bit on every entry (design/07 "Upload-failure
+    /// recovery"): hashes and every other field are left untouched. Returns
+    /// `true` (and marks the cache dirty) if any bit was actually cleared.
+    pub fn clear_all_sealed(&mut self) -> bool {
+        let mut changed = false;
+        for entry in self.entries.values_mut() {
+            if entry.sealed {
+                entry.sealed = false;
+                changed = true;
+            }
+        }
+        if changed {
+            self.dirty = true;
+        }
+        changed
+    }
+
     #[allow(dead_code)]
     pub fn remove(&mut self, path: &str) {
         if self.entries.remove(path).is_some() {
@@ -226,13 +317,171 @@ impl StatCache {
     pub fn contains(&self, path: &str) -> bool {
         self.entries.contains_key(path)
     }
+
+    /// Whether this entry (if present, not-unsafe, and matching `sealed`) is
+    /// currently sealed. Test/diagnostic helper.
+    #[allow(dead_code)]
+    pub fn is_sealed(&self, path: &str) -> bool {
+        self.entries.get(path).map(|e| e.sealed).unwrap_or(false)
+    }
+
+    // -----------------------------------------------------------------------
+    // Seal invalidation (design/07 "Seal invalidation")
+    // -----------------------------------------------------------------------
+
+    /// Compute whether `sealed` entries in this cache can be trusted without a
+    /// fresh `store.exists()` check, for the blob-writing scan that just
+    /// loaded this cache. Must be called once, right after loading (before any
+    /// scanning), and only for a `write_blobs = true` scan — `seals_trusted()`
+    /// defaults to `false` (safe) until this is called.
+    ///
+    /// Two conditions must both hold:
+    /// 1. **Epoch match**: `seal_epoch` is non-zero and equals the current
+    ///    `.omemfs/objects/.seal_epoch` marker. On a mismatch (including a
+    ///    missing marker file, or a zero/never-recorded epoch), trust is
+    ///    withheld for this whole scan and [`finalize_seal_epoch`] will
+    ///    generate and persist a fresh marker at the end of the scan.
+    /// 2. **Sampling**: when the epoch matches, a fixed-stride sample of up to
+    ///    `OMEMFS_SEAL_SAMPLE` (default 256; `0` disables sampling) `sealed`
+    ///    entries is checked against `store.exists()`. Any single miss
+    ///    downgrades trust to `false` for this scan (but does not trigger an
+    ///    epoch rotation — see design/07 "Sampling verification").
+    pub fn compute_seals_trusted(&mut self, omemfs_dir: &Path, store: &dyn ObjectStore) {
+        let marker = read_seal_epoch_marker(omemfs_dir);
+        let epoch_matches = self.seal_epoch != NO_SEAL_EPOCH && marker == Some(self.seal_epoch);
+        if !epoch_matches {
+            self.seals_trusted = false;
+            self.needs_new_epoch = true;
+            return;
+        }
+        self.needs_new_epoch = false;
+        self.seals_trusted = self.sample_verify(store);
+    }
+
+    /// Result of the most recent [`compute_seals_trusted`] call. Defaults to
+    /// `false` (never computed / read-only scan), which is always safe: every
+    /// `sealed` entry then falls back to a real `store.exists()` check.
+    pub fn seals_trusted(&self) -> bool {
+        self.seals_trusted
+    }
+
+    /// Deterministic fixed-stride sample of up to `OMEMFS_SEAL_SAMPLE` sealed
+    /// entries (sorted by path, so the check is reproducible in tests — no
+    /// RNG). Returns `false` on the first sampled object found missing;
+    /// `true` if every sampled object exists (including the vacuous case of
+    /// no sealed entries, or sampling disabled via `OMEMFS_SEAL_SAMPLE=0`).
+    fn sample_verify(&self, store: &dyn ObjectStore) -> bool {
+        let sample_max = seal_sample_size();
+        if sample_max == 0 {
+            return true;
+        }
+        let mut sealed_paths: Vec<&String> = self
+            .entries
+            .iter()
+            .filter(|(_, e)| e.sealed)
+            .map(|(p, _)| p)
+            .collect();
+        if sealed_paths.is_empty() {
+            return true;
+        }
+        sealed_paths.sort();
+
+        let n = sealed_paths.len();
+        let sample_n = sample_max.min(n);
+        let stride = n / sample_n; // >= 1, since sample_n <= n
+        for k in 0..sample_n {
+            let path = sealed_paths[k * stride];
+            let entry = &self.entries[path];
+            match store.exists(&entry.hash) {
+                Ok(true) => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// Generate and persist a fresh seal epoch when [`compute_seals_trusted`]
+    /// found a whole-epoch mismatch, and record it in this cache's TRAILER.
+    /// Forces a write even when no entry changed (design/07 "Seal epoch": the
+    /// new epoch must be persisted so future scans can trust it).
+    ///
+    /// Only meaningful for a `write_blobs = true` scan; a read-only scan must
+    /// never call this — it carries the loaded `seal_epoch` forward unchanged
+    /// instead (design/07 "Implementation notes").
+    pub fn finalize_seal_epoch(&mut self, omemfs_dir: &Path) {
+        if !self.needs_new_epoch {
+            return;
+        }
+        let new_epoch = random_seal_epoch();
+        // Best-effort: a failure to persist the marker is not fatal (STAT_CACHE
+        // is a pure acceleration cache); the next scan will simply observe a
+        // mismatch again and retry.
+        let _ = write_seal_epoch_marker(omemfs_dir, &new_epoch);
+        self.seal_epoch = new_epoch;
+        self.dirty = true;
+        self.needs_new_epoch = false;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Seal epoch marker file (`.omemfs/objects/.seal_epoch`)
+// ---------------------------------------------------------------------------
+
+fn seal_epoch_marker_path(omemfs_dir: &Path) -> PathBuf {
+    omemfs_dir.join("objects").join(SEAL_EPOCH_MARKER_FILE)
+}
+
+/// Read the current marker ID, or `None` if absent/corrupt (wrong length) —
+/// both treated as "no marker" (design/07 "Seal epoch").
+fn read_seal_epoch_marker(omemfs_dir: &Path) -> Option<[u8; SEAL_EPOCH_LEN]> {
+    let bytes = fs::read(seal_epoch_marker_path(omemfs_dir)).ok()?;
+    bytes.try_into().ok()
+}
+
+/// Overwrite (or create) the marker file with a fresh epoch ID. `objects/` is
+/// created if it does not exist yet (mirrors the lazy creation of `.depth` /
+/// `.migrating`).
+fn write_seal_epoch_marker(omemfs_dir: &Path, epoch: &[u8; SEAL_EPOCH_LEN]) -> Result<(), Error> {
+    let path = seal_epoch_marker_path(omemfs_dir);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    atomic_write_no_fsync(&path, epoch)
+}
+
+/// Generate a fresh 16-byte random epoch ID.
+fn random_seal_epoch() -> [u8; SEAL_EPOCH_LEN] {
+    use rand::RngCore;
+    let mut buf = [0u8; SEAL_EPOCH_LEN];
+    rand::rng().fill_bytes(&mut buf);
+    buf
+}
+
+/// Serialises every test (in this module and in `scan.rs`) that reads or
+/// mutates `OMEMFS_SEAL_SAMPLE` -- a single process-global env var -- so
+/// parallel test runs cannot race each other. Shared across modules (rather
+/// than one static per module) because two independent `Mutex`es would not
+/// actually synchronise access to the same underlying env var.
+#[cfg(test)]
+pub(crate) static SEAL_SAMPLE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Resolve `OMEMFS_SEAL_SAMPLE` (default `DEFAULT_SEAL_SAMPLE`; `0` disables
+/// sampling). An unset or unparseable value falls back to the default.
+fn seal_sample_size() -> usize {
+    match std::env::var("OMEMFS_SEAL_SAMPLE") {
+        Ok(v) => v.trim().parse::<usize>().unwrap_or(DEFAULT_SEAL_SAMPLE),
+        Err(_) => DEFAULT_SEAL_SAMPLE,
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Encoding
 // ---------------------------------------------------------------------------
 
-fn encode_v1(entries: &HashMap<String, StatCacheEntry>) -> Result<Vec<u8>, Error> {
+fn encode_v1(
+    entries: &HashMap<String, StatCacheEntry>,
+    seal_epoch: &[u8; SEAL_EPOCH_LEN],
+) -> Result<Vec<u8>, Error> {
     let mut sorted: Vec<(&String, &StatCacheEntry)> = entries.iter().collect();
     sorted.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
 
@@ -279,7 +528,13 @@ fn encode_v1(entries: &HashMap<String, StatCacheEntry>) -> Result<Vec<u8>, Error
 
     // DATA
     for (_, entry) in &sorted {
-        let flags: u32 = if entry.is_unsafe { UNSAFE_FLAG } else { 0 };
+        let mut flags: u32 = 0;
+        if entry.is_unsafe {
+            flags |= UNSAFE_FLAG;
+        }
+        if entry.sealed {
+            flags |= SEALED_FLAG;
+        }
         body.extend_from_slice(&entry.mtime_secs.to_be_bytes());
         body.extend_from_slice(&entry.mtime_nanos.to_be_bytes());
         body.extend_from_slice(&entry.fs_size.to_be_bytes());
@@ -287,8 +542,9 @@ fn encode_v1(entries: &HashMap<String, StatCacheEntry>) -> Result<Vec<u8>, Error
         body.extend_from_slice(&flags.to_be_bytes());
     }
 
-    // TRAILER (reserved, zero-filled)
-    body.extend(std::iter::repeat_n(0u8, DIGEST_LEN));
+    // TRAILER: seal_epoch (16 bytes) + reserved (16 bytes, zero-filled).
+    body.extend_from_slice(seal_epoch);
+    body.extend(std::iter::repeat_n(0u8, DIGEST_LEN - SEAL_EPOCH_LEN));
 
     Ok(body)
 }
@@ -347,6 +603,7 @@ fn parse_v1(bytes: &[u8]) -> Option<StatCache> {
         let flags = u32::from_be_bytes(bytes[off + 52..off + 56].try_into().ok()?);
         let hash = Hash::from_bytes(hash_bin);
         let is_unsafe = (flags & UNSAFE_FLAG) != 0;
+        let sealed = (flags & SEALED_FLAG) != 0;
 
         entries.insert(
             path,
@@ -356,14 +613,24 @@ fn parse_v1(bytes: &[u8]) -> Option<StatCache> {
                 fs_size,
                 hash,
                 is_unsafe,
+                sealed,
             },
         );
     }
+
+    // TRAILER: seal_epoch is the first SEAL_EPOCH_LEN bytes; already validated
+    // in range by the `body_end + DIGEST_LEN > bytes.len()` check above.
+    let seal_epoch: [u8; SEAL_EPOCH_LEN] = bytes[body_end..body_end + SEAL_EPOCH_LEN]
+        .try_into()
+        .ok()?;
 
     // A freshly loaded cache reflects the on-disk state exactly: not dirty.
     Some(StatCache {
         entries,
         dirty: false,
+        seal_epoch,
+        seals_trusted: false,
+        needs_new_epoch: false,
     })
 }
 
@@ -479,6 +746,7 @@ fn parse_v1_scoped(bytes: &[u8], scope_prefix: &str) -> Option<StatCache> {
         let flags = u32::from_be_bytes(bytes[off + 52..off + 56].try_into().ok()?);
         let hash = Hash::from_bytes(hash_bin);
         let is_unsafe = (flags & UNSAFE_FLAG) != 0;
+        let sealed = (flags & SEALED_FLAG) != 0;
 
         entries.insert(
             path,
@@ -488,13 +756,24 @@ fn parse_v1_scoped(bytes: &[u8], scope_prefix: &str) -> Option<StatCache> {
                 fs_size,
                 hash,
                 is_unsafe,
+                sealed,
             },
         );
     }
 
+    // TRAILER: a scoped read must still carry `seal_epoch` forward correctly
+    // (design/07 "read_scoped/write_scoped_merge でも seal_epoch を正しく
+    // 引き継ぐこと") even though only a slice of entries was decoded above.
+    let seal_epoch: [u8; SEAL_EPOCH_LEN] = bytes[body_end..body_end + SEAL_EPOCH_LEN]
+        .try_into()
+        .ok()?;
+
     Some(StatCache {
         entries,
         dirty: false,
+        seal_epoch,
+        seals_trusted: false,
+        needs_new_epoch: false,
     })
 }
 
@@ -518,6 +797,7 @@ fn entry_eq(a: &StatCacheEntry, b: &StatCacheEntry) -> bool {
         && a.fs_size == b.fs_size
         && a.hash == b.hash
         && a.is_unsafe == b.is_unsafe
+        && a.sealed == b.sealed
 }
 
 fn systemtime_to_parts(t: SystemTime) -> (i64, u32) {
@@ -580,6 +860,7 @@ mod tests {
                 fs_size: 4096,
                 hash: hash.clone(),
                 is_unsafe: false,
+                sealed: false,
             },
         );
         cache.write(tmp.path()).unwrap();
@@ -606,7 +887,7 @@ mod tests {
         let mut cache = StatCache::default();
         let hash = fake_hash(0x01);
         let mtime = mtime_at(1_700_000_000, 0);
-        cache.update("a.txt".to_string(), mtime, 100, hash.clone());
+        cache.update("a.txt".to_string(), mtime, 100, hash.clone(), false);
         // Force is_unsafe=false (mtime is old enough).
         cache.entries.get_mut("a.txt").unwrap().is_unsafe = false;
         assert_eq!(cache.lookup_current("a.txt", mtime, 100), Some(&hash));
@@ -617,7 +898,7 @@ mod tests {
         let mut cache = StatCache::default();
         let hash = fake_hash(0x01);
         let mtime = mtime_at(1_700_000_000, 0);
-        cache.update("a.txt".to_string(), mtime, 100, hash.clone());
+        cache.update("a.txt".to_string(), mtime, 100, hash.clone(), false);
         cache.entries.get_mut("a.txt").unwrap().is_unsafe = false;
         assert_eq!(cache.lookup_current("a.txt", mtime, 99), None);
     }
@@ -627,7 +908,7 @@ mod tests {
         let mut cache = StatCache::default();
         let hash = fake_hash(0x01);
         let mtime = mtime_at(1_700_000_000, 0);
-        cache.update("a.txt".to_string(), mtime, 100, hash.clone());
+        cache.update("a.txt".to_string(), mtime, 100, hash.clone(), false);
         cache.entries.get_mut("a.txt").unwrap().is_unsafe = false;
         assert_eq!(
             cache.lookup_current("a.txt", mtime_at(1_700_000_001, 0), 100),
@@ -648,9 +929,33 @@ mod tests {
                 fs_size: 100,
                 hash,
                 is_unsafe: true,
+                sealed: false,
             },
         );
         assert_eq!(cache.lookup_current("a.txt", mtime, 100), None);
+    }
+
+    #[test]
+    fn lookup_current_entry_ignores_sealed_bit_of_unsafe_entry() {
+        // design/07 "flags bit assignments": SEALED and UNSAFE are independent
+        // bits, but lookup_current_entry filters out is_unsafe entries before
+        // sealed is ever observed by a caller -- an unsafe-and-sealed entry
+        // must be treated identically to an unsafe-and-unsealed one (a miss).
+        let mut cache = StatCache::default();
+        let mtime = mtime_at(1_700_000_000, 0);
+        cache.entries.insert(
+            "racy.txt".to_string(),
+            StatCacheEntry {
+                mtime_secs: 1_700_000_000,
+                mtime_nanos: 0,
+                fs_size: 100,
+                hash: fake_hash(0x01),
+                is_unsafe: true,
+                sealed: true,
+            },
+        );
+        assert!(cache.lookup_current_entry("racy.txt", mtime, 100).is_none());
+        assert!(cache.lookup_current("racy.txt", mtime, 100).is_none());
     }
 
     #[test]
@@ -682,6 +987,7 @@ mod tests {
                 fs_size: 8,
                 hash: fake_hash(0xFF),
                 is_unsafe: true,
+                sealed: false,
             },
         );
         cache.write(tmp.path()).unwrap();
@@ -699,7 +1005,7 @@ mod tests {
     fn update_with_new_entry_marks_dirty() {
         let mut cache = StatCache::default();
         let mtime = mtime_at(1_700_000_000, 0);
-        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01));
+        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), false);
         assert!(
             cache.is_dirty(),
             "inserting a new entry must mark the cache dirty"
@@ -712,11 +1018,11 @@ mod tests {
         let mut cache = StatCache::default();
         // Use an old mtime so is_unsafe is stable (false) across both updates.
         let mtime = mtime_at(1_000_000_000, 0);
-        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01));
+        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), false);
         cache.write(tmp.path()).unwrap();
         assert!(!cache.is_dirty(), "write must clear the dirty flag");
         // Re-apply the exact same (mtime, size, hash): no change → stays clean.
-        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01));
+        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), false);
         assert!(
             !cache.is_dirty(),
             "a no-op update must not mark the cache dirty"
@@ -728,10 +1034,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut cache = StatCache::default();
         let mtime = mtime_at(1_000_000_000, 0);
-        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01));
+        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), false);
         cache.write(tmp.path()).unwrap();
         assert!(!cache.is_dirty());
-        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x02));
+        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x02), false);
         assert!(cache.is_dirty(), "changed hash must mark the cache dirty");
     }
 
@@ -740,13 +1046,13 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut cache = StatCache::default();
         let mtime = mtime_at(1_000_000_000, 0);
-        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01));
+        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), false);
         // First write: cache is dirty, so it writes and the file appears.
         assert!(cache.write_if_dirty(tmp.path()).unwrap());
         let path = tmp.path().join("STAT_CACHE");
         let mtime1 = fs::metadata(&path).unwrap().modified().unwrap();
         // Re-apply the same entry (no change), then write_if_dirty must skip.
-        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01));
+        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), false);
         assert!(
             !cache.write_if_dirty(tmp.path()).unwrap(),
             "clean cache must skip write"
@@ -760,7 +1066,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut cache = StatCache::default();
         let mtime = mtime_at(1_000_000_000, 0);
-        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01));
+        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), false);
         cache.write(tmp.path()).unwrap();
         assert!(!cache.is_dirty());
         // Removing a missing key is a no-op.
@@ -795,7 +1101,7 @@ mod tests {
         let mut cache = StatCache::default();
         let mtime = mtime_at(1_000_000_000, 0);
         for (i, p) in paths.iter().enumerate() {
-            cache.update(p.to_string(), mtime, 100 + i as u64, fake_hash(i as u8));
+            cache.update(p.to_string(), mtime, 100 + i as u64, fake_hash(i as u8), false);
         }
         cache.write(dir).unwrap();
     }
@@ -905,7 +1211,7 @@ mod tests {
         let mut scoped = StatCache::read_scoped(tmp.path(), "dirA");
         assert_eq!(sorted_keys(&scoped), vec!["dirA/a.rs"]);
         let mtime = mtime_at(1_000_000_000, 0);
-        scoped.update("dirA/a.rs".to_string(), mtime, 999, fake_hash(0x77));
+        scoped.update("dirA/a.rs".to_string(), mtime, 999, fake_hash(0x77), false);
         assert!(scoped.write_scoped_merge(tmp.path(), "dirA").unwrap());
 
         // dirB/b.rs must survive untouched; dirA/a.rs must reflect the update.
@@ -928,7 +1234,7 @@ mod tests {
         let mut scoped = StatCache::read_scoped(tmp.path(), "dirA");
         // Re-apply the identical entry: no in-scope change.
         let mtime = mtime_at(1_000_000_000, 0);
-        scoped.update("dirA/a.rs".to_string(), mtime, 100, fake_hash(0x00));
+        scoped.update("dirA/a.rs".to_string(), mtime, 100, fake_hash(0x00), false);
         assert!(!scoped.is_dirty(), "no-op scoped update must stay clean");
         assert!(
             !scoped.write_scoped_merge(tmp.path(), "dirA").unwrap(),
@@ -948,7 +1254,7 @@ mod tests {
         write_cache_with_paths(tmp.path(), &["dirA/a.rs", "dirB/b.rs"]);
         let mut scoped = StatCache::read_scoped(tmp.path(), "dirA");
         let mtime = mtime_at(1_000_000_000, 0);
-        scoped.update("dirA/new.rs".to_string(), mtime, 42, fake_hash(0x55));
+        scoped.update("dirA/new.rs".to_string(), mtime, 42, fake_hash(0x55), false);
         assert!(scoped.write_scoped_merge(tmp.path(), "dirA").unwrap());
 
         let after = StatCache::read(tmp.path());
@@ -966,5 +1272,367 @@ mod tests {
         assert!(!path_in_scope("foobar", "foo"));
         assert!(!path_in_scope("fo", "foo"));
         assert!(!path_in_scope("other", "foo"));
+    }
+
+    // -----------------------------------------------------------------------
+    // SEALED flag (design/07 "Seal invalidation")
+    // -----------------------------------------------------------------------
+
+    use crate::store::local::LocalStore;
+
+    #[test]
+    fn sealed_flag_roundtrips() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cache = StatCache::default();
+        let mtime = mtime_at(1_000_000_000, 0);
+        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), true);
+        cache.update("b.txt".to_string(), mtime, 100, fake_hash(0x02), false);
+        cache.write(tmp.path()).unwrap();
+
+        let loaded = StatCache::read(tmp.path());
+        assert!(loaded.entries["a.txt"].sealed, "sealed=true must roundtrip");
+        assert!(
+            !loaded.entries["b.txt"].sealed,
+            "sealed=false must roundtrip"
+        );
+    }
+
+    #[test]
+    fn existing_v1_file_with_zero_flags_reads_sealed_false() {
+        // A cache written before the SEALED bit existed has flags = 0 for every
+        // entry (bit 1 among them). Reading it must decode sealed = false and
+        // must not spuriously mark anything dirty.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cache = StatCache::default();
+        let mtime = mtime_at(1_000_000_000, 0);
+        // sealed=false already produces flags bit 1 = 0; this simulates the
+        // pre-existing v1 on-disk format exactly.
+        cache.update("old.txt".to_string(), mtime, 100, fake_hash(0x09), false);
+        cache.write(tmp.path()).unwrap();
+
+        let loaded = StatCache::read(tmp.path());
+        assert!(!loaded.entries["old.txt"].sealed);
+        assert!(!loaded.is_dirty(), "a freshly loaded cache must be clean");
+    }
+
+    #[test]
+    fn mark_sealed_on_unsealed_entry_sets_bit_and_dirties() {
+        let mut cache = StatCache::default();
+        let mtime = mtime_at(1_000_000_000, 0);
+        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), false);
+        cache.dirty = false; // isolate mark_sealed's own effect
+        assert!(cache.mark_sealed("a.txt"), "unsealed -> sealed must return true");
+        assert!(cache.entries["a.txt"].sealed);
+        assert!(cache.is_dirty(), "setting the bit must dirty the cache");
+    }
+
+    #[test]
+    fn mark_sealed_on_already_sealed_entry_is_a_noop() {
+        let mut cache = StatCache::default();
+        let mtime = mtime_at(1_000_000_000, 0);
+        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), true);
+        cache.dirty = false;
+        assert!(
+            !cache.mark_sealed("a.txt"),
+            "already-sealed entry must return false"
+        );
+        assert!(!cache.is_dirty(), "no-op mark_sealed must leave cache clean");
+    }
+
+    #[test]
+    fn mark_sealed_on_missing_path_is_a_noop() {
+        let mut cache = StatCache::default();
+        assert!(!cache.mark_sealed("missing.txt"));
+        assert!(!cache.is_dirty());
+    }
+
+    #[test]
+    fn update_sealed_change_alone_marks_dirty() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cache = StatCache::default();
+        let mtime = mtime_at(1_000_000_000, 0);
+        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), false);
+        cache.write(tmp.path()).unwrap();
+        assert!(!cache.is_dirty());
+        // Same (mtime, size, hash), only `sealed` flips: entry_eq must catch
+        // this so update()'s no-op detection includes `sealed`.
+        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), true);
+        assert!(
+            cache.is_dirty(),
+            "a sealed-only change must still mark the cache dirty"
+        );
+    }
+
+    #[test]
+    fn clear_all_sealed_clears_every_bit_and_dirties() {
+        let mut cache = StatCache::default();
+        let mtime = mtime_at(1_000_000_000, 0);
+        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), true);
+        cache.update("b.txt".to_string(), mtime, 100, fake_hash(0x02), true);
+        cache.update("c.txt".to_string(), mtime, 100, fake_hash(0x03), false);
+        cache.dirty = false;
+
+        assert!(cache.clear_all_sealed());
+        assert!(!cache.entries["a.txt"].sealed);
+        assert!(!cache.entries["b.txt"].sealed);
+        assert!(!cache.entries["c.txt"].sealed);
+        assert!(cache.is_dirty());
+    }
+
+    #[test]
+    fn clear_all_sealed_on_already_clear_cache_is_a_noop() {
+        let mut cache = StatCache::default();
+        let mtime = mtime_at(1_000_000_000, 0);
+        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), false);
+        cache.dirty = false;
+        assert!(!cache.clear_all_sealed());
+        assert!(!cache.is_dirty());
+    }
+
+    #[test]
+    fn read_scoped_carries_seal_epoch_forward() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_cache_with_paths(tmp.path(), &["dirA/a.rs", "dirB/b.rs"]);
+        let mut full = StatCache::read(tmp.path());
+        full.seal_epoch = [0x42; SEAL_EPOCH_LEN];
+        full.dirty = true;
+        full.write(tmp.path()).unwrap();
+
+        let scoped = StatCache::read_scoped(tmp.path(), "dirA");
+        assert_eq!(
+            scoped.seal_epoch, [0x42; SEAL_EPOCH_LEN],
+            "a scoped read must still decode the TRAILER's seal_epoch"
+        );
+    }
+
+    #[test]
+    fn write_scoped_merge_carries_rotated_epoch_over_stale_on_disk_value() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_cache_with_paths(tmp.path(), &["dirA/a.rs", "dirB/b.rs"]);
+
+        let mut scoped = StatCache::read_scoped(tmp.path(), "dirA");
+        // Simulate finalize_seal_epoch having rotated the epoch during a
+        // blob-writing scoped scan (self.seal_epoch now differs from the
+        // stale on-disk value that write_scoped_merge will re-read into `full`).
+        scoped.seal_epoch = [0x99; SEAL_EPOCH_LEN];
+        scoped.dirty = true;
+        assert!(scoped.write_scoped_merge(tmp.path(), "dirA").unwrap());
+
+        let after = StatCache::read(tmp.path());
+        assert_eq!(
+            after.seal_epoch,
+            [0x99; SEAL_EPOCH_LEN],
+            "the rotated epoch must win over the stale re-read value"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // seals_trusted: epoch + sampling (design/07 "Seal epoch",
+    // "Sampling verification")
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn compute_seals_trusted_false_when_marker_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cache = StatCache::default();
+        cache.seal_epoch = [0x11; SEAL_EPOCH_LEN];
+        let store = LocalStore::for_cache(tmp.path().join("objects"));
+        cache.compute_seals_trusted(tmp.path(), &store);
+        assert!(!cache.seals_trusted());
+        assert!(
+            cache.needs_new_epoch,
+            "a missing marker must request a fresh epoch"
+        );
+    }
+
+    #[test]
+    fn compute_seals_trusted_false_when_cache_epoch_is_zero() {
+        // An old cache (written before seal_epoch existed) has seal_epoch = 0,
+        // which must never be trusted even if a marker happens to be present.
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_seal_epoch_marker(tmp.path(), &[0x22; SEAL_EPOCH_LEN]).unwrap();
+        let mut cache = StatCache::default(); // seal_epoch defaults to all-zero
+        let store = LocalStore::for_cache(tmp.path().join("objects"));
+        cache.compute_seals_trusted(tmp.path(), &store);
+        assert!(!cache.seals_trusted());
+        assert!(cache.needs_new_epoch);
+    }
+
+    #[test]
+    fn compute_seals_trusted_true_when_epoch_matches_and_no_sealed_entries() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let epoch = [0x33; SEAL_EPOCH_LEN];
+        write_seal_epoch_marker(tmp.path(), &epoch).unwrap();
+        let mut cache = StatCache::default();
+        cache.seal_epoch = epoch;
+        let store = LocalStore::for_cache(tmp.path().join("objects"));
+        cache.compute_seals_trusted(tmp.path(), &store);
+        assert!(cache.seals_trusted());
+        assert!(!cache.needs_new_epoch, "a matching epoch needs no rotation");
+    }
+
+    #[test]
+    fn compute_seals_trusted_true_when_sampling_confirms_presence() {
+        // Relies on the ambient (default, non-zero) OMEMFS_SEAL_SAMPLE, so it
+        // holds SEAL_SAMPLE_ENV_LOCK for mutual exclusion with the tests that
+        // override it.
+        let _guard = SEAL_SAMPLE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let epoch = [0x44; SEAL_EPOCH_LEN];
+        write_seal_epoch_marker(tmp.path(), &epoch).unwrap();
+        let store = LocalStore::for_cache(tmp.path().join("objects"));
+
+        let mut cache = StatCache::default();
+        cache.seal_epoch = epoch;
+        let mtime = mtime_at(1_000_000_000, 0);
+        // Two sealed entries whose blobs genuinely exist in the store.
+        for i in 0..2u8 {
+            let content = format!("content-{i}").into_bytes();
+            let hash = crate::object::blob_hash(&content);
+            let serialised = crate::object::serialise_blob(&content);
+            crate::codec::chunk::store_chunked(&store, &hash, &serialised, None).unwrap();
+            cache.update(format!("f{i}.txt"), mtime, 100, hash, true);
+        }
+        cache.compute_seals_trusted(tmp.path(), &store);
+        assert!(cache.seals_trusted());
+    }
+
+    #[test]
+    fn compute_seals_trusted_downgrades_to_false_when_a_sampled_object_is_missing() {
+        // Relies on the ambient (default, non-zero) OMEMFS_SEAL_SAMPLE, so it
+        // holds SEAL_SAMPLE_ENV_LOCK for mutual exclusion with the tests that
+        // override it.
+        let _guard = SEAL_SAMPLE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let epoch = [0x55; SEAL_EPOCH_LEN];
+        write_seal_epoch_marker(tmp.path(), &epoch).unwrap();
+        let store = LocalStore::for_cache(tmp.path().join("objects"));
+
+        let mut cache = StatCache::default();
+        cache.seal_epoch = epoch;
+        let mtime = mtime_at(1_000_000_000, 0);
+        // A sealed entry whose blob is NOT actually present (e.g. a shard
+        // subdirectory was deleted while .seal_epoch was untouched).
+        cache.update(
+            "missing.txt".to_string(),
+            mtime,
+            100,
+            fake_hash(0x01),
+            true,
+        );
+        cache.compute_seals_trusted(tmp.path(), &store);
+        assert!(
+            !cache.seals_trusted(),
+            "a missing sampled object must downgrade trust for this scan"
+        );
+        assert!(
+            !cache.needs_new_epoch,
+            "sampling failure must not trigger an epoch rotation (design/07: \
+             sampling only narrows trust for the current scan)"
+        );
+    }
+
+    #[test]
+    fn seal_sample_zero_disables_sampling() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let epoch = [0x66; SEAL_EPOCH_LEN];
+        write_seal_epoch_marker(tmp.path(), &epoch).unwrap();
+        let store = LocalStore::for_cache(tmp.path().join("objects"));
+
+        let mut cache = StatCache::default();
+        cache.seal_epoch = epoch;
+        let mtime = mtime_at(1_000_000_000, 0);
+        // Sealed entry with NO backing object -- would normally fail sampling.
+        cache.update(
+            "missing.txt".to_string(),
+            mtime,
+            100,
+            fake_hash(0x01),
+            true,
+        );
+
+        // SAFETY (test-only): OMEMFS_SEAL_SAMPLE is read by seal_sample_size()
+        // on every compute_seals_trusted call; SEAL_SAMPLE_ENV_LOCK is shared
+        // with every other test (here and in scan.rs) that reads or mutates
+        // it, so no other test can observe this override.
+        let _guard = SEAL_SAMPLE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("OMEMFS_SEAL_SAMPLE", "0");
+        }
+        cache.compute_seals_trusted(tmp.path(), &store);
+        unsafe {
+            std::env::remove_var("OMEMFS_SEAL_SAMPLE");
+        }
+        assert!(
+            cache.seals_trusted(),
+            "OMEMFS_SEAL_SAMPLE=0 must disable sampling entirely"
+        );
+    }
+
+    #[test]
+    fn finalize_seal_epoch_noop_when_not_needed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cache = StatCache::default();
+        cache.seal_epoch = [0x77; SEAL_EPOCH_LEN];
+        cache.needs_new_epoch = false;
+        cache.dirty = false;
+        cache.finalize_seal_epoch(tmp.path());
+        assert_eq!(cache.seal_epoch, [0x77; SEAL_EPOCH_LEN]);
+        assert!(!cache.is_dirty(), "no rotation needed -> no forced write");
+        assert!(
+            read_seal_epoch_marker(tmp.path()).is_none(),
+            "no marker should be written when no rotation is needed"
+        );
+    }
+
+    #[test]
+    fn finalize_seal_epoch_rotates_and_persists_marker_when_needed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cache = StatCache::default();
+        cache.needs_new_epoch = true;
+        cache.dirty = false;
+        cache.finalize_seal_epoch(tmp.path());
+
+        assert_ne!(
+            cache.seal_epoch, NO_SEAL_EPOCH,
+            "a freshly generated epoch must not be all-zero"
+        );
+        assert!(cache.is_dirty(), "rotation must force a write even with no entry changes");
+        assert!(!cache.needs_new_epoch, "the flag must be cleared after rotating");
+        assert_eq!(
+            read_seal_epoch_marker(tmp.path()),
+            Some(cache.seal_epoch),
+            "the new epoch must be persisted to the marker file"
+        );
+    }
+
+    #[test]
+    fn full_cycle_epoch_mismatch_then_finalize_then_next_scan_trusts() {
+        // End-to-end of the state machine within stat_cache.rs itself (no
+        // scan.rs / push.rs involved): a cache with no recorded epoch is
+        // untrusted, gets a fresh epoch persisted by finalize_seal_epoch, and
+        // a *subsequent* load with that persisted epoch is trusted again.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = LocalStore::for_cache(tmp.path().join("objects"));
+
+        let mut cache = StatCache::default(); // seal_epoch = 0: never recorded
+        cache.compute_seals_trusted(tmp.path(), &store);
+        assert!(!cache.seals_trusted());
+        cache.finalize_seal_epoch(tmp.path());
+        let rotated = cache.seal_epoch;
+        assert_ne!(rotated, NO_SEAL_EPOCH);
+
+        // A later scan loads a cache that already recorded `rotated` as its
+        // seal_epoch; the marker on disk still matches, so trust holds.
+        let mut next = StatCache::default();
+        next.seal_epoch = rotated;
+        next.compute_seals_trusted(tmp.path(), &store);
+        assert!(next.seals_trusted());
     }
 }

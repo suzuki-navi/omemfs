@@ -143,7 +143,7 @@ fn pull_full(
             false,
         )?;
         let file_count = scan_result.files.len();
-        refresh_stat_cache(stat_cache, &scan_result.files, &omemfs_dir);
+        refresh_stat_cache(stat_cache, &scan_result.files, &omemfs_dir, false);
         dlog_l1!(
             "working tree root: {}",
             &scan_result.root_hash.as_str()[..8]
@@ -478,7 +478,7 @@ fn pull_scoped(
             clone_scoped_hash,
         });
     }
-    refresh_stat_cache(stat_cache, &scanned_files, &omemfs_dir);
+    refresh_stat_cache(stat_cache, &scanned_files, &omemfs_dir, false);
 
     if path_diffs.is_empty() {
         plain_println("Already up to date.");
