@@ -885,7 +885,7 @@ The following call sites are all inside this boundary; each is either walking th
 - `omemfs stub`'s directory-stub deletion (`src/commands/stub.rs`): after writing the `.omemfs-stub` marker (see `design/08_stub_system.md`, "omemfs stub"), the directory's other contents are removed with `fsguard::remove_dir_all`, and the directory-vs-file decision at the top of `stub run()` uses `fsguard::is_real_dir` rather than `Path::is_dir()`.
 - `omemfs restore`'s conflict-helper cleanup (`src/commands/restore.rs`, `remove_conflict_helpers`): removes the three conflict helper files and the metadata sidecar via `fsguard::remove_file_tolerant`, tolerating a helper that is already gone, instead of a bare `fs::remove_file` that both follows a symlinked ancestor and silently swallows every error.
 - `omemfs conflict clean`'s helper-file and metadata-sidecar deletion (`src/commands/conflict.rs`, `run_clean`): removes each collected helper path, and each base path's `.omemfs-conflict-meta` sidecar, via `fsguard::remove_file_tolerant`.
-- Path-scoped `push` (`src/commands/push.rs`, `push_scoped`): before scanning or reading a scoped path's content for upload, every path component from `work_dir` down to (and including) the scoped path itself is verified to be symlink-free via `fsguard::is_real_dir`/`fsguard`'s component walk, so a symlinked ancestor of the scoped path can never be traversed to read — and upload — content from outside `work_dir`.
+- Path-scoped `push` (`src/commands/push.rs`, `push_scoped`): before scanning or reading a scoped path's content for upload, every path component from `work_dir` down to the scoped path's parent is verified to be symlink-free via `fsguard`'s component walk, so a symlinked ancestor of the scoped path can never be traversed to read — and upload — content from outside `work_dir`. A symlink at the scoped path itself is recorded as a symlink entry and not followed.
 
 - `omemfs conflict accept-*` (`src/commands/conflict.rs`, `run_accept`): the accepted side's helper file is **read** through `fsguard::open_leaf` + `GuardedDir::open_file` (`openat` with `O_NOFOLLOW`), not `std::fs::read`. A helper that is a symlink is refused (`SourceChanged`) rather than followed, so `accept-remote` can never copy the contents of a file outside the repository into the working tree by way of a symlink planted as `<path>.omemfs-conflict-remote`. Helper files are regular files omemfs itself wrote, so a symlink in that position is always wrong. The refusal happens in the resolve step, before anything is written, deleted, or advanced.
 
@@ -900,7 +900,7 @@ The scan therefore walks the tree the way the write side does: by directory fd.
 - The directory-stub marker and file-stub records are read through the same fds. A symlink named `.omemfs-stub` is not a marker.
 - **A child directory is opened just before it is scanned, not when it is listed.** The listing of a directory records only names and kinds. The subdirectory jobs it produces carry `(parent fd, name)`, and the `openat(O_DIRECTORY|O_NOFOLLOW)` of the child happens at the start of that child's own scan, through the parent's fd, which is still open because the parent waits for all of its children. The stub classification of a child (`.omemfs-stub` marker: none / full / partial) is made from that same single open, so a directory is opened exactly once per scan. This keeps every guarantee above (the open is still parent-fd-relative and `O_NOFOLLOW`), and a child that is a symlink or gone by then is the same live-path race as before: unstable, previous entry preserved. The point is to bound how many directory fds are open at once; see "File descriptor budget" below.
 - The file is opened once and both its metadata and its content come from that handle (this was already true of `store_file_snapshot`); only the *open* changed, from a path to `(directory fd, name)`.
-- Path-scoped `push` keeps the `fsguard::is_real_dir` pre-check (it gives a precise `SymlinkEscape` error for the common static case), but it is no longer what the guarantee rests on: the scan root and a scoped single file are opened by fd, a root swapped between the check and the open is a live-path race (`unstable`), and the "nothing there, so delete" decision uses a guarded `lstat` (`fsguard::lstat_path`) rather than `symlink_metadata` on the joined path, which a swapped ancestor could have made report `NotFound` and turned into a pushed deletion.
+- Path-scoped `push` keeps a pre-check on the scoped path's **ancestors** (it gives a precise `SymlinkEscape` error for the common static case; the scoped path itself may be a symlink and is then pushed as a symlink entry, never followed), but it is no longer what the guarantee rests on: the scan root and a scoped single file are opened by fd, a root swapped between the check and the open is a live-path race (`unstable`), and the "nothing there, so delete" decision uses a guarded `lstat` (`fsguard::lstat_path`) rather than `symlink_metadata` on the joined path, which a swapped ancestor could have made report `NotFound` and turned into a pushed deletion.
 
 Still path-based, deliberately: reads whose result is never uploaded as working-tree content (`ls`/`pull` hash-only reads of a single scoped file; `.omemfs-filter` file contents).
 
@@ -998,13 +998,15 @@ Path-scoped operations apply only to the specified path (file or directory subtr
 
 ### Path-scoped push
 
-1. Scan `<path>` in the working tree and build a new subtree. Before reading any content, every path component from `work_dir` down to (and including) `<path>` is verified to be symlink-free (see "Write safety: the working-tree write boundary" above) — a symlinked ancestor is refused rather than followed, so a scoped push can never read (and upload) content that actually lives outside `work_dir` by walking through a symlink planted along `<path>`.
+1. Scan `<path>` in the working tree and build a new subtree. Before reading any content, every path component from `work_dir` down to `<path>`'s **parent** is verified to be symlink-free (see "Write safety: the working-tree write boundary" above) — a symlinked ancestor is refused rather than followed, so a scoped push can never read (and upload) content that actually lives outside `work_dir` by walking through a symlink planted along `<path>`. `<path>` itself may be a symlink: it is a leaf entry in its own right and is never followed (see "Symlink leaf" below).
 
     **Deletion detection.** A scoped push must tell "`<path>` was intentionally removed from the working tree" apart from "`<path>` merely could not be observed", since only the former is safe to splice into the remote as a deletion. `<path>` is treated as a deletion intent **only** when a direct `symlink_metadata` lookup on it reports `io::ErrorKind::NotFound` (nothing exists there at all — not even a symlink or a stub marker). Every other case that keeps the working tree from being read is a hard error that aborts the whole push before any object is uploaded or the index root is touched — the remote is left exactly as it was:
     - `<path>` itself is a stub (file or directory): this is not a deletion at all — handled separately by splicing the stub's recorded `TreeEntry`, never treated as absence (design/08_stub_system.md, "Interaction with push").
     - `<path>` sits below a directory that is itself dir-stubbed (an ancestor of `<path>`, not `<path>` itself, carries a `.omemfs-stub` marker): the path is unreachable, not confirmed absent — the ancestor's real content has been deferred, and `<path>` may or may not exist inside it. Push aborts with an error rather than guessing.
     - `symlink_metadata` fails with any `io::ErrorKind` other than `NotFound` — most importantly `PermissionDenied` (an unreadable ancestor or the path itself, e.g. `EACCES`) — leaves existence genuinely unknown; push aborts rather than assume deletion.
     - A symlink at `<path>` whose target does not exist ("dangling symlink") is not a deletion either: `symlink_metadata` (which does not follow the final symlink) reports the link itself as present, so this case is naturally excluded from the `NotFound` test above and is scanned like any other symlink entry.
+
+    **Symlink leaf.** When `<path>` itself is a symlink, the scoped push records a `TreeEntry::Symlink` whose `target` is the link's own target string, read with `readlinkat` through the parent directory's fd — the same representation the full-tree scan produces for that name. The link is never followed: the content its target names is not read, hashed, or uploaded, so a link pointing outside `work_dir` cannot leak anything. A symlink has no content hash, so for the per-path bookkeeping that needs one (the "Would push `<path>` → `<hash>`" dry-run line) the hash of the one-entry wrapper tree containing the link is used, as `pull` does for a leaf scope. The unchanged-path skip (step 1c), the divergence check (step 2b) and the splice all compare and replace the entry as a whole; two symlinks are equal when their `target` is equal (an `mtime`-only difference is not a change). A kind change at the same path (file ↔ symlink) is an ordinary replacement of that one leaf. A link swapped for another kind between the parent-directory check and the read is a live-path race: the path is reported unstable and its previous entry is preserved.
 
 1c. **Unchanged-path skip.** After scanning `<path>` (step 1), a path whose freshly-scanned entry already matches `clone_root`'s recorded entry at that same path is skipped entirely — it needs no splice, no upload, and does not count toward "something to push" (mirroring step 3's whole-tree "nothing to push" check, scoped to this one path). For a blob leaf, "matches" means both the content hash **and** the executable-bit `mode` are equal — same rule as "Diff output" above (a mode-only change, e.g. `chmod +x`, is a real modification even when the hash is unchanged) and as `ls --dirty`'s dirty detection. Comparing only the hash here would silently treat a mode-only change as "nothing to push" and, if a remote-side mode-only change to the same path exists, would let this push's splice overwrite it without ever reading or preserving it. For a directory subtree, "matches" is a single tree-hash comparison, since `mode` is not a field of `TreeEntry::Tree` and any mode change to a file inside the subtree already changes that subtree's hash.
 
@@ -1120,6 +1122,26 @@ real directory on disk at `<path>` (e.g. the type change has not yet been
 pulled locally either), that directory is scanned as an ordinary subtree and
 the resulting tree hash is wrapped in the same one-entry synthetic tree,
 rather than being read as file content.
+
+**Scope of the mtime pre-filter map.** Step 3's working-tree scan of `<path>`
+uses the same mtime pre-filter described under "Working tree scan optimization"
+above. For a path-scoped pull the flattened clone-root map is built **only
+from the clone root's `<path>` subtree**, never from the whole clone root: the
+clone root is navigated along `<path>`'s components (reading only that spine of
+tree objects) and the subtree found at the end of the spine is flattened,
+bounded to the subtrees that exist on disk exactly as in the whole-tree case
+(a child absent on disk, or a stub, is not descended into). Map keys carry the
+full repo-relative prefix (e.g. `blog/post.md`, not `post.md`) so they match
+the scan's `rel_path` lookups. Clone-root tree objects outside `<path>`, other
+than the spine, are never read. With several `<path>` arguments the map is the
+union of each path's bounded map. If `<path>` does not exist in the clone root
+the contribution is empty; if it resolves to a single blob or symlink the
+contribution is that one entry. Only a pull whose scope is the repository root
+(no argument given from the root, or `.` at the root) flattens the whole clone
+root. As everywhere else this bound is purely an optimisation: a path missing
+from the map is re-hashed by the scan, so the result of the pull is unchanged.
+A pull of a single file therefore reads a number of tree objects proportional
+to the depth of that file, not to the number of directories in the repository.
 
 After the operation:
 - The working tree's `<path>` matches the remote root.

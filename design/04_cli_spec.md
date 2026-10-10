@@ -775,6 +775,11 @@ Remote column `R` (clone root vs remote root):
 - `D`: entry deleted on the remote (present in clone root but absent in remote root)
 - ` ` (space): up to date with remote, or remote not configured / unreachable
 
+The `R` comparison is made per entry **kind-aware**, using the whole tree entry rather than a hash alone, because a symlink entry has no hash:
+- A symlink is `M` when the clone root also has a symlink at that name but with a different `target`; an identical symlink (same `target`) is unchanged and shows a blank `R`. (An `mtime`-only difference is not a change, consistent with how blobs are compared.)
+- A change of kind at the same name (blob, symlink, or directory on one side and a different kind on the other) is `M`, not `A`/`D`: the name exists on both sides. When the remote side is a directory, the descendants are then listed relative to an empty clone side, like any other newly appearing subtree.
+- A name present in the clone root but absent from the remote is `D` whether it is a blob, a symlink, or a directory.
+
 Status column `X` (working tree vs clone root):
 - `A`: added in working tree (not in clone root)
 - `M`: modified in working tree. A file is modified when its content hash differs
@@ -783,6 +788,8 @@ Status column `X` (working tree vs clone root):
   a dirty tree: the tree hash includes `mode`, so a mode-only change is pushed.
 - `D`: deleted in working tree (in clone root but absent locally)
 - ` ` (space): unchanged
+
+The `X` comparison is kind-aware, like the `R` comparison above. A symlink is `M` when the clone root also has a symlink at that name but with a different `target`; an identical symlink is unchanged. A change of kind at the same name (a file, symlink or directory replaced by a different kind) is `M`, not `A`/`D`, because the name exists on both sides.
 
 There is no `X=?` success state. If any tree required to determine `X` cannot
 be resolved, `ls` fails before printing the table. The `Z` column's `?` remains

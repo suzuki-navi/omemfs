@@ -369,11 +369,12 @@ fn pull_scoped(
     let lazy = LazyTreeStore::new(&local, &pack_reader, remote_key.as_ref());
 
     // Flatten clone_root so the scan can reuse unchanged tree-object entries
-    // (mtime stability), bounded to working-tree-present subtrees so a stubbed
-    // clone_root is not fully fetched through the lazy store.
+    // (mtime stability), bounded to the requested paths and to working-tree-
+    // present subtrees so neither a stubbed clone_root nor unrelated
+    // directories are fetched through the lazy store.
     let clone_root_flat = clone_root
         .as_ref()
-        .and_then(|h| flatten_clone_root_present(h, &repo.work_dir, &lazy).ok());
+        .and_then(|h| flatten_clone_root_present_scoped(h, &rels, &repo.work_dir, &lazy).ok());
     let omemfs_dir = repo.omemfs_dir();
     // STAT_CACHE is read once in full (not per-path scoped, unlike push's
     // single-path `read_scoped`) and written back once at the end from the
@@ -2338,6 +2339,41 @@ fn flatten_clone_root_present(
     Ok(map)
 }
 
+/// Scoped counterpart of [`flatten_clone_root_present`] (design/03 "Path-scoped
+/// pull", "Scope of the mtime pre-filter map"): for each repo-relative `rels`
+/// path, navigate the clone root along its components (reading only that spine)
+/// and flatten just the subtree found there, bounded to directories present on
+/// disk. Keys carry the full repo-relative prefix. A path absent from the clone
+/// root or from disk contributes nothing; a map miss only makes the scan
+/// re-hash that file.
+fn flatten_clone_root_present_scoped(
+    root_hash: &Hash,
+    rels: &[String],
+    work_dir: &std::path::Path,
+    store: &dyn ObjectStore,
+) -> Result<HashMap<String, TreeEntry>, Error> {
+    let mut map = HashMap::new();
+    for rel in rels {
+        let components: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+        match tree_ops::navigate_entry(root_hash, &components, store)? {
+            None => {}
+            Some(TreeEntry::Tree { hash, .. }) => {
+                let abs = work_dir.join(rel);
+                let is_real_dir = std::fs::symlink_metadata(&abs)
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false);
+                if is_real_dir {
+                    flatten_present_into(&hash, rel, &abs, store, &mut map)?;
+                }
+            }
+            Some(entry) => {
+                map.insert(rel.clone(), entry);
+            }
+        }
+    }
+    Ok(map)
+}
+
 fn flatten_present_into(
     hash: &Hash,
     prefix: &str,
@@ -3719,5 +3755,221 @@ mod tests {
         let (clean, conflicts) = classify_conflicts(&remote, &local);
         assert!(conflicts.is_empty());
         assert!(clean.contains_key("f"));
+    }
+    // -----------------------------------------------------------------------
+    // flatten_clone_root_present_scoped -- design/03_sync_model.md,
+    // "Path-scoped pull", "Scope of the mtime pre-filter map".
+    // -----------------------------------------------------------------------
+
+    /// Counts `open_read` calls so a test can assert how many tree objects a
+    /// flatten read.
+    struct CountingStore {
+        inner: LocalStore,
+        reads: AtomicUsize,
+    }
+
+    impl ObjectStore for CountingStore {
+        fn exists(&self, hash: &Hash) -> Result<bool, Error> {
+            self.inner.exists(hash)
+        }
+        fn size(&self, hash: &Hash) -> Result<u64, Error> {
+            self.inner.size(hash)
+        }
+        fn list_with_sizes(&self) -> Result<Vec<(String, u64)>, Error> {
+            self.inner.list_with_sizes()
+        }
+        fn open_read(&self, hash: &Hash) -> Result<Box<dyn std::io::Read>, Error> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.inner.open_read(hash)
+        }
+        fn write_from(&self, hash: &Hash, r: &mut dyn std::io::Read) -> Result<(), Error> {
+            self.inner.write_from(hash, r)
+        }
+    }
+
+    fn flat_blob(name: &str) -> TreeEntry {
+        TreeEntry::Blob {
+            name: name.to_string(),
+            hash: Hash::compute(name.as_bytes()),
+            mtime: None,
+            size: name.len() as u64,
+            mode: None,
+        }
+    }
+
+    fn flat_dir(name: &str, hash: Hash) -> TreeEntry {
+        TreeEntry::Tree {
+            name: name.to_string(),
+            hash,
+            mtime: None,
+            size: 0,
+            blob_count: 1,
+        }
+    }
+
+    /// Clone root (also mirrored on disk under `work`):
+    ///   a/f.txt, a/sub/g.txt, b/h.txt, b/deep/i.txt, top.txt
+    struct FlattenFixture {
+        _tmp: TempDir,
+        work: PathBuf,
+        store: CountingStore,
+        root: Hash,
+    }
+
+    fn flatten_fixture() -> FlattenFixture {
+        let tmp = TempDir::new().unwrap();
+        let work = tmp.path().join("work");
+        for d in ["a/sub", "b/deep"] {
+            fs::create_dir_all(work.join(d)).unwrap();
+        }
+        let store = CountingStore {
+            inner: LocalStore::for_cache(tmp.path().join("objects")),
+            reads: AtomicUsize::new(0),
+        };
+        let a_sub = tree_ops::build_and_store(vec![flat_blob("g.txt")], &store).unwrap();
+        let a = tree_ops::build_and_store(
+            vec![flat_blob("f.txt"), flat_dir("sub", a_sub)],
+            &store,
+        )
+        .unwrap();
+        let b_deep = tree_ops::build_and_store(vec![flat_blob("i.txt")], &store).unwrap();
+        let b = tree_ops::build_and_store(
+            vec![flat_blob("h.txt"), flat_dir("deep", b_deep)],
+            &store,
+        )
+        .unwrap();
+        let root = tree_ops::build_and_store(
+            vec![flat_dir("a", a), flat_dir("b", b), flat_blob("top.txt")],
+            &store,
+        )
+        .unwrap();
+        FlattenFixture {
+            _tmp: tmp,
+            work,
+            store,
+            root,
+        }
+    }
+
+    fn sorted_keys(m: &HashMap<String, TreeEntry>) -> Vec<String> {
+        let mut k: Vec<String> = m.keys().cloned().collect();
+        k.sort();
+        k
+    }
+
+    #[test]
+    fn scoped_present_flatten_of_a_nested_file_reads_only_the_spine() {
+        let fx = flatten_fixture();
+        let before = fx.store.reads.load(Ordering::SeqCst);
+        let map = flatten_clone_root_present_scoped(
+            &fx.root,
+            &["a/f.txt".to_string()],
+            &fx.work,
+            &fx.store,
+        )
+        .unwrap();
+        let reads = fx.store.reads.load(Ordering::SeqCst) - before;
+        assert_eq!(sorted_keys(&map), vec!["a/f.txt".to_string()]);
+        // Root tree + a's tree. Neither b nor a/sub is read.
+        assert_eq!(reads, 2, "only the spine may be read");
+    }
+
+    #[test]
+    fn scoped_present_flatten_of_a_directory_keys_with_the_full_prefix() {
+        let fx = flatten_fixture();
+        let before = fx.store.reads.load(Ordering::SeqCst);
+        let map = flatten_clone_root_present_scoped(
+            &fx.root,
+            &["a".to_string()],
+            &fx.work,
+            &fx.store,
+        )
+        .unwrap();
+        let reads = fx.store.reads.load(Ordering::SeqCst) - before;
+        assert_eq!(
+            sorted_keys(&map),
+            vec!["a/f.txt".to_string(), "a/sub/g.txt".to_string()]
+        );
+        // Root, a, a/sub. Nothing under b.
+        assert_eq!(reads, 3);
+    }
+
+    #[test]
+    fn scoped_present_flatten_does_not_descend_into_a_directory_absent_on_disk() {
+        let fx = flatten_fixture();
+        fs::remove_dir_all(fx.work.join("a/sub")).unwrap();
+        let map = flatten_clone_root_present_scoped(
+            &fx.root,
+            &["a".to_string()],
+            &fx.work,
+            &fx.store,
+        )
+        .unwrap();
+        assert_eq!(sorted_keys(&map), vec!["a/f.txt".to_string()]);
+    }
+
+    #[test]
+    fn scoped_present_flatten_of_an_absent_path_is_empty() {
+        let fx = flatten_fixture();
+        let map = flatten_clone_root_present_scoped(
+            &fx.root,
+            &["missing/x".to_string()],
+            &fx.work,
+            &fx.store,
+        )
+        .unwrap();
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn scoped_present_flatten_of_a_directory_absent_on_disk_is_empty() {
+        let fx = flatten_fixture();
+        fs::remove_dir_all(fx.work.join("b")).unwrap();
+        let map = flatten_clone_root_present_scoped(
+            &fx.root,
+            &["b".to_string()],
+            &fx.work,
+            &fx.store,
+        )
+        .unwrap();
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn scoped_present_flatten_of_several_paths_is_the_union() {
+        let fx = flatten_fixture();
+        let map = flatten_clone_root_present_scoped(
+            &fx.root,
+            &["a/sub".to_string(), "b/deep/i.txt".to_string(), "top.txt".to_string()],
+            &fx.work,
+            &fx.store,
+        )
+        .unwrap();
+        assert_eq!(
+            sorted_keys(&map),
+            vec![
+                "a/sub/g.txt".to_string(),
+                "b/deep/i.txt".to_string(),
+                "top.txt".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn scoped_present_flatten_matches_the_whole_tree_flatten_restricted_to_the_scope() {
+        let fx = flatten_fixture();
+        let whole = flatten_clone_root_present(&fx.root, &fx.work, &fx.store).unwrap();
+        let scoped = flatten_clone_root_present_scoped(
+            &fx.root,
+            &["b".to_string()],
+            &fx.work,
+            &fx.store,
+        )
+        .unwrap();
+        let expected: HashMap<String, TreeEntry> = whole
+            .into_iter()
+            .filter(|(k, _)| k.starts_with("b/"))
+            .collect();
+        assert_eq!(sorted_keys(&scoped), sorted_keys(&expected));
     }
 }

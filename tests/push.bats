@@ -379,26 +379,33 @@ EOF
     [ "$status" -eq 0 ]
 }
 
-@test "push: scoped push refuses to read through a directory symlink scoped path, and does not upload its content" {
-    # Regression test / reproduction of the symlink-escape incident this
-    # fsguard boundary closes: before design/03_sync_model.md's
-    # "Path-scoped push" step 1 guard, `push_scoped` decided whether to scan
-    # a scoped path as a directory with a bare `abs_path.is_dir()`, which
-    # follows symlinks. Pushing a scoped path that is itself a symlink
-    # pointing at a directory OUTSIDE work_dir would scan and upload that
-    # outside content as if it were part of the repository.
+@test "push: scoped push of a directory symlink pushes the link itself and never reads its target" {
+    # Regression test / reproduction of the symlink-escape incident the
+    # fsguard boundary closes: `push_scoped` once decided whether to scan a
+    # scoped path as a directory with a bare `abs_path.is_dir()`, which follows
+    # symlinks, so a scoped path that was itself a symlink to a directory
+    # OUTSIDE work_dir would scan and upload that outside content.
+    #
+    # design/03 "Path-scoped push", "Symlink leaf": a symlink at the scoped
+    # path is a leaf entry. It is recorded as a symlink (target string only);
+    # what it points at is never read, so nothing outside work_dir can leak.
     local outside
     outside="$(mktemp -d)"
     echo "secret" > "$outside/secret.txt"
     ln -s "$outside" escape
 
     run "$OMEMFS" push escape
-    [ "$status" -ne 0 ]
+    [ "$status" -eq 0 ]
 
-    # Nothing was pushed: the remote must not have advanced past the initial
-    # (empty) clone, and the symlink target must remain untouched.
+    # The target is untouched and was not uploaded: a second clone gets the
+    # link, not the directory's content, and no copy of the secret exists.
     [ -f "$outside/secret.txt" ]
     [ "$(cat "$outside/secret.txt")" = "secret" ]
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" "$BATS_TEST_TMPDIR/second"
+    [ "$status" -eq 0 ]
+    [ -L "$BATS_TEST_TMPDIR/second/escape" ]
+    [ "$(readlink "$BATS_TEST_TMPDIR/second/escape")" = "$outside" ]
+    ! grep -rq "secret" "$REMOTE_DIR"
 
     rm escape
     rm -rf "$outside"
@@ -1711,4 +1718,89 @@ PY
     local stub_hash_after
     stub_hash_after="$(python3 -c "import json; print(json.load(open('bigdir/.omemfs-stub'))['hash'])")"
     [ "$stub_hash_before" = "$stub_hash_after" ]
+}
+
+# design/03 "Path-scoped push", "Symlink leaf": a symlink at the scoped path is
+# pushed as a symlink entry (target string), never followed.
+
+@test "push: scoped push of a symlink to a file pushes the link" {
+    echo "target content" > target.txt
+    run "$OMEMFS" push target.txt
+    [ "$status" -eq 0 ]
+    ln -s target.txt link.txt
+
+    run "$OMEMFS" push link.txt
+    [ "$status" -eq 0 ]
+
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" "$BATS_TEST_TMPDIR/second"
+    [ "$status" -eq 0 ]
+    [ -L "$BATS_TEST_TMPDIR/second/link.txt" ]
+    [ "$(readlink "$BATS_TEST_TMPDIR/second/link.txt")" = "target.txt" ]
+}
+
+@test "push: scoped push of an unchanged symlink is a no-op" {
+    echo "t" > target.txt
+    ln -s target.txt link.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    run "$OMEMFS" push link.txt
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Nothing to push."* ]]
+}
+
+@test "push: scoped push of a retargeted symlink updates the remote link" {
+    echo "a" > a.txt
+    echo "b" > b.txt
+    ln -s a.txt link.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    rm link.txt
+    ln -s b.txt link.txt
+    run "$OMEMFS" push link.txt
+    [ "$status" -eq 0 ]
+
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" "$BATS_TEST_TMPDIR/second"
+    [ "$status" -eq 0 ]
+    [ "$(readlink "$BATS_TEST_TMPDIR/second/link.txt")" = "b.txt" ]
+}
+
+@test "push: scoped push of a dangling symlink pushes it and is not a deletion" {
+    ln -s missing-target.txt dangling.txt
+    run "$OMEMFS" push dangling.txt
+    [ "$status" -eq 0 ]
+
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" "$BATS_TEST_TMPDIR/second"
+    [ "$status" -eq 0 ]
+    [ -L "$BATS_TEST_TMPDIR/second/dangling.txt" ]
+    [ "$(readlink "$BATS_TEST_TMPDIR/second/dangling.txt")" = "missing-target.txt" ]
+}
+
+@test "push: scoped push replaces a remote regular file with a symlink of the same name" {
+    echo "content" > node
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    rm node
+    ln -s elsewhere node
+    run "$OMEMFS" push node
+    [ "$status" -eq 0 ]
+
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" "$BATS_TEST_TMPDIR/second"
+    [ "$status" -eq 0 ]
+    [ -L "$BATS_TEST_TMPDIR/second/node" ]
+}
+
+@test "push: scoped push of a symlink below a symlinked directory is still refused" {
+    local outside
+    outside="$(mktemp -d)"
+    ln -s target "$outside/inner"
+    ln -s "$outside" viadir
+
+    run "$OMEMFS" push viadir/inner
+    [ "$status" -ne 0 ]
+
+    rm viadir
+    rm -rf "$outside"
 }

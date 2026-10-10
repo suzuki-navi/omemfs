@@ -2013,3 +2013,177 @@ make_partially_expanded_lazy_clone() {
     [ -f verify_full/bigdir/a.txt ]
     [ -f verify_full/bigdir/c.txt ]
 }
+
+# A symlink entry has no hash. The R-column comparison used to build its
+# clone-root lookup from hashes only, so every symlink looked absent from the
+# clone root: an unchanged link showed R=A, a retargeted link showed R=A
+# instead of M, and a link deleted on the remote showed no D at all.
+
+@test "ls: R column is space for a symlink the remote has not changed" {
+    setup_two_clones_for_ls
+
+    cd clone_A
+    echo "t" > target.txt
+    ln -s target.txt link.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    cd clone_B
+    run "$OMEMFS" pull
+    [ "$status" -eq 0 ]
+    cd ..
+
+    # A remote change elsewhere makes the root hashes differ, so the symlink
+    # comparison is actually exercised.
+    cd clone_A
+    echo "other" > other.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    cd clone_B
+    run "$OMEMFS" ls
+    [ "$status" -eq 0 ]
+    link_line=$(echo "$output" | grep "link.txt")
+    [[ -n "$link_line" ]]
+    [[ "${link_line:0:1}" == " " ]]
+    other_line=$(echo "$output" | grep "other.txt")
+    [[ "${other_line:0:1}" == "A" ]]
+}
+
+@test "ls: R column shows M when remote retargeted a symlink" {
+    setup_two_clones_for_ls
+
+    cd clone_A
+    ln -s old.txt link.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    cd clone_B
+    run "$OMEMFS" pull
+    [ "$status" -eq 0 ]
+    cd ..
+
+    cd clone_A
+    rm link.txt
+    ln -s new.txt link.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    cd clone_B
+    run "$OMEMFS" ls
+    [ "$status" -eq 0 ]
+    link_line=$(echo "$output" | grep "link.txt")
+    [[ -n "$link_line" ]]
+    [[ "${link_line:0:1}" == "M" ]]
+}
+
+@test "ls: R column shows D when remote deleted a symlink" {
+    setup_two_clones_for_ls
+
+    cd clone_A
+    echo "keep" > keep.txt
+    ln -s keep.txt link.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    cd clone_B
+    run "$OMEMFS" pull
+    [ "$status" -eq 0 ]
+    cd ..
+
+    cd clone_A
+    rm link.txt
+    run "$OMEMFS" push link.txt
+    [ "$status" -eq 0 ]
+    cd ..
+
+    cd clone_B
+    run "$OMEMFS" ls
+    [ "$status" -eq 0 ]
+    link_line=$(echo "$output" | grep "link.txt")
+    [[ -n "$link_line" ]]
+    [[ "${link_line:0:1}" == "D" ]]
+}
+
+# A scoped `ls <symlink>` must treat the link as a link (design/04 "<path>...":
+# no hash, no size). The single-file branch used to stat through the link
+# (`fs::metadata`, `exists`, `is_dir`), so a link to a regular file was listed
+# as a regular file with the TARGET's hash and size and showed X=M against the
+# clone root's symlink entry, and a link to a directory was scanned as that
+# directory.
+
+@test "ls: scoped ls of an unchanged symlink to a file shows it as a symlink in sync" {
+    echo "target content" > target.txt
+    ln -s target.txt link.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    run "$OMEMFS" ls link.txt
+    [ "$status" -eq 0 ]
+    line=$(echo "$output" | grep "link.txt")
+    # X and R columns blank, no hash, no size.
+    [[ "${line:0:2}" == "  " ]]
+    [[ "$line" == *" - "* ]]
+    [[ "$line" != *"$(printf 'target content' | sha256sum | cut -c1-8)"* ]]
+}
+
+@test "ls: scoped ls of a symlink agrees with the unscoped listing" {
+    echo "target content" > target.txt
+    ln -s target.txt link.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    run "$OMEMFS" ls
+    [ "$status" -eq 0 ]
+    unscoped=$(echo "$output" | grep "link.txt" | tr -s ' ')
+    run "$OMEMFS" ls link.txt
+    [ "$status" -eq 0 ]
+    scoped=$(echo "$output" | grep "link.txt" | tr -s ' ')
+    [ "$scoped" = "$unscoped" ]
+}
+
+@test "ls: scoped ls shows a retargeted symlink as modified" {
+    echo "a" > a.txt
+    echo "b" > b.txt
+    ln -s a.txt link.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    rm link.txt
+    ln -s b.txt link.txt
+    run "$OMEMFS" ls link.txt
+    [ "$status" -eq 0 ]
+    line=$(echo "$output" | grep "link.txt")
+    [[ "${line:1:1}" == "M" ]]
+}
+
+@test "ls: scoped ls of a dangling symlink is not a deletion" {
+    ln -s missing-target.txt dangling.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    run "$OMEMFS" ls dangling.txt
+    [ "$status" -eq 0 ]
+    line=$(echo "$output" | grep "dangling.txt")
+    # Unchanged: X must not be D (deleted).
+    [[ "${line:1:1}" == " " ]]
+}
+
+@test "ls: scoped ls of a symlink to a directory lists the link, not the directory" {
+    mkdir realdir
+    echo "inside" > realdir/inside.txt
+    ln -s realdir dirlink
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    run "$OMEMFS" ls dirlink
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"inside.txt"* ]]
+    line=$(echo "$output" | grep "dirlink")
+    [[ "${line:0:2}" == "  " ]]
+}

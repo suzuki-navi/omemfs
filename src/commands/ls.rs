@@ -1240,15 +1240,24 @@ fn scan_scoped_for_ls(
         // the previous behaviour for a genuinely nonexistent path).
         //
         // A path below a fully stubbed ancestor never reaches this check: it is
-        // refused above, so `!abs.exists()` here really means "absent".
-        if !abs.exists() {
+        // refused above, so a missing `lstat` here really means "absent".
+        //
+        // The path is classified with `lstat` and never followed
+        // (design/04 "<path>..."): a symlink is a leaf entry of its own, so a
+        // dangling link is present, not deleted, and a link to a directory is
+        // not that directory. A symlinked ancestor is refused, as `push` does.
+        let observed = crate::fsguard::lstat_path(work_dir, &abs)?;
+        if observed.is_none() {
             if let Some(new_hash) = crate::tree_ops::remove_entry(&root_hash, &components, store)? {
                 root_hash = new_hash;
             }
             continue;
         }
 
-        let new_entry = if abs.is_dir() {
+        let new_entry = if observed.as_ref().is_some_and(|st| st.is_symlink()) {
+            let (parent, leaf) = crate::fsguard::open_leaf(work_dir, &rel_str, false)?;
+            crate::scan::symlink_leaf_entry(&parent, &leaf)?
+        } else if observed.as_ref().is_some_and(|st| st.is_dir()) {
             // Scan only this subtree. `scan_and_store_with_cache` derives the
             // rel_prefix from `dir` against `work_dir`, so the recorded `files`
             // and `side` keys are already repo-relative.
@@ -2013,14 +2022,28 @@ fn diff_recursive(
                 }
                 prefix.truncate(prev);
             }
-            TreeEntry::Symlink { .. } => {
-                if !base_map.contains_key(name) && scope.in_scope(&path) {
-                    result.insert(
-                        path,
-                        DiffRow::Added {
-                            working_hash: Hash::compute(b""),
-                        },
-                    );
+            TreeEntry::Symlink { target, .. } => {
+                // A symlink has no hash: it is compared by `target`, and the
+                // placeholder hash below is never displayed (design/04 "X").
+                let row = match base_map.get(name) {
+                    Some(TreeEntry::Symlink {
+                        target: base_target,
+                        ..
+                    }) => (base_target != target).then(|| DiffRow::Modified {
+                        working_hash: Hash::compute(b""),
+                    }),
+                    // Entry kind changed (was a blob or tree).
+                    Some(_) => Some(DiffRow::Modified {
+                        working_hash: Hash::compute(b""),
+                    }),
+                    None => Some(DiffRow::Added {
+                        working_hash: Hash::compute(b""),
+                    }),
+                };
+                if let Some(row) = row {
+                    if scope.in_scope(&path) {
+                        result.insert(path, row);
+                    }
                 }
             }
         }
@@ -2589,21 +2612,10 @@ fn remote_diff_recursive(
     } else {
         Vec::new()
     };
-    let clone_map: HashMap<String, Hash> = clone_entries
-        .iter()
-        .filter_map(|e| e.hash().map(|h| (e.name().to_string(), h.clone())))
-        .collect();
-    // Blob mode lookup (C4): clone_map only carries the hash, which is not
-    // enough to detect a mode-only (chmod) remote change when the content
-    // hash is unchanged -- mirrors the local diff_recursive's base_map, which
-    // keeps the full TreeEntry for exactly this reason.
-    let clone_blob_modes: HashMap<String, Option<String>> = clone_entries
-        .iter()
-        .filter_map(|e| match e {
-            TreeEntry::Blob { name, mode, .. } => Some((name.clone(), mode.clone())),
-            _ => None,
-        })
-        .collect();
+    // Whole entries, not hashes: a symlink has no hash, so a hash-keyed map
+    // would make every clone-root symlink look absent.
+    let clone_map: HashMap<&str, &TreeEntry> =
+        clone_entries.iter().map(|e| (e.name(), e)).collect();
 
     let remote_names: HashSet<&str> = remote_entries.iter().map(|e| e.name()).collect();
 
@@ -2619,25 +2631,37 @@ fn remote_diff_recursive(
                 if !scope.in_scope(&entry_path) {
                     continue;
                 }
-                let status = if clone_map.contains_key(name) {
+                let status = match clone_map.get(name) {
                     // A mode-only (chmod) change still rewrites the tree hash
                     // (see push's dirty detection), so report it as modified
                     // even when the blob content hash is unchanged.
-                    let mode_changed = clone_blob_modes.get(name) != Some(mode);
-                    if clone_map.get(name) != Some(hash) || mode_changed {
-                        'M'
-                    } else {
-                        continue;
+                    Some(TreeEntry::Blob {
+                        hash: clone_hash,
+                        mode: clone_mode,
+                        ..
+                    }) => {
+                        if clone_hash != hash || clone_mode != mode {
+                            'M'
+                        } else {
+                            continue;
+                        }
                     }
-                } else {
-                    added_entries.insert(entry_path.clone(), entry.clone());
-                    'A'
+                    // Same name, different kind on the clone side.
+                    Some(_) => 'M',
+                    None => {
+                        added_entries.insert(entry_path.clone(), entry.clone());
+                        'A'
+                    }
                 };
                 all_remote_entries.insert(entry_path.clone(), entry.clone());
                 out.insert(entry_path, status);
             }
             TreeEntry::Tree { hash, .. } => {
-                let clone_child = clone_map.get(name);
+                let clone_entry = clone_map.get(name).copied();
+                let clone_child = match clone_entry {
+                    Some(TreeEntry::Tree { hash, .. }) => Some(hash),
+                    _ => None,
+                };
                 if clone_child == Some(hash) {
                     continue;
                 }
@@ -2645,7 +2669,7 @@ fn remote_diff_recursive(
                     continue;
                 }
                 if scope.in_scope(&entry_path) {
-                    let is_new = clone_child.is_none();
+                    let is_new = clone_entry.is_none();
                     let dir_status = if is_new { 'A' } else { 'M' };
                     let dir_path = format!("{}/", entry_path);
                     if is_new {
@@ -2677,11 +2701,26 @@ fn remote_diff_recursive(
                 if !scope.in_scope(&entry_path) {
                     continue;
                 }
-                let status = if clone_map.contains_key(name) {
-                    'M'
-                } else {
-                    added_entries.insert(entry_path.clone(), entry.clone());
-                    'A'
+                let status = match (clone_map.get(name), entry) {
+                    (
+                        Some(TreeEntry::Symlink {
+                            target: clone_target,
+                            ..
+                        }),
+                        TreeEntry::Symlink { target, .. },
+                    ) => {
+                        if clone_target != target {
+                            'M'
+                        } else {
+                            continue;
+                        }
+                    }
+                    // Same name, different kind on the clone side.
+                    (Some(_), _) => 'M',
+                    (None, _) => {
+                        added_entries.insert(entry_path.clone(), entry.clone());
+                        'A'
+                    }
                 };
                 all_remote_entries.insert(entry_path.clone(), entry.clone());
                 out.insert(entry_path, status);
@@ -2690,9 +2729,9 @@ fn remote_diff_recursive(
     }
 
     for name in clone_map.keys() {
-        if !remote_names.contains(name.as_str()) {
+        if !remote_names.contains(name) {
             let entry_path = if prefix.is_empty() {
-                name.clone()
+                name.to_string()
             } else {
                 format!("{}/{}", prefix, name)
             };
@@ -3039,5 +3078,226 @@ mod tests {
 
         assert_eq!(unknown, std::collections::HashSet::from([".".to_string()]));
         assert!(diff_map.is_empty());
+    }
+    // -----------------------------------------------------------------------
+    // remote_diff_recursive -- R column, kind-aware comparison
+    // (design/04 "Remote column R"). A symlink entry has no hash, so it must
+    // be compared by its target rather than through a hash map.
+    // -----------------------------------------------------------------------
+
+    fn symlink_entry(name: &str, target: &str) -> TreeEntry {
+        TreeEntry::Symlink {
+            name: name.to_string(),
+            target: target.to_string(),
+            mtime: None,
+        }
+    }
+
+    /// R-column statuses for `clone` -> `remote`, both single-level trees.
+    fn remote_statuses(
+        clone: Vec<TreeEntry>,
+        remote: Vec<TreeEntry>,
+    ) -> HashMap<String, char> {
+        let dir = TempDir::new().unwrap();
+        let store = LocalStore::for_cache(dir.path());
+        let clone_root = store_tree(clone, &store);
+        let remote_root = store_tree(remote, &store);
+        let mut out = HashMap::new();
+        remote_diff_recursive(
+            Some(&clone_root),
+            &remote_root,
+            &store,
+            &store,
+            None,
+            &ScopeFilter::unscoped(),
+            &mut String::new(),
+            &mut out,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        )
+        .unwrap();
+        out
+    }
+
+    #[test]
+    fn remote_diff_ignores_an_identical_symlink() {
+        // The unchanged symlink is beside a changed blob so the two trees differ.
+        let out = remote_statuses(
+            vec![symlink_entry("link", "t.txt"), blob_entry("f", b"old")],
+            vec![symlink_entry("link", "t.txt"), blob_entry("f", b"new")],
+        );
+        assert_eq!(out, HashMap::from([("f".to_string(), 'M')]));
+    }
+
+    #[test]
+    fn remote_diff_reports_a_changed_symlink_target_as_modified() {
+        let out = remote_statuses(
+            vec![symlink_entry("link", "old.txt")],
+            vec![symlink_entry("link", "new.txt")],
+        );
+        assert_eq!(out, HashMap::from([("link".to_string(), 'M')]));
+    }
+
+    #[test]
+    fn remote_diff_reports_a_new_symlink_as_added() {
+        let out = remote_statuses(
+            vec![blob_entry("f", b"x")],
+            vec![blob_entry("f", b"x"), symlink_entry("link", "f")],
+        );
+        assert_eq!(out, HashMap::from([("link".to_string(), 'A')]));
+    }
+
+    #[test]
+    fn remote_diff_reports_a_symlink_deleted_on_the_remote() {
+        let out = remote_statuses(
+            vec![blob_entry("f", b"x"), symlink_entry("link", "f")],
+            vec![blob_entry("f", b"x")],
+        );
+        assert_eq!(out, HashMap::from([("link".to_string(), 'D')]));
+    }
+
+    #[test]
+    fn remote_diff_reports_symlink_to_blob_as_modified_not_added() {
+        let out = remote_statuses(
+            vec![symlink_entry("n", "t")],
+            vec![blob_entry("n", b"content")],
+        );
+        assert_eq!(out, HashMap::from([("n".to_string(), 'M')]));
+    }
+
+    #[test]
+    fn remote_diff_reports_blob_to_symlink_as_modified() {
+        let out = remote_statuses(
+            vec![blob_entry("n", b"content")],
+            vec![symlink_entry("n", "t")],
+        );
+        assert_eq!(out, HashMap::from([("n".to_string(), 'M')]));
+    }
+
+    #[test]
+    fn remote_diff_reports_symlink_to_directory_as_modified_with_children_added() {
+        let dir = TempDir::new().unwrap();
+        let store = LocalStore::for_cache(dir.path());
+        let sub = store_tree(vec![blob_entry("x", b"x")], &store);
+        let clone_root = store_tree(vec![symlink_entry("n", "t")], &store);
+        let remote_root = store_tree(vec![tree_entry("n", sub)], &store);
+        let mut out = HashMap::new();
+        remote_diff_recursive(
+            Some(&clone_root),
+            &remote_root,
+            &store,
+            &store,
+            None,
+            &ScopeFilter::unscoped(),
+            &mut String::new(),
+            &mut out,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            HashMap::from([("n/".to_string(), 'M'), ("n/x".to_string(), 'A')])
+        );
+    }
+
+    #[test]
+    fn remote_diff_reports_directory_to_symlink_as_modified() {
+        let dir = TempDir::new().unwrap();
+        let store = LocalStore::for_cache(dir.path());
+        let sub = store_tree(vec![blob_entry("x", b"x")], &store);
+        let clone_root = store_tree(vec![tree_entry("n", sub)], &store);
+        let remote_root = store_tree(vec![symlink_entry("n", "t")], &store);
+        let mut out = HashMap::new();
+        remote_diff_recursive(
+            Some(&clone_root),
+            &remote_root,
+            &store,
+            &store,
+            None,
+            &ScopeFilter::unscoped(),
+            &mut String::new(),
+            &mut out,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(out, HashMap::from([("n".to_string(), 'M')]));
+    }
+    // -----------------------------------------------------------------------
+    // diff_trees -- X column, kind-aware symlink comparison (design/04 "X").
+    // -----------------------------------------------------------------------
+
+    fn local_symlink(name: &str, target: &str) -> TreeEntry {
+        TreeEntry::Symlink {
+            name: name.to_string(),
+            target: target.to_string(),
+            mtime: None,
+        }
+    }
+
+    fn local_rows(
+        base: Vec<TreeEntry>,
+        target: Vec<TreeEntry>,
+    ) -> HashMap<String, &'static str> {
+        let dir = TempDir::new().unwrap();
+        let store = LocalStore::for_cache(dir.path());
+        let base_root = store_tree(base, &store);
+        let target_root = store_tree(target, &store);
+        let (map, _unknown) =
+            diff_trees(Some(&base_root), target_root, &store, &ScopeFilter::unscoped()).unwrap();
+        map.into_iter()
+            .map(|(k, v)| {
+                let tag = match v {
+                    DiffRow::Added { .. } => "A",
+                    DiffRow::Modified { .. } => "M",
+                    DiffRow::Deleted => "D",
+                    DiffRow::AddedEmptyDir { .. } => "E",
+                };
+                (k, tag)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn local_diff_ignores_an_identical_symlink() {
+        let rows = local_rows(
+            vec![local_symlink("link", "t")],
+            vec![local_symlink("link", "t")],
+        );
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn local_diff_reports_a_retargeted_symlink_as_modified() {
+        let rows = local_rows(
+            vec![local_symlink("link", "old")],
+            vec![local_symlink("link", "new")],
+        );
+        assert_eq!(rows, HashMap::from([("link".to_string(), "M")]));
+    }
+
+    #[test]
+    fn local_diff_reports_blob_to_symlink_as_modified() {
+        let rows = local_rows(
+            vec![blob_entry("n", b"content")],
+            vec![local_symlink("n", "t")],
+        );
+        assert_eq!(rows, HashMap::from([("n".to_string(), "M")]));
+    }
+
+    #[test]
+    fn local_diff_reports_symlink_to_blob_as_modified() {
+        let rows = local_rows(
+            vec![local_symlink("n", "t")],
+            vec![blob_entry("n", b"content")],
+        );
+        assert_eq!(rows, HashMap::from([("n".to_string(), "M")]));
+    }
+
+    #[test]
+    fn local_diff_reports_a_new_symlink_as_added() {
+        let rows = local_rows(vec![], vec![local_symlink("link", "t")]);
+        assert_eq!(rows, HashMap::from([("link".to_string(), "A")]));
     }
 }

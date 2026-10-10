@@ -1753,7 +1753,33 @@ fn warn_unknown_reserved(rel: &str) {
     }
 }
 
-fn system_time_to_datetime(t: Option<SystemTime>) -> Option<DateTime<Utc>> {
+/// Build the `TreeEntry::Symlink` for a scoped path that is itself a symlink,
+/// reading it through the parent directory's fd so a swap after the caller's
+/// `lstat` cannot redirect the read. The link is never followed.
+///
+/// A link that vanished or was replaced by a non-symlink in the meantime is a
+/// live-path race (`Error::is_live_path_race`), not a failure.
+pub(crate) fn symlink_leaf_entry(
+    parent: &crate::fsguard::GuardedDir,
+    name: &str,
+) -> Result<TreeEntry, Error> {
+    let metadata = parent.lstat(name)?;
+    let target = match parent.read_link(name) {
+        Ok(target) => target,
+        // EINVAL: replaced by a non-symlink after the lstat.
+        Err(Error::Io(e)) if e.raw_os_error() == Some(libc::EINVAL) => {
+            return Err(Error::SourceChanged(name.to_string()));
+        }
+        Err(e) => return Err(e),
+    };
+    Ok(TreeEntry::Symlink {
+        name: name.to_string(),
+        target,
+        mtime: system_time_to_datetime(metadata.modified()),
+    })
+}
+
+pub(crate) fn system_time_to_datetime(t: Option<SystemTime>) -> Option<DateTime<Utc>> {
     let t = t?;
     let dur = t.duration_since(std::time::UNIX_EPOCH).ok()?;
     Utc.timestamp_opt(dur.as_secs() as i64, dur.subsec_nanos())

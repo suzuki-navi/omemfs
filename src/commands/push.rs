@@ -333,17 +333,16 @@ fn push_scoped(
 
         // design/03_sync_model.md, "Path-scoped push" step 1: before scanning
         // or reading any content for this path, verify every component from
-        // work_dir down to (and including) the scoped path itself is
-        // symlink-free. `is_real_dir` returns `Err(SymlinkEscape)` for a
-        // symlinked ancestor OR a symlink at the leaf itself, `Ok(_)`
-        // (true/false, neither an error) for a real directory, a plain
-        // file, or a missing path -- exactly the set of outcomes that are
-        // safe to keep processing below (a plain file goes on to the file
-        // scan branch, a missing path to the delete branch, a real
-        // directory to the directory scan branch). This closes the escape a
-        // symlinked ancestor of `<path>` would otherwise allow: reading (and
-        // uploading) content that actually lives outside `work_dir`.
-        crate::fsguard::is_real_dir(&repo.work_dir, &abs_path)?;
+        // work_dir down to the scoped path's PARENT is symlink-free.
+        // `lstat_path` resolves each ancestor by fd and returns
+        // `Err(SymlinkEscape)` for a symlinked ancestor, closing the escape
+        // that would otherwise read (and upload) content that actually lives
+        // outside `work_dir`.
+        //
+        // The scoped path itself may be a symlink (design/03 "Symlink leaf"):
+        // it is a leaf entry and is never followed, so a symlink there is
+        // not refused.
+        crate::fsguard::lstat_path(&repo.work_dir, &abs_path)?;
 
         // If the path is itself a stub, splice its recorded entry — never treat
         // the missing materialised content as a deletion (design/08).
@@ -496,31 +495,53 @@ fn push_scoped(
             // Opened as (parent directory fd, name): a path swapped for a
             // symlink or FIFO since `lstat_path` is a live-path race, never
             // followed (design/03 "The read side").
-            let stored = match crate::fsguard::open_leaf(&repo.work_dir, rel, false)
-                .and_then(|(parent, leaf)| {
-                    crate::codec::chunk::store_file_snapshot_at(local, &parent, &leaf, None)
-                }) {
-                Ok(stored) => stored,
-                Err(e) if e.is_live_path_race() || matches!(e, Error::SymlinkEscape(_)) => {
-                    unstable_paths.insert(rel.clone());
-                    phase.complete("skipped active path");
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-            let hash = stored.hash.clone();
-            captured_entries.insert(
-                rel.clone(),
-                TreeEntry::Blob {
-                    name: components.last().unwrap().to_string(),
-                    hash: hash.clone(),
-                    mtime: stored.fs_mtime.map(chrono::DateTime::<chrono::Utc>::from),
-                    size: stored.size,
-                    mode: stored.mode,
-                },
-            );
-            phase.complete("1 file");
-            hash
+            if observed.is_symlink() {
+                // design/03 "Symlink leaf": record the link's own target,
+                // never the content it points at.
+                let entry = match crate::fsguard::open_leaf(&repo.work_dir, rel, false)
+                    .and_then(|(parent, leaf)| crate::scan::symlink_leaf_entry(&parent, &leaf))
+                {
+                    Ok(entry) => entry,
+                    Err(e) if e.is_live_path_race() || matches!(e, Error::SymlinkEscape(_)) => {
+                        unstable_paths.insert(rel.clone());
+                        phase.complete("skipped active path");
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
+                // A symlink has no content hash; the one-entry wrapper tree's
+                // hash stands in wherever a per-path hash is displayed.
+                let hash = tree_ops::build_and_store(vec![entry.clone()], local)?;
+                captured_entries.insert(rel.clone(), entry);
+                phase.complete("1 symlink");
+                hash
+            } else {
+                let stored = match crate::fsguard::open_leaf(&repo.work_dir, rel, false)
+                    .and_then(|(parent, leaf)| {
+                        crate::codec::chunk::store_file_snapshot_at(local, &parent, &leaf, None)
+                    }) {
+                    Ok(stored) => stored,
+                    Err(e) if e.is_live_path_race() || matches!(e, Error::SymlinkEscape(_)) => {
+                        unstable_paths.insert(rel.clone());
+                        phase.complete("skipped active path");
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
+                let hash = stored.hash.clone();
+                captured_entries.insert(
+                    rel.clone(),
+                    TreeEntry::Blob {
+                        name: components.last().unwrap().to_string(),
+                        hash: hash.clone(),
+                        mtime: stored.fs_mtime.map(chrono::DateTime::<chrono::Utc>::from),
+                        size: stored.size,
+                        mode: stored.mode,
+                    },
+                );
+                phase.complete("1 file");
+                hash
+            }
         };
 
         // Skip a path whose freshly scanned entry already matches clone_root:
