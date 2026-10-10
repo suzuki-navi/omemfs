@@ -132,15 +132,28 @@ pub fn scan_and_store_with_cache(
     // bounded set of worker threads (work-stealing across all depth levels),
     // rather than oversubscribing.
     let DirScan {
-        hash: root_hash,
+        hash: disk_hash,
         files,
-        side,
+        mut side,
         vanished,
         ..
     } = scan_pool().install(|| scan_dir(dir, &rel_prefix, &cfg, &filters))?;
     if vanished {
         return Err(Error::SourceChanged(dir.display().to_string()));
     }
+    // The scan root has no parent to detect its own `.omemfs-stub` marker, so the
+    // directory-stub classification a parent performs for a child is applied here
+    // instead (design/03 "Partial-expansion merge is independent of scan root").
+    // Without this, a scan rooted on a stubbed directory — every `ls <path>` /
+    // `push <path>` landing exactly on one — would return a tree holding only the
+    // on-disk entries and drop the stub-only ones.
+    let root_hash = match classify_dir_stub(dir, &rel_prefix, &mut side) {
+        DirStubKind::Full(record) => record.hash,
+        DirStubKind::Partial(record) => {
+            merge_partial_expansion(&record.hash, &disk_hash, store)?.0
+        }
+        DirStubKind::None => disk_hash,
+    };
     Ok(ScanResult {
         root_hash,
         files,
@@ -410,8 +423,11 @@ fn scan_dir(
     let mut seen: HashSet<String> = HashSet::new();
     for (raw, entry) in dir_entries {
         if raw == stub::DIR_STUB_NAME {
-            // Skip: the directory stub for the *current* dir is handled by the
-            // caller; this name refers to a .omemfs-stub inside a *child* dir.
+            // Skip: the marker itself is never an entry of its own directory. The
+            // stub for the *current* dir is classified by whoever owns this level
+            // (the enumerating parent, or `scan_and_store_with_cache` when this
+            // dir is the scan root); the is_dir branch below handles the marker
+            // inside a *child* dir.
             continue;
         }
         if let Some(logical_name) = stub::logical_name(&raw) {
@@ -531,36 +547,22 @@ fn scan_dir(
                 mtime,
             });
         } else if ftype.is_dir() {
-            // Check for a directory stub (.omemfs-stub inside this child dir).
-            // This marker is NOT in the current level's name set, so its presence
-            // requires one statx (kept to a single call).
-            let dir_stub_path = child.join(stub::DIR_STUB_NAME);
-            if dir_stub_path.is_file()
-                && let Ok(s) = fs::read_to_string(&dir_stub_path)
-                && let Ok(record) = serde_json::from_str::<stub::StubRecord>(&s)
-            {
-                // Record the directory stub as side data regardless of
-                // target type (matches stub enumeration semantics).
-                side.stubs.push((rel_path.clone(), record.clone()));
-                if record.target_type == stub::StubTargetType::Tree {
-                    // Distinguish a fully-stubbed directory (only the
-                    // .omemfs-stub marker inside) from a partially
-                    // expanded one (the marker coexists with real
-                    // files / subdirectories).
-                    if !dir_has_real_children(&child) {
-                        // Fully stubbed: use the recorded tree hash
-                        // directly without scanning the subtree.
-                        entries.push(TreeEntry::Tree {
-                            name,
-                            hash: record.hash,
-                            mtime: record.mtime,
-                            size: record.size,
-                            blob_count: record.blob_count,
-                        });
-                        continue;
-                    }
-                    // Partial expansion: scan the disk subtree, then merge
-                    // with the stub's recorded tree after recursion.
+            match classify_dir_stub(&child, &rel_path, &mut side) {
+                // Fully stubbed: use the recorded tree hash directly without
+                // scanning the subtree.
+                DirStubKind::Full(record) => {
+                    entries.push(TreeEntry::Tree {
+                        name,
+                        hash: record.hash,
+                        mtime: record.mtime,
+                        size: record.size,
+                        blob_count: record.blob_count,
+                    });
+                    continue;
+                }
+                // Partial expansion: scan the disk subtree, then merge with the
+                // stub's recorded tree after recursion.
+                DirStubKind::Partial(record) => {
                     subdir_jobs.push(SubdirJob {
                         name,
                         rel_path,
@@ -569,6 +571,7 @@ fn scan_dir(
                     });
                     continue;
                 }
+                DirStubKind::None => {}
             }
             subdir_jobs.push(SubdirJob {
                 name,
@@ -986,6 +989,50 @@ fn process_file_job(job: &FileJob, cfg: &FileJobConfig<'_>) -> Result<FileJobRes
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// How a directory's own stub marker (`<dir>/.omemfs-stub`) affects the tree
+/// built for that directory.
+enum DirStubKind {
+    /// No directory stub, or one whose target is not a tree: scan disk only.
+    None,
+    /// Fully stubbed (the marker is the directory's only content): the recorded
+    /// tree is the directory's content.
+    Full(stub::StubRecord),
+    /// Partially expanded (the marker coexists with real files /
+    /// subdirectories): the disk tree must be merged with the recorded one.
+    Partial(stub::StubRecord),
+}
+
+/// Classify `dir`'s own directory stub marker and record it in `side`.
+///
+/// Shared by both callers so the classification cannot drift between them: a
+/// parent enumerating `dir` as a child, and the entry point handling `dir` as the
+/// scan root (design/03 "Partial-expansion merge is independent of scan root").
+/// The stub is recorded as side data regardless of target type (matches stub
+/// enumeration semantics).
+fn classify_dir_stub(dir: &Path, rel_path: &str, side: &mut ScanSideData) -> DirStubKind {
+    // The marker is not part of the parent level's name set, so its presence
+    // requires one statx (kept to a single call).
+    let dir_stub_path = dir.join(stub::DIR_STUB_NAME);
+    if !dir_stub_path.is_file() {
+        return DirStubKind::None;
+    }
+    let Ok(text) = fs::read_to_string(&dir_stub_path) else {
+        return DirStubKind::None;
+    };
+    let Ok(record) = serde_json::from_str::<stub::StubRecord>(&text) else {
+        return DirStubKind::None;
+    };
+    side.stubs.push((rel_path.to_string(), record.clone()));
+    if record.target_type != stub::StubTargetType::Tree {
+        return DirStubKind::None;
+    }
+    if dir_has_real_children(dir) {
+        DirStubKind::Partial(record)
+    } else {
+        DirStubKind::Full(record)
+    }
+}
 
 /// Returns true if `dir` contains any entry other than the directory stub
 /// marker (`.omemfs-stub`). Used to distinguish a fully-stubbed directory from

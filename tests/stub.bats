@@ -367,6 +367,69 @@ teardown() {
     [ "$(cat verify/sub/a.txt)" = "overridden" ]
 }
 
+@test "stub: ls of a partially expanded directory agrees with its parent's view (no diff)" {
+    # Reproduces a bug where `omemfs ls <partially-expanded-dir>` (the
+    # partially expanded directory used directly as the scan root) disagreed
+    # with `omemfs ls <parent>` (which reaches the same directory as a CHILD
+    # while enumerating its parent) about that directory's diff status.
+    #
+    # See design/03_sync_model.md "Partial-expansion merge is independent of
+    # scan root" and design/04_cli_spec.md "Scoped working-tree scan":
+    # `merge_partial_expansion` must run identically whether the partially
+    # expanded directory is reached as a child or is itself the scan root.
+    #
+    # Row format (src/commands/ls.rs print_rows): the line is
+    # "<remote><X><Z> <hash> <size> <blob_count> <mtime> <path>", so the local
+    # diff status (X: ' '/'M'/'A'/'D') is the SECOND character of the line.
+    # Directory entries print their path with a trailing '/'.
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" repo
+    [ "$status" -eq 0 ]
+    cd repo
+    mkdir -p daily/0420
+    echo "original-a" > daily/0420/a.txt
+    echo "original-b" > daily/0420/b.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    # Stub the whole directory, then restore ONLY a.txt with its original
+    # content: a partial expansion (design/08_stub_system.md, "Partial
+    # expansion") with no net change from the last push. b.txt is now
+    # recoverable only from the stub's recorded tree, not from disk.
+    run "$OMEMFS" stub daily/0420/
+    [ "$status" -eq 0 ]
+    [ -f daily/0420/.omemfs-stub ]
+    [ ! -f daily/0420/a.txt ]
+    [ ! -f daily/0420/b.txt ]
+    echo "original-a" > daily/0420/a.txt
+
+    # Reached via the parent: daily/0420 is enumerated as a CHILD while
+    # scanning "daily", so the child-stub merge path in scan_dir correctly
+    # merges the stub's recorded tree with the disk scan. Since nothing
+    # actually changed, the daily/0420 row must show no diff (X == ' ').
+    run "$OMEMFS" ls daily
+    [ "$status" -eq 0 ]
+    parent_row=$(echo "$output" | awk '$NF == "daily/0420/" { print }')
+    [ -n "$parent_row" ]
+    [ "${parent_row:1:1}" = " " ]
+
+    # Reached directly: daily/0420 is itself the scan root passed to
+    # scan_dir for this scoped `ls`. Per design/03 "Partial-expansion merge is
+    # independent of scan root", the same merge must run at the root too, so
+    # this must report the exact same (no-diff) status for daily/0420 as the
+    # parent-scoped view above -- and b.txt (stub-only on disk) must NOT be
+    # reported as deleted, since it did not change; it is just not
+    # materialised.
+    run "$OMEMFS" ls daily/0420
+    [ "$status" -eq 0 ]
+    self_row=$(echo "$output" | awk '$NF == "daily/0420/" { print }')
+    [ -n "$self_row" ]
+    [ "${self_row:1:1}" = " " ]
+
+    b_row=$(echo "$output" | awk '$NF == "daily/0420/b.txt" { print }')
+    [ -n "$b_row" ]
+    [ "${b_row:1:1}" != "D" ]
+}
+
 @test "stub: stub --dry-run does not modify files" {
     run "$OMEMFS" clone --new --url "$REMOTE_DIR" repo
     [ "$status" -eq 0 ]

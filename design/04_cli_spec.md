@@ -494,6 +494,7 @@ Same as full pull, but:
 - Only the working tree under those paths is modified.
 - All diffs across all specified paths are collected and conflict-checked together before any changes are applied. If any path has a conflict, the entire pull is aborted.
 - `clone_root` is updated by splicing each remote root subtree into the current clone root tree (all splices applied, then written once).
+- A scope naming a regular file or symlink is treated as a leaf entry, so only that entry is applied and updated in `clone_root`.
 
 **Output example**
 
@@ -567,6 +568,8 @@ This scoping also bounds `--working`'s row substitution: since that substitution
 To keep the scope from leaking back into a whole-tree walk, the `.omemfs-filter` set for a single `<path>` is loaded scope-limited (`FilterSet::load_scoped`): only the ancestors of the path and the files inside its subtree are read, never out-of-scope siblings (see `05_ignore_and_aggregate.md` "Scope-limited filter load"). Without this, discovering filter files alone would re-walk the entire tree.
 
 If a `<path>` is itself a file or a stub, no subtree scan runs: the file is hashed directly (or the stub's recorded entry is spliced), matching `push`'s single-path handling. A `<path>` excluded by an `.omemfs-filter` ignore pattern is not scanned.
+
+When `<path>` names a **partially expanded** directory instead — one where a `.omemfs-stub` marker coexists with real files (see `08_stub_system.md`, "Partial expansion") — a subtree scan does run, and it performs the same stub/real-file merge at `<path>` that an unscoped scan performs when it reaches `<path>` as a descendant while enumerating its parent (see `03_sync_model.md`, "Partial-expansion merge is independent of scan root"). The merge does not depend on whether `<path>` is the top of the scoped walk or reached partway through a whole-tree walk, so the reconstructed subtree hash at `<path>` — and therefore the `X`/`Z` columns for `<path>` and every row beneath it — is identical either way. In particular, `omemfs ls daily` and `omemfs ls daily/0420` report the same status for `daily/0420` and everything under it whenever `daily` is a partially expanded stub directory: scoping to a subpath never leaves that subpath's own stub unmerged.
 
 For a single `<path>`, the STAT_CACHE is loaded scope-limited (`read_scoped`) and written back with `write_scoped_merge`, so only the in-scope cache entries are parsed rather than the whole file (see `07_stat_cache.md` "Read optimisation: scope-limited load"). This matters on large repositories whose STAT_CACHE has grown to many megabytes: `omemfs ls daily` then parses only the `daily` slice. Multiple `<path>` arguments fall back to a full STAT_CACHE read, as scoped `push` does.
 

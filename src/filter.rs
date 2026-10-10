@@ -2,11 +2,10 @@
 ///
 /// Format:
 ///   Lines before the first section header belong to `[ignore]`.
-///   `[ignore]`      section: gitignore-subset patterns; matched paths are excluded from push/scan.
-///   `[aggregate]`   section: gitignore-subset patterns; matched directories are collapsed in `ls`.
-///   `[line_merge]`  section: gitignore-subset patterns; marks line-based, append-only log files
-///                    for automatic merging during `pull` (see
-///                    design/15_line_history_merge.md).
+///   `[ignore]`     section: gitignore-subset patterns; matched paths are excluded from push/scan.
+///   `[aggregate]`  section: gitignore-subset patterns; matched directories are collapsed in `ls`.
+///   `[line_merge]` section: gitignore-subset patterns; matched paths are line-merged by `pull`
+///                  instead of conflicting (see `design/15_line_history_merge.md`).
 ///
 /// Pattern syntax (gitignore subset):
 ///   blank / `# comment`  — ignored
@@ -191,12 +190,10 @@ struct FilterFile {
     line_merge: Section,
 }
 
-/// Which section a line belongs to while scanning a `.omemfs-filter` file.
-/// Defaults to `Ignore` because lines before the first section header belong
-/// to `[ignore]`.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+/// Which section the pattern lines currently being parsed belong to. Lines
+/// before the first section header belong to `[ignore]` (the default section).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CurrentSection {
-    #[default]
     Ignore,
     Aggregate,
     LineMerge,
@@ -340,11 +337,11 @@ impl FilterSet {
         })
     }
 
-    /// Returns true if `rel_path` is marked as a line-based, append-only log
-    /// file by any `[line_merge]` section. Consumed by `pull`
-    /// (`src/commands/pull.rs`) to decide which conflicting paths are
-    /// candidates for the automatic line merge documented in
-    /// `design/15_line_history_merge.md`.
+    /// Returns true if `rel_path` is marked for automatic three-way line
+    /// merging by any `[line_merge]` section (see
+    /// `design/15_line_history_merge.md`). Consulted by `pull` for a path
+    /// that changed on both sides, before falling back to the conflict
+    /// helper files.
     pub fn is_line_merge(&self, rel_path: &str) -> bool {
         self.test(rel_path, |ff, path_in_scope| {
             ff.line_merge.matches(path_in_scope)
@@ -488,10 +485,10 @@ node_modules/
 __pycache__/
 
 [line_merge]
-# Line-based, append-only log files listed here are auto-merged by a future
-# `pull` instead of producing a conflict (see design/15_line_history_merge.md).
+# Files matching these patterns are merged line by line when both sides
+# changed them, instead of producing conflict helper files.
 
-# Shell and REPL history files
+# Shell / REPL history files (append-only, one entry per line)
 .zsh_history
 .bash_history
 .python_history
@@ -512,11 +509,6 @@ mod tests {
     #[allow(dead_code)]
     fn matches_aggregate(content: &str, path: &str) -> bool {
         FilterFile::parse(content).aggregate.matches(path)
-    }
-
-    #[allow(dead_code)]
-    fn matches_line_merge(content: &str, path: &str) -> bool {
-        FilterFile::parse(content).line_merge.matches(path)
     }
 
     // --- Pattern parsing ---
@@ -633,6 +625,8 @@ mod tests {
         assert!(f.aggregate.matches(".git"));
     }
 
+    // --- [line_merge] section (design/15_line_history_merge.md) ---
+
     #[test]
     fn line_merge_section() {
         let content = "[line_merge]\n.zsh_history\n";
@@ -643,21 +637,52 @@ mod tests {
     }
 
     #[test]
-    fn all_three_sections() {
-        let content = "[ignore]\ntarget/\n[aggregate]\n.git\n[line_merge]\n.zsh_history\n";
+    fn line_merge_section_does_not_swallow_following_sections() {
+        // A `[line_merge]` section followed by another header must not keep
+        // capturing patterns after the header.
+        let content = "[line_merge]\n.zsh_history\n[ignore]\nsecret.txt\n";
         let f = FilterFile::parse(content);
-        // Each pattern only affects its own section.
-        assert!(f.ignore.matches("target"));
-        assert!(!f.aggregate.matches("target"));
-        assert!(!f.line_merge.matches("target"));
-
-        assert!(!f.ignore.matches(".git"));
-        assert!(f.aggregate.matches(".git"));
-        assert!(!f.line_merge.matches(".git"));
-
-        assert!(!f.ignore.matches(".zsh_history"));
-        assert!(!f.aggregate.matches(".zsh_history"));
         assert!(f.line_merge.matches(".zsh_history"));
+        assert!(!f.line_merge.matches("secret.txt"));
+        assert!(f.ignore.matches("secret.txt"));
+    }
+
+    #[test]
+    fn line_merge_matches_at_any_depth_like_ignore() {
+        let content = "[line_merge]\n.zsh_history\n";
+        let f = FilterFile::parse(content);
+        assert!(f.line_merge.matches("logs/.zsh_history"));
+        assert!(f.line_merge.matches("a/b/.zsh_history"));
+    }
+
+    #[test]
+    fn filter_set_line_merge_hierarchical() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".omemfs-filter"),
+            "[line_merge]\n.zsh_history\n",
+        )
+        .unwrap();
+        let set = FilterSet::load(dir.path());
+        assert!(set.is_line_merge(".zsh_history"));
+        assert!(set.is_line_merge("logs/.zsh_history"));
+        assert!(!set.is_line_merge("notes.txt"));
+        // A `[line_merge]` pattern must not affect the other sections.
+        assert!(!set.is_ignored(".zsh_history"));
+        assert!(!set.is_aggregated(".zsh_history"));
+    }
+
+    #[test]
+    fn default_template_line_merges_shell_history_files() {
+        // tests/pull.bats relies on the default template shipped by
+        // `omemfs clone --new` already listing `.zsh_history` under
+        // `[line_merge]` (design/15, "Default `omemfs clone` template
+        // patterns").
+        let f = FilterFile::parse(DEFAULT_FILTER_TEMPLATE);
+        for path in [".zsh_history", ".bash_history", ".python_history"] {
+            assert!(f.line_merge.matches(path), "not line-merged: {}", path);
+            assert!(!f.ignore.matches(path), "unexpectedly ignored: {}", path);
+        }
     }
 
     #[test]
@@ -692,21 +717,6 @@ mod tests {
         assert!(set.is_ignored("sub/target"));
         assert!(set.is_aggregated(".git"));
         assert!(!set.is_ignored(".git"));
-    }
-
-    #[test]
-    fn filter_set_root_file_line_merge() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join(".omemfs-filter"),
-            "[ignore]\ntarget/\n[line_merge]\n.zsh_history\n",
-        )
-        .unwrap();
-        let set = FilterSet::load(dir.path());
-        assert!(set.is_line_merge(".zsh_history"));
-        assert!(set.is_line_merge("sub/.zsh_history"));
-        assert!(!set.is_line_merge("target"));
-        assert!(!set.is_ignored(".zsh_history"));
     }
 
     #[test]
@@ -828,18 +838,5 @@ mod tests {
         let scoped = FilterSet::load_scoped(dir.path(), "");
         assert!(scoped.is_ignored("target"));
         assert!(scoped.is_ignored("a/b/target"));
-    }
-
-    // --- Default template ([line_merge]) ---
-
-    #[test]
-    fn default_template_line_merge_patterns() {
-        let f = FilterFile::parse(DEFAULT_FILTER_TEMPLATE);
-        assert!(f.line_merge.matches(".zsh_history"));
-        assert!(f.line_merge.matches(".bash_history"));
-        assert!(f.line_merge.matches(".python_history"));
-        // These patterns must not leak into the other sections.
-        assert!(!f.ignore.matches(".zsh_history"));
-        assert!(!f.aggregate.matches(".zsh_history"));
     }
 }

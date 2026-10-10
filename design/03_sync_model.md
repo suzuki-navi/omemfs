@@ -224,6 +224,40 @@ two fronts:
 On a stub-free repository (the common case) these changes drop the per-entry
 `statx` count from 2–3 to 1.
 
+#### Partial-expansion merge is independent of scan root
+
+The two stub-detection paths above — the file-adjacent stub name-set lookup
+and the directory-stub `statx` — are both run by a directory's *parent* while
+enumerating that directory as a child. When the child is a directory stub
+whose target is a tree and the directory also has real children (a
+*partially expanded* directory; see `08_stub_system.md`, "Partial
+expansion"), the parent recurses into it and then merges the stub's recorded
+tree with the tree just scanned from disk (`merge_partial_expansion`):
+on-disk entries win over same-name stub entries, and the merged tree replaces
+the disk-only tree as that child's entry.
+
+This merge runs identically when the partially expanded directory is not a
+child at all, but is itself the top-level `dir` a `scan_dir` call was invoked
+on — which happens for every scoped scan (`ls <path>`, `push <path>`; see
+`04_cli_spec.md`, "Scoped working-tree scan") whose `<path>` lands exactly on
+a partially expanded directory. A scan root has no parent to perform the
+lookup on its behalf, so `scan_dir` detects its own `.omemfs-stub` marker and
+applies the merge itself before returning, rather than assuming the merge is
+always "handled by the caller." Skipping the merge at the root would build a
+tree containing only the on-disk entries and silently drop every stub-only
+entry the directory still logically contains — entries that a whole-tree
+(unscoped) scan reaching the same directory as a descendant would have merged
+in. The two scans would then disagree about that directory's hash, and a
+subsequent diff against `clone_root` would report the missing entries as
+spurious deletions, propagated up to every ancestor row shown by `ls`.
+
+The merge is therefore scan-root-independent: a given partially expanded
+directory produces the same merged tree hash whether `scan_dir` reaches it as
+a child of an enumerating parent or is invoked on it directly as the scan
+root. This is what allows a scoped command's result for a path to always
+agree with an unscoped command's result for the same path (see
+`04_cli_spec.md`, "Scoped working-tree scan").
+
 #### STAT_CACHE invariant and push-time staging
 
 Historically a STAT_CACHE hit implied "this blob is already in the local object
@@ -654,6 +688,12 @@ After the operation:
 4. Check for conflicts within `<path>` (same logic as full pull). If any conflict is found, abort.
 5. Apply remote changes within `<path>` to the working tree. Paths outside `<path>` in the working tree are untouched.
 6. Update `clone_root` by splicing the remote root's `<path>` subtree into a copy of the **current clone root tree**. Paths outside `<path>` in clone root are unchanged.
+
+When `<path>` names a regular file or symlink, it is a leaf entry rather than a
+subtree. Its add, modification, or deletion is applied only to that entry, and
+the corresponding clone-root leaf is replaced or removed. If that leaf has a
+whole-file conflict, its conflict helper files are written alongside the leaf
+itself, exactly as for a full pull; the file-scope path is not prefixed again.
 
 After the operation:
 - The working tree's `<path>` matches the remote root.

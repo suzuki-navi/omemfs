@@ -325,10 +325,15 @@ fn pull_scoped(
         remote_diff: HashMap<String, DiffEntry>,
         local_diff: HashMap<String, DiffEntry>,
         remote_scoped_hash: Option<Hash>,
+        remote_scoped_entry: Option<TreeEntry>,
+        is_leaf: bool,
         /// The clone-side hash at this scoped subtree root -- the base root
         /// a [line_merge] merge resolves each path's base blob against (see
         /// `resolve_line_merges`). Already computed above; stored here so
-        /// the merge pass does not need to re-navigate `clone_root`.
+        /// the merge pass does not need to re-navigate `clone_root`. For a
+        /// leaf (`is_leaf`) target this is the one-entry wrapper tree hash,
+        /// matching `remote_scoped_hash` and the diff-map keys, which are the
+        /// leaf's file name rather than a subtree-relative path.
         clone_scoped_hash: Option<Hash>,
     }
 
@@ -360,8 +365,32 @@ fn pull_scoped(
         // the read-through store, which fetches only the tree objects actually
         // traversed and only the subtrees that differ. Changed blob content is
         // fetched on demand in apply_diff.
-        let remote_scoped_hash = tree_ops::navigate(&remote_root, &components, &lazy)?;
-        let clone_scoped_hash = if let Some(ref cr) = clone_root {
+        let remote_scoped_entry = tree_ops::navigate_entry(&remote_root, &components, &lazy)?;
+        let clone_scoped_entry = if let Some(ref cr) = clone_root {
+            tree_ops::navigate_entry(cr, &components, &lazy)?
+        } else {
+            None
+        };
+        // `navigate` returns a blob hash for a file leaf. Diffing that hash as
+        // a tree attempts to parse file content as JSON, so compare leaf entries
+        // through one-entry wrapper trees instead.
+        let is_leaf = !matches!(remote_scoped_entry.as_ref(), Some(TreeEntry::Tree { .. }))
+            && !matches!(clone_scoped_entry.as_ref(), Some(TreeEntry::Tree { .. }))
+            && (remote_scoped_entry.is_some() || clone_scoped_entry.is_some());
+        let remote_scoped_hash = if is_leaf {
+            remote_scoped_entry
+                .as_ref()
+                .map(|entry| tree_ops::build_and_store(vec![entry.clone()], &local))
+                .transpose()?
+        } else {
+            tree_ops::navigate(&remote_root, &components, &lazy)?
+        };
+        let clone_scoped_hash = if is_leaf {
+            clone_scoped_entry
+                .as_ref()
+                .map(|entry| tree_ops::build_and_store(vec![entry.clone()], &local))
+                .transpose()?
+        } else if let Some(ref cr) = clone_root {
             tree_ops::navigate(cr, &components, &lazy)?
         } else {
             None
@@ -407,19 +436,27 @@ fn pull_scoped(
         // pull_scoped's per-path scan below.
         let scoped_abs = repo.work_dir.join(rel);
         let working_scoped_hash = if scoped_abs.exists() {
-            let phase = crate::progress::begin_phase("Scan working tree");
-            let scan_result = scan_and_store_with_cache(
-                &repo.work_dir,
-                &scoped_abs,
-                &local,
-                clone_root_flat.as_ref(),
-                &stat_cache,
-                false,
-            )?;
-            let file_count = scan_result.files.len();
-            scanned_files.extend(scan_result.files);
-            phase.complete(format!("{} files", file_count));
-            Some(scan_result.root_hash)
+            if is_leaf {
+                Some(scan_file_as_tree(
+                    &scoped_abs,
+                    components.last().unwrap(),
+                    &local,
+                )?)
+            } else {
+                let phase = crate::progress::begin_phase("Scan working tree");
+                let scan_result = scan_and_store_with_cache(
+                    &repo.work_dir,
+                    &scoped_abs,
+                    &local,
+                    clone_root_flat.as_ref(),
+                    &stat_cache,
+                    false,
+                )?;
+                let file_count = scan_result.files.len();
+                scanned_files.extend(scan_result.files);
+                phase.complete(format!("{} files", file_count));
+                Some(scan_result.root_hash)
+            }
         } else {
             None
         };
@@ -436,6 +473,8 @@ fn pull_scoped(
             remote_diff,
             local_diff,
             remote_scoped_hash,
+            remote_scoped_entry,
+            is_leaf,
             clone_scoped_hash,
         });
     }
@@ -487,8 +526,21 @@ fn pull_scoped(
         // (a key in pd.remote_diff/pd.local_diff) is relative to the scoped
         // subtree root (pd.rel), not the repo root, so the repo-root-relative
         // path for the FilterSet lookup is `pd.rel` joined with `path`.
-        let scoped_abs = repo.work_dir.join(&pd.rel);
-        let rel_prefix = pd.rel.clone();
+        //
+        // For a leaf-entry scope target (`omemfs pull <file>`) the diff maps
+        // compare one-entry wrapper trees, so their keys are the leaf's own
+        // file name; both the working-tree join base and the reporting prefix
+        // must therefore be the leaf's PARENT directory -- exactly the same
+        // adjustment the apply phase below makes for its `scoped_abs`.
+        let (scoped_abs, rel_prefix) = if pd.is_leaf {
+            let parent_rel = match pd.rel.rsplit_once('/') {
+                Some((parent, _)) => parent.to_string(),
+                None => String::new(),
+            };
+            (repo.work_dir.join(&parent_rel), parent_rel)
+        } else {
+            (repo.work_dir.join(&pd.rel), pd.rel.clone())
+        };
         resolved_by_pd[i] = resolve_line_merges(
             &mut conflicts,
             &pd.remote_diff,
@@ -498,7 +550,9 @@ fn pull_scoped(
             pd.clone_scoped_hash.as_ref(),
             &lazy,
             move |p| {
-                if p.is_empty() {
+                if rel_prefix.is_empty() {
+                    p.to_string()
+                } else if p.is_empty() {
                     rel_prefix.clone()
                 } else {
                     format!("{}/{}", rel_prefix, p)
@@ -517,24 +571,34 @@ fn pull_scoped(
         // Pre-compute clone_scoped_hash once per pd that owns at least one conflict.
         let mut clone_scoped_by_pd: Vec<Option<Hash>> = vec![None; path_diffs.len()];
         for &i in conflict_owner.values() {
-            if clone_scoped_by_pd[i].is_none()
-                && let Some(ref cr) = clone_root
-            {
-                let comps: Vec<&str> = path_diffs[i]
-                    .components
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect();
-                clone_scoped_by_pd[i] = tree_ops::navigate(cr, &comps, &lazy)?;
+            if clone_scoped_by_pd[i].is_none() {
+                clone_scoped_by_pd[i] = if path_diffs[i].is_leaf {
+                    // Leaf scopes use a one-entry wrapper tree for their diff keys.
+                    path_diffs[i].clone_scoped_hash.clone()
+                } else if let Some(ref cr) = clone_root {
+                    let comps: Vec<&str> = path_diffs[i]
+                        .components
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect();
+                    tree_ops::navigate(cr, &comps, &lazy)?
+                } else {
+                    None
+                };
             }
         }
         // Write conflict helpers for each conflicting path.
         for path in &all_conflicts {
             let i = conflict_owner[path];
             let pd = &path_diffs[i];
-            // The conflict path key is relative to the scoped subtree root, so it
-            // must be joined under the scoped prefix (pd.rel), not the repo root.
-            let abs = repo.work_dir.join(&pd.rel).join(path);
+            // The conflict path key is relative to the scoped subtree root. A leaf
+            // scope wraps its file in a one-entry tree, so its key is the leaf name
+            // itself and must be joined onto the leaf parent, not `pd.rel` again.
+            let abs = if pd.is_leaf {
+                repo.work_dir.join(&pd.rel).parent().unwrap().join(path)
+            } else {
+                repo.work_dir.join(&pd.rel).join(path)
+            };
             let clone_scoped_hash = clone_scoped_by_pd[i].as_ref();
             write_conflict_for_path(
                 &abs,
@@ -557,7 +621,11 @@ fn pull_scoped(
     {
         let phase = crate::progress::begin_phase("Apply changes");
         for (i, pd) in path_diffs.iter().enumerate() {
-            let scoped_abs = repo.work_dir.join(&pd.rel);
+            let scoped_abs = if pd.is_leaf {
+                repo.work_dir.join(&pd.rel).parent().unwrap().to_path_buf()
+            } else {
+                repo.work_dir.join(&pd.rel)
+            };
             total_changed += apply_diff(
                 &pd_clean[i],
                 &scoped_abs,
@@ -584,12 +652,21 @@ fn pull_scoped(
         // Splice reads intermediate clone_root tree objects along the path,
         // which may be absent locally after a lazy clone; route through lazy.
         // Newly-built trees are written to the local cache by `build_and_store`.
-        new_clone_root = Some(splice_into_clone_root(
-            new_clone_root.as_ref(),
-            &comps,
-            pd.remote_scoped_hash.as_ref(),
-            &lazy,
-        )?);
+        new_clone_root = Some(if pd.is_leaf {
+            splice_entry_into_clone_root(
+                new_clone_root.as_ref(),
+                &comps,
+                pd.remote_scoped_entry.clone(),
+                &lazy,
+            )?
+        } else {
+            splice_into_clone_root(
+                new_clone_root.as_ref(),
+                &comps,
+                pd.remote_scoped_hash.as_ref(),
+                &lazy,
+            )?
+        });
     }
     if let Some(ref cr) = new_clone_root {
         repo.write_clone_root(cr)?;
@@ -1442,6 +1519,49 @@ fn paint_diff_entry(colored: bool, styles: &Styles, path: &str, label: &str) -> 
     };
     let label_str = paint(colored, label_style, label);
     format!("{}: {}", label_str, path)
+}
+
+/// Build a one-entry tree for a regular-file scope without scanning sibling paths.
+fn scan_file_as_tree(
+    path: &std::path::Path,
+    name: &str,
+    store: &dyn ObjectStore,
+) -> Result<Hash, Error> {
+    let metadata = fs::symlink_metadata(path)?;
+    let entry = if metadata.file_type().is_symlink() {
+        TreeEntry::Symlink {
+            name: name.to_string(),
+            target: fs::read_link(path)?.to_string_lossy().into_owned(),
+            mtime: crate::fsmeta::mtime_from_metadata(&metadata),
+        }
+    } else {
+        TreeEntry::Blob {
+            name: name.to_string(),
+            hash: crate::codec::chunk::hash_file(path)?,
+            mtime: crate::fsmeta::mtime_from_metadata(&metadata),
+            size: metadata.len(),
+            mode: crate::fsmeta::mode_from_metadata(&metadata),
+        }
+    };
+    tree_ops::build_and_store(vec![entry], store)
+}
+
+/// Splice a leaf entry into `base_root`, or remove it when the remote deleted it.
+fn splice_entry_into_clone_root(
+    base_root: Option<&Hash>,
+    components: &[&str],
+    entry: Option<TreeEntry>,
+    store: &dyn ObjectStore,
+) -> Result<Hash, Error> {
+    match entry {
+        Some(entry) => tree_ops::splice_entry(base_root, components, entry, store),
+        None => {
+            let base =
+                base_root.ok_or_else(|| Error::Other("no base root to remove from".to_string()))?;
+            tree_ops::remove_entry(base, components, store)?
+                .ok_or_else(|| Error::Other("entry not found in clone_root".to_string()))
+        }
+    }
 }
 
 /// Splice `new_hash` at `components` into `base_root`. If `new_hash` is

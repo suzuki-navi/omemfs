@@ -166,6 +166,28 @@ setup_two_clones() {
     [[ "$output" == *"Already up to date"* ]]
 }
 
+@test "pull: path-scoped pull updates .omemfs-filter as a regular file" {
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone1
+    [ "$status" -eq 0 ]
+    cd clone1
+    printf '[ignore]\nold/\n' > .omemfs-filter
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" clone2
+    [ "$status" -eq 0 ]
+
+    cd clone1
+    printf '[ignore]\nnew/\n' > .omemfs-filter
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ../clone2
+
+    run "$OMEMFS" pull .omemfs-filter
+    [ "$status" -eq 0 ]
+    [ "$(cat .omemfs-filter)" = $'[ignore]\nnew/' ]
+}
+
 @test "pull: scoped pull of an unchanged path downloads no subtree objects" {
     run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone1
     [ "$status" -eq 0 ]
@@ -478,6 +500,31 @@ setup_two_clones() {
     [ "$(cat src/file.txt)" = "local change" ]
     [ -f src/file.txt.omemfs-conflict-local ]
     [ -f src/file.txt.omemfs-conflict-remote ]
+}
+
+@test "pull: single-file scoped pull writes conflict helpers beside the leaf" {
+    setup_two_clones
+
+    cd clone2
+    run "$OMEMFS" pull
+    [ "$status" -eq 0 ]
+    echo "local change" > file.txt
+
+    cd ../clone1
+    echo "remote change" > file.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    cd ../clone2
+    run "$OMEMFS" pull file.txt
+    [ "$status" -ne 0 ]
+    [ "$(cat file.txt)" = "local change" ]
+    [ -f file.txt.omemfs-conflict-base ]
+    [ -f file.txt.omemfs-conflict-local ]
+    [ -f file.txt.omemfs-conflict-remote ]
+    [ "$(cat file.txt.omemfs-conflict-base)" = "hello" ]
+    [ "$(cat file.txt.omemfs-conflict-local)" = "local change" ]
+    [ "$(cat file.txt.omemfs-conflict-remote)" = "remote change" ]
 }
 
 @test "pull: multi nested scoped pull writes conflict helpers at the correct path" {
@@ -979,14 +1026,11 @@ setup_two_clones() {
 }
 
 @test "pull: line-merges .zsh_history via a scoped pull" {
-    # Scoped to a subdirectory (not the bare filename) so this exercises the
-    # pd.rel-prefixed diff-map-key join that pull_scoped's per-path loop uses
-    # for nested paths (see src/commands/pull.rs pull_scoped, `format!("{}/{}",
-    # pd.rel, path)`). A bare leaf-file scope target (e.g. `pull .zsh_history`
-    # at the repo root) hits a separate, pre-existing limitation in
-    # pull_scoped/diff_trees/splice_into_clone_root (they assume the scoped
-    # path resolves to a tree hash) that is unrelated to line_merge and out of
-    # scope for this change.
+    # Scoped to a subdirectory so this exercises the pd.rel-prefixed
+    # diff-map-key join that pull_scoped's per-path loop uses for nested
+    # paths (see src/commands/pull.rs pull_scoped, `format!("{}/{}", pd.rel,
+    # path)`). The bare-filename leaf-scope case (e.g. `pull .zsh_history` at
+    # the repo root) is covered separately below.
     run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone1
     [ "$status" -eq 0 ]
     run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone2
@@ -1020,6 +1064,48 @@ setup_two_clones() {
     grep -q "cmd_100" logs/.zsh_history
     grep -q "cmd_local" logs/.zsh_history
     grep -q "cmd_remote" logs/.zsh_history
+
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+}
+
+@test "pull: line-merges .zsh_history via a bare-filename leaf scope" {
+    # Regression: unlike the subdirectory-scoped case above, a bare leaf-file
+    # scope target (`pull .zsh_history` at the repo root) resolves its diff
+    # via the leaf-scope wrapper tree path in pull_scoped, not the
+    # pd.rel-prefixed nested-path join. Line merging must still succeed here.
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone1
+    [ "$status" -eq 0 ]
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone2
+    [ "$status" -eq 0 ]
+
+    cd clone1
+    printf ': 100:0;cmd_100\n' > .zsh_history
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    cd ../clone2
+    run "$OMEMFS" pull .zsh_history
+    [ "$status" -eq 0 ]
+    [ "$(cat .zsh_history)" = ": 100:0;cmd_100" ]
+    printf ': 200:0;cmd_local\n' >> .zsh_history
+
+    cd ../clone1
+    printf ': 300:0;cmd_remote\n' >> .zsh_history
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    # clone2: bare-filename scoped pull should merge cleanly, not conflict.
+    cd ../clone2
+    run "$OMEMFS" pull .zsh_history
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"erged"* ]]
+    [ ! -f .zsh_history.omemfs-conflict-base ]
+    [ ! -f .zsh_history.omemfs-conflict-local ]
+    [ ! -f .zsh_history.omemfs-conflict-remote ]
+    grep -q "cmd_100" .zsh_history
+    grep -q "cmd_local" .zsh_history
+    grep -q "cmd_remote" .zsh_history
 
     run "$OMEMFS" push
     [ "$status" -eq 0 ]

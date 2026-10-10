@@ -28,6 +28,10 @@ anyhow = "1"
 # Path utilities
 walkdir = "2"
 
+# Line-level diff engine for the three-way [line_merge] merge
+# (see src/line_merge.rs and design/15_line_history_merge.md)
+similar = "2"
+
 # Data-parallel directory walk + per-file hashing (persistent global pool).
 # See src/scan.rs and design/03 "Parallel walk and hash computation".
 rayon = "1"
@@ -84,9 +88,6 @@ bytes = "1"
 # Stream combinators (StreamExt::next) for draining the Azure list_blobs Pager
 futures = "0.3"
 unicode-width = { version = "0.2", features = ["cjk"] }
-
-# Line-level diff for the [line_merge] pull fast path (design/15)
-similar = "2"
 
 
 [build-dependencies]
