@@ -1,12 +1,19 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
+
+use rayon::prelude::*;
 
 use crate::codec;
+use crate::codec::chunk::blob_fully_cached;
 use crate::dtimer_l1;
 use crate::error::Error;
-use crate::object::{Tree, TreeEntry};
+use crate::io_stats;
+use crate::object::{Hash, Tree, TreeEntry};
 use crate::repo::Repo;
 use crate::store::ObjectStore;
+use crate::store::stats::IoRecord;
 use crate::stub::{self, StubRecord, StubTargetType};
 use crate::term::{ColorChoice, Styles, color_enabled, paint};
 use crate::tree_ops;
@@ -18,9 +25,31 @@ pub struct RestoreOptions {
     /// Paths to restore. Empty means the entire working tree.
     pub paths: Vec<PathBuf>,
     pub dry_run: bool,
+    /// Remote to fetch missing objects from, if the plan finds any (default: "origin").
+    pub remote_name: String,
+    /// Never contact the remote at all, including to heal a missing
+    /// clone_root tree object. A path that would otherwise need a fetch is
+    /// left un-restored and reported under `unavailable:` instead.
+    pub no_remote: bool,
 }
 
+/// `restore` runs in three phases -- see `design/04_cli_spec.md`, "omemfs
+/// restore" Behaviour:
+///
+/// 1. Plan (`plan_restore` below): walk `clone_root` against the working
+///    tree, purely locally, deciding every [`Action`] without writing
+///    anything. Blobs needing content that is not [`blob_fully_cached`] are
+///    collected into `Plan::pending`; clone_root tree objects the walk could
+///    not read locally are collected into `Plan::unresolved_trees`.
+/// 2. Fetch: skipped entirely -- no remote config read, no cloud client
+///    built -- when both collections are empty. Otherwise, unresolved trees
+///    are healed and the plan is re-run (looping until stable), then every
+///    pending blob is fetched in one batched transfer.
+/// 3. Apply: every planned action is applied. An action whose blob could not
+///    be resolved in phase 2 is skipped and reported under `unavailable:`
+///    instead, rather than failing with a bare "object not found: <hash>".
 pub fn run(opts: RestoreOptions) -> Result<(), Error> {
+    let started = std::time::Instant::now();
     let repo = Repo::open(&opts.work_dir)?;
     crate::progress::notify_repo_dir(&repo.work_dir);
     let _lock = repo.acquire_lock()?;
@@ -33,72 +62,512 @@ pub fn run(opts: RestoreOptions) -> Result<(), Error> {
     // When no paths given, restore the entire working tree (the repo root),
     // regardless of the cwd. Unlike push/pull/ls, restore does not narrow its
     // no-argument default to the cwd subtree (design/04 restore Arguments).
-    let paths = if opts.paths.is_empty() {
+    let paths: Vec<PathBuf> = if opts.paths.is_empty() {
         vec![opts.work_dir.clone()]
     } else {
-        opts.paths
+        opts.paths.clone()
     };
 
-    let phase = crate::progress::begin_phase("Restore working tree");
-    let mut counts = Counts::default();
-    for path in &paths {
-        let rel = crate::repo::normalize_path(path, &repo.work_dir, &opts.current_dir)?;
-        if rel.is_empty() {
-            // cwd is repo root: full restore
-            restore_tree(
-                &clone_root,
-                &repo.work_dir,
-                &repo.work_dir,
-                &local,
-                &repo.work_dir,
-                opts.dry_run,
-                &mut counts,
-            )?;
-            remove_added_files(
-                &clone_root,
-                &repo.work_dir,
-                &repo.work_dir,
-                &local,
-                &repo.work_dir,
-                opts.dry_run,
-                &mut counts,
-            )?;
+    // ------------------------------------------------------------------
+    // Phase 1: Plan. Local-only; makes no write of any kind.
+    // ------------------------------------------------------------------
+    let phase1 = crate::progress::begin_phase("Plan restore");
+    let mut plan = plan_restore(
+        &clone_root,
+        &paths,
+        &repo.work_dir,
+        &opts.current_dir,
+        &local,
+    )?;
+    phase1.complete(format!("{} action(s)", plan.actions.len()));
+
+    if opts.dry_run {
+        // --dry-run stops here: zero remote I/O, zero local cache writes
+        // (design/04_cli_spec.md, "omemfs restore" Options).
+        let counts = report_plan(&plan, &local, &repo.work_dir)?;
+        print_summary(&counts, true);
+        return Ok(());
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 2: Fetch missing objects. Skipped entirely when nothing is
+    // missing, which keeps a fully-cached restore exactly as offline-safe
+    // as it was before this feature existed (no `repo.pack_reader()` call
+    // at all in that case).
+    // ------------------------------------------------------------------
+    let io_record = Arc::new(IoRecord::default());
+    let mut unavailable_hashes: HashSet<Hash> = HashSet::new();
+    // The first non-recoverable fetch failure encountered anywhere in Phase
+    // 2 (opening the remote, healing a tree object, or the batched blob
+    // transfer). Kept (rather than discarded, as before) so its real cause
+    // can be reported once, after the summary, instead of every genuine
+    // failure -- auth/DEK mismatch, remote data corruption, a misconfigured
+    // or mistyped `--remote`, a full local disk -- silently degrading into
+    // an indistinguishable `unavailable:` line. `Error::is_recoverable_
+    // fetch_miss` (`src/error.rs`) decides which failures are ordinary
+    // "not fetched into this clone yet" cases that need no such warning.
+    let mut fetch_warning: Option<Error> = None;
+    if !plan.pending.is_empty() || !plan.unresolved_trees.is_empty() {
+        let phase2 = crate::progress::begin_phase("Fetch objects");
+        if opts.no_remote {
+            unavailable_hashes.extend(plan.pending.iter().cloned());
+            phase2.complete("skipped (--no-remote)");
         } else {
-            restore_path(
-                &rel,
-                &clone_root,
-                &repo.work_dir,
-                &local,
-                &repo.work_dir,
-                opts.dry_run,
-                &mut counts,
-            )?;
+            match repo.pack_reader(&opts.remote_name, Some(&io_record)) {
+                Ok((pack_reader, _remote, remote_key)) => {
+                    let remote_key = remote_key.as_ref();
+
+                    // Heal every clone_root tree object the plan could not
+                    // read locally, then re-run the plan from scratch so the
+                    // newly-healed subtree's own actions (and possibly its
+                    // own further-unresolved trees) are picked up. Loop
+                    // until no new hash remains to try. A hash that fails to
+                    // heal is never retried again in this run.
+                    //
+                    // Each iteration heals every currently-unresolved hash
+                    // concurrently rather than one at a time (design/02_
+                    // storage_format.md, "Multi-root batching" -- the same
+                    // principle the batched blob transfer below, and
+                    // `expand`'s parallel walk, already apply): healing one
+                    // tree object never discovers further hashes to heal in
+                    // the same pass (new unresolved trees only surface after
+                    // the `plan_restore` re-run), so a plain parallel map
+                    // over `to_heal` is enough -- no shared queue/visited-set
+                    // machinery is needed.
+                    //
+                    // `MAX_HEAL_ITERATIONS` is a safety net, not an expected
+                    // limit: real clone_root hierarchies are nowhere near
+                    // this deep, so hitting it only happens in a bug
+                    // scenario. When it does, whatever is left over is
+                    // reported under `unavailable:` in Phase 3 exactly like
+                    // any other permanently-unresolved hash, rather than the
+                    // command hanging or erroring out.
+                    const MAX_HEAL_ITERATIONS: usize = 10_000;
+                    let mut permanently_unresolved: HashSet<Hash> = HashSet::new();
+                    let mut iterations = 0usize;
+                    loop {
+                        let to_heal: Vec<Hash> = plan
+                            .unresolved_trees
+                            .iter()
+                            .filter(|(h, _)| !permanently_unresolved.contains(h))
+                            .map(|(h, _)| h.clone())
+                            .collect();
+                        if to_heal.is_empty() {
+                            break;
+                        }
+                        iterations += 1;
+                        if iterations > MAX_HEAL_ITERATIONS {
+                            permanently_unresolved.extend(to_heal);
+                            break;
+                        }
+                        let results: Vec<(Hash, Result<Vec<u8>, Error>)> = to_heal
+                            .par_iter()
+                            .map(|hash| {
+                                (
+                                    hash.clone(),
+                                    codec::ensure_local_then_read(
+                                        &pack_reader,
+                                        &local,
+                                        hash,
+                                        remote_key,
+                                    ),
+                                )
+                            })
+                            .collect();
+                        let mut healed_any = false;
+                        for (hash, result) in results {
+                            match result {
+                                Ok(_) => healed_any = true,
+                                Err(e) => {
+                                    if fetch_warning.is_none() && !e.is_recoverable_fetch_miss() {
+                                        fetch_warning = Some(e);
+                                    }
+                                    permanently_unresolved.insert(hash);
+                                }
+                            }
+                        }
+                        if !healed_any {
+                            break;
+                        }
+                        plan = plan_restore(
+                            &clone_root,
+                            &paths,
+                            &repo.work_dir,
+                            &opts.current_dir,
+                            &local,
+                        )?;
+                    }
+                    // Whatever remains in `plan.unresolved_trees` at this
+                    // point (only entries `permanently_unresolved` failed to
+                    // heal, since a successful heal drops out of the next
+                    // `plan_restore` re-run above) is reported by path in
+                    // Phase 3 directly from `plan.unresolved_trees` -- no
+                    // separate hash-keyed bookkeeping needed here.
+
+                    // One batched, concurrent, SnapshotOnly transfer for
+                    // every blob still missing after healing (never
+                    // LiveFallback -- see design/02_storage_format.md,
+                    // "Snapshot read path"). A failure here (e.g. the
+                    // remote becomes unreachable partway through) is not
+                    // fatal to the whole command: whatever could not be
+                    // transferred is simply still missing afterward, and is
+                    // reported per-path in phase 3 rather than aborting. Its
+                    // cause, when not an ordinary cache miss, is still
+                    // captured for the end-of-run warning.
+                    let pending_before = plan.pending.len();
+                    if let Err(e) = crate::commands::push::transfer_objects_many(
+                        &pack_reader,
+                        &local,
+                        &plan.pending,
+                        remote_key,
+                        true,
+                    ) && fetch_warning.is_none()
+                        && !e.is_recoverable_fetch_miss()
+                    {
+                        fetch_warning = Some(e);
+                    }
+                    let mut still_missing = 0usize;
+                    for hash in &plan.pending {
+                        if !blob_fully_cached(&local, hash)? {
+                            unavailable_hashes.insert(hash.clone());
+                            still_missing += 1;
+                        }
+                    }
+                    phase2.complete(format!(
+                        "{} object(s) fetched",
+                        pending_before.saturating_sub(still_missing)
+                    ));
+                }
+                Err(e) => {
+                    // Remote not configured, or otherwise could not be
+                    // opened at all: degrade exactly like --no-remote
+                    // rather than aborting the whole command. `plan` is left
+                    // untouched, so its `unresolved_trees` (Phase 1's) is
+                    // exactly what Phase 3 reports. The real cause (e.g. a
+                    // misconfigured or mistyped remote name) is still
+                    // captured for the end-of-run warning, unless it is an
+                    // ordinary "remote unreachable" case.
+                    if !e.is_recoverable_fetch_miss() {
+                        fetch_warning = Some(e);
+                    }
+                    unavailable_hashes.extend(plan.pending.iter().cloned());
+                    phase2.complete("remote unavailable");
+                }
+            }
         }
     }
-    phase.complete(format!("{} files", counts.restored + counts.deleted));
-    print_summary(&counts, opts.dry_run);
+
+    // ------------------------------------------------------------------
+    // Phase 3: Apply.
+    // ------------------------------------------------------------------
+    let phase3 = crate::progress::begin_phase("Restore working tree");
+    let mut counts = Counts::default();
+    let mut unavailable_paths: Vec<String> = Vec::new();
+    for action in plan.actions {
+        apply_action(
+            action,
+            &repo.work_dir,
+            &repo.work_dir,
+            &local,
+            &unavailable_hashes,
+            &mut counts,
+            &mut unavailable_paths,
+        )?;
+    }
+    // A directory whose clone_root tree object could never be read (locally
+    // or, after phase 2, from the remote) has no action at all in `plan` --
+    // there was nothing to enumerate underneath it. Report it by path here,
+    // directly from the plan's final `unresolved_trees`, rather than
+    // silently skipping it.
+    for (_, rel) in &plan.unresolved_trees {
+        print_action(false, "unavailable", rel);
+        counts.unavailable += 1;
+        unavailable_paths.push(rel.clone());
+    }
+    phase3.complete(format!("{} file(s)", counts.restored + counts.deleted));
+    print_summary(&counts, false);
+
+    // Problem 3 (design/04_cli_spec.md, "omemfs restore" -> "Missing
+    // objects"): a fetch failure that is not an ordinary "not yet fetched"
+    // cache miss gets one explicit line naming its real cause, printed after
+    // the summary rather than only ever showing up as an unexplained
+    // `unavailable:` path.
+    if let Some(e) = &fetch_warning {
+        eprintln!("warning: fetch from '{}' failed: {}", opts.remote_name, e);
+    }
+
+    let duration_ms = started.elapsed().as_millis() as u64;
+    io_stats::append_record(
+        &repo.work_dir.join(".omemfs"),
+        "restore",
+        &opts.remote_name,
+        &io_record,
+        duration_ms,
+    );
+
+    if !unavailable_paths.is_empty() {
+        return Err(Error::Other(format!(
+            "{} path(s) could not be restored",
+            unavailable_paths.len()
+        )));
+    }
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Core helpers
+// Plan / Action
 // ---------------------------------------------------------------------------
 
-#[derive(Default)]
-struct Counts {
-    restored: usize,
-    deleted: usize,
+/// One elementary decision made by the plan phase, reusing exactly the same
+/// predicates the pre-3-phase implementation applied inline
+/// (`needs_restore_blob`, `crate::fsmeta::mode_matches`, the stub-reconcile
+/// branch conditions, `conflict_helpers_exist`). Building a `Plan` writes
+/// nothing to the working tree, `.omemfs/objects/`, or any stub file.
+enum Action {
+    /// Overwrite `rel` with the blob at `hash` (content differs).
+    RestoreBlobContent {
+        rel: String,
+        hash: Hash,
+        mtime: Option<chrono::DateTime<chrono::Utc>>,
+        mode: Option<String>,
+    },
+    /// Content at `rel` already matches; only the executable-bit mode needs
+    /// fixing (chmod, no content rewrite -- no fetch needed either).
+    RestoreBlobModeOnly {
+        rel: String,
+        mode: Option<String>,
+    },
+    /// Content and mode both already match; nothing visible to restore, but
+    /// stray conflict helper files (if any) are still cleaned up silently.
+    CleanupOnly { rel: String },
+    RestoreSymlink {
+        rel: String,
+        target: String,
+        mtime: Option<chrono::DateTime<chrono::Utc>>,
+    },
+    /// `rel` (an explicitly-named path) is absent from `clone_root`: delete
+    /// whichever of a file/file-stub and a directory-stub is present, and
+    /// clean up conflict helpers unconditionally either way.
+    DeleteAbsent {
+        rel: String,
+        delete_file: bool,
+        delete_dir_stub: bool,
+    },
+    /// A locally-added file or symlink with no entry in `clone_root` at all
+    /// (found while scanning a directory for extras): delete it.
+    DeleteFile { rel: String },
+    /// A locally-added directory with no entry in `clone_root` at all:
+    /// delete it and everything under it, recursively, at apply/report time.
+    DeleteAddedDir { rel: String },
+    /// Ensure an (empty) directory exists, restoring an empty tree entry.
+    EnsureDir { rel: String },
+    /// A stray file stub whose logical entry is no longer in `clone_root`,
+    /// found while scanning a directory for extras.
+    DeleteOrphanFileStub {
+        logical_rel: String,
+        stub_abs: PathBuf,
+    },
+    ReconcileFileStubToBlob {
+        rel: String,
+        hash: Hash,
+        size: u64,
+        mtime: Option<chrono::DateTime<chrono::Utc>>,
+        mode: Option<String>,
+    },
+    ReconcileDirStubToTree {
+        rel: String,
+        hash: Hash,
+        size: u64,
+        mtime: Option<chrono::DateTime<chrono::Utc>>,
+        blob_count: u64,
+    },
+    ReconcileDirStubToBlob {
+        rel: String,
+        hash: Hash,
+        size: u64,
+        mtime: Option<chrono::DateTime<chrono::Utc>>,
+        mode: Option<String>,
+    },
+    ReconcileFileStubToTree {
+        rel: String,
+        hash: Hash,
+        size: u64,
+        mtime: Option<chrono::DateTime<chrono::Utc>>,
+        blob_count: u64,
+    },
 }
 
-/// Restore a single relative path (file or directory) from clone_root.
-fn restore_path(
+/// Result of the plan phase: every action `restore` intends to take, plus
+/// everything it would need from the remote to carry all of them out. See
+/// `04_cli_spec.md`, "omemfs restore" -> "Missing objects".
+#[derive(Default)]
+struct Plan {
+    actions: Vec<Action>,
+    /// Blob hashes named by a `RestoreBlobContent` action that are not (yet)
+    /// [`blob_fully_cached`] in the local cache.
+    pending: Vec<Hash>,
+    /// `clone_root` tree object hashes the plan walk needed to read but which
+    /// were absent from the local cache, paired with the working-tree path
+    /// whose subtree that object roots (kept so an unhealed entry can still
+    /// be reported under `unavailable:` by path -- see `run`'s Phase 3).
+    /// Healing one (fetching it from the remote into the local cache) and
+    /// re-running the plan may reveal further actions -- and further entries
+    /// here -- for the subtree it roots.
+    unresolved_trees: Vec<(Hash, String)>,
+}
+
+/// Build the full [`Plan`] for `paths` (or the whole working tree when
+/// `paths` is exactly `[work_dir]`, matching `run`'s no-argument default).
+/// Purely local and side-effect-free: safe to call repeatedly (`run`'s Phase
+/// 2 heal loop does) and safe to call for `--dry-run`.
+fn plan_restore(
+    clone_root: &Hash,
+    paths: &[PathBuf],
+    work_dir: &std::path::Path,
+    current_dir: &std::path::Path,
+    local: &dyn ObjectStore,
+) -> Result<Plan, Error> {
+    let mut plan = Plan::default();
+    let rels: Vec<String> = paths
+        .iter()
+        .map(|path| crate::repo::normalize_path(path, work_dir, current_dir))
+        .collect::<Result<Vec<_>, _>>()?;
+    // Problem 1 (design/04_cli_spec.md, "omemfs restore" Arguments):
+    // deduplicate and collapse ancestor/descendant relationships among the
+    // requested paths BEFORE planning anything. Without this, `restore sub
+    // sub` (an exact duplicate) or `restore . sub` (an overlap) planned --
+    // and therefore deleted -- the same locally-added file once per matching
+    // argument; the second `fs::remove_file` for it hit a bare ENOENT and
+    // aborted Apply entirely.
+    let rels = collapse_dedup_paths(rels);
+    for rel in &rels {
+        if rel.is_empty() {
+            plan_tree(clone_root, work_dir, work_dir, local, work_dir, &mut plan)?;
+            plan_remove_added_files(clone_root, work_dir, work_dir, local, work_dir, &mut plan)?;
+        } else {
+            plan_path(rel, clone_root, work_dir, local, work_dir, &mut plan)?;
+        }
+    }
+    // plan_tree and plan_remove_added_files independently read the same
+    // clone_root tree object for the same directory, so a directory whose
+    // tree object is unreadable is recorded twice (once by each walk).
+    // Deduplicate by path so Phase 3 never reports the same unavailable
+    // directory more than once.
+    let mut seen_rels: HashSet<String> = HashSet::new();
+    plan.unresolved_trees
+        .retain(|(_, rel)| seen_rels.insert(rel.clone()));
+    // Insurance against any other source of duplicate actions (e.g. a future
+    // planning path that does not go through `collapse_dedup_paths` above):
+    // an exact duplicate -- same path AND same action kind -- is dropped
+    // rather than applied twice. This is a safety net, not the primary fix;
+    // the primary fix is the path-level dedup above plus the NotFound-
+    // tolerant deletes in `apply_action`.
+    dedup_actions(&mut plan.actions);
+    Ok(plan)
+}
+
+/// Deduplicate `rels` and collapse any path that is an ancestor of (or
+/// identical to) another into a single occurrence of the ancestor. An empty
+/// string (the whole working tree) is the ultimate ancestor of every other
+/// path, so its presence anywhere in `rels` collapses the whole list to just
+/// `[""]`.
+fn collapse_dedup_paths(rels: Vec<String>) -> Vec<String> {
+    if rels.iter().any(|r| r.is_empty()) {
+        return vec![String::new()];
+    }
+    let mut kept: Vec<String> = Vec::new();
+    'outer: for rel in rels {
+        for existing in &kept {
+            if is_ancestor_or_equal(existing, &rel) {
+                continue 'outer;
+            }
+        }
+        // `rel` is not covered by anything already kept; drop any kept path
+        // that `rel` itself now covers (`rel` is its ancestor).
+        kept.retain(|existing| !is_ancestor_or_equal(&rel, existing));
+        kept.push(rel);
+    }
+    kept
+}
+
+/// Returns `true` if `ancestor` is `other` itself, or a path component
+/// prefix of it (`"sub"` is an ancestor of `"sub/nested.txt"` but not of
+/// `"subdir"`).
+fn is_ancestor_or_equal(ancestor: &str, other: &str) -> bool {
+    ancestor == other || other.starts_with(&format!("{}/", ancestor))
+}
+
+/// A stable identity for an `Action`, used only to detect and drop exact
+/// duplicates (same path, same kind) in `dedup_actions`. Not a full
+/// structural comparison -- two actions with the same identity but different
+/// payloads (e.g. a different `mode`) are still treated as duplicates, since
+/// by construction only one planning call ever produces an action for a
+/// given path (`collapse_dedup_paths` already prevents that call from
+/// running twice for equivalent input paths).
+fn action_identity(action: &Action) -> (&'static str, String) {
+    match action {
+        Action::RestoreBlobContent { rel, .. } => ("RestoreBlobContent", rel.clone()),
+        Action::RestoreBlobModeOnly { rel, .. } => ("RestoreBlobModeOnly", rel.clone()),
+        Action::CleanupOnly { rel } => ("CleanupOnly", rel.clone()),
+        Action::RestoreSymlink { rel, .. } => ("RestoreSymlink", rel.clone()),
+        Action::DeleteAbsent { rel, .. } => ("DeleteAbsent", rel.clone()),
+        Action::DeleteFile { rel } => ("DeleteFile", rel.clone()),
+        Action::DeleteAddedDir { rel } => ("DeleteAddedDir", rel.clone()),
+        Action::EnsureDir { rel } => ("EnsureDir", rel.clone()),
+        Action::DeleteOrphanFileStub {
+            logical_rel,
+            stub_abs,
+        } => (
+            "DeleteOrphanFileStub",
+            format!("{}::{}", logical_rel, stub_abs.display()),
+        ),
+        Action::ReconcileFileStubToBlob { rel, .. } => ("ReconcileFileStubToBlob", rel.clone()),
+        Action::ReconcileDirStubToTree { rel, .. } => ("ReconcileDirStubToTree", rel.clone()),
+        Action::ReconcileDirStubToBlob { rel, .. } => ("ReconcileDirStubToBlob", rel.clone()),
+        Action::ReconcileFileStubToTree { rel, .. } => ("ReconcileFileStubToTree", rel.clone()),
+    }
+}
+
+/// Drop exact duplicate actions (same path, same kind) -- see
+/// `action_identity`'s doc comment for what "duplicate" means here.
+fn dedup_actions(actions: &mut Vec<Action>) {
+    let mut seen: HashSet<(&'static str, String)> = HashSet::new();
+    actions.retain(|a| seen.insert(action_identity(a)));
+}
+
+/// Read the tree object at `hash` from `store` (the local cache). On
+/// `ObjectNotFound`, defer: record `(hash, rel)` in `plan.unresolved_trees`
+/// and return `Ok(None)` rather than erroring, so the caller can skip the
+/// subtree for now instead of aborting the whole plan walk. `rel` is the
+/// working-tree path of the directory `hash` roots, kept so this subtree can
+/// still be reported under `unavailable:` by path if it is never healed.
+fn read_tree_entries(
+    store: &dyn ObjectStore,
+    hash: &Hash,
     rel: &str,
-    clone_root: &crate::object::Hash,
+    plan: &mut Plan,
+) -> Result<Option<Vec<TreeEntry>>, Error> {
+    match codec::store_read(store, hash, None) {
+        Ok(data) => {
+            let Tree::Normal { entries } = Tree::deserialise(&data)?;
+            Ok(Some(entries))
+        }
+        Err(Error::ObjectNotFound(_)) => {
+            plan.unresolved_trees.push((hash.clone(), rel.to_string()));
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Plan a single relative path (file or directory) from clone_root.
+fn plan_path(
+    rel: &str,
+    clone_root: &Hash,
     work_dir: &std::path::Path,
     store: &dyn ObjectStore,
     stub_root: &std::path::Path,
-    dry_run: bool,
-    counts: &mut Counts,
+    plan: &mut Plan,
 ) -> Result<(), Error> {
     let components: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
     if components.is_empty() {
@@ -106,38 +575,33 @@ fn restore_path(
         return Ok(());
     }
 
-    let entry = tree_ops::navigate_entry(clone_root, &components, store)?;
+    let entry = match tree_ops::navigate_entry(clone_root, &components, store) {
+        Ok(e) => e,
+        Err(Error::ObjectNotFound(hex)) => {
+            // An ancestor's own clone_root tree object could not be read
+            // locally. Defer this path entirely; healing that tree object
+            // and re-planning may resolve it.
+            if let Ok(h) = Hash::from_hex(&hex) {
+                plan.unresolved_trees.push((h, rel.to_string()));
+            }
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
     let abs = work_dir.join(rel);
 
     match entry {
         None => {
-            // Path absent from clone_root: delete file/stubs from the working tree.
-            if abs.is_file() || stub::exists(stub_root, rel) {
-                if dry_run {
-                    print_action(true, "delete", rel);
-                } else {
-                    if abs.is_file() {
-                        fs::remove_file(&abs)?;
-                    }
-                    stub::remove(stub_root, rel)?;
-                    print_action(false, "delete", rel);
-                }
-                counts.deleted += 1;
-            }
-            if stub::dir_exists(stub_root, rel) {
-                if dry_run {
-                    print_action(true, "delete", rel);
-                } else {
-                    stub::remove_dir_stub(stub_root, rel)?;
-                    // Remove the directory if it is now empty.
-                    fs::remove_dir(&abs).ok();
-                    print_action(false, "delete", rel);
-                }
-                counts.deleted += 1;
-            }
-            if !dry_run {
-                remove_conflict_helpers(&abs);
-            }
+            // Path absent from clone_root: plan to delete file/stubs from
+            // the working tree, and unconditionally clean up any conflict
+            // helpers regardless of whether either delete applies.
+            let delete_file = abs.is_file() || stub::exists(stub_root, rel);
+            let delete_dir_stub = stub::dir_exists(stub_root, rel);
+            plan.actions.push(Action::DeleteAbsent {
+                rel: rel.to_string(),
+                delete_file,
+                delete_dir_stub,
+            });
         }
         Some(TreeEntry::Blob {
             hash,
@@ -148,45 +612,15 @@ fn restore_path(
         }) => {
             // Stub reconcile: update the stub record instead of materialising.
             if stub::exists(stub_root, rel) {
-                reconcile_file_stub_to_blob(
-                    stub_root, rel, &hash, size, &mtime, &mode, dry_run, counts,
-                )?;
+                plan_reconcile_file_stub_to_blob(stub_root, rel, &hash, size, &mtime, &mode, plan)?;
                 return Ok(());
             }
             // Type mismatch: dir stub where clone_root has a blob.
             if stub::dir_exists(stub_root, rel) {
-                reconcile_dir_stub_to_blob(
-                    &abs, stub_root, rel, &hash, size, &mtime, &mode, dry_run, counts,
-                )?;
+                plan_reconcile_dir_stub_to_blob(rel, &hash, size, &mtime, &mode, plan)?;
                 return Ok(());
             }
-
-            // Check if already matching. The mode is only consulted when the
-            // content matches (the file is then known to exist on disk).
-            let content_matches = !needs_restore_blob(&abs, stub_root, rel, &hash);
-            let already_matches = content_matches && crate::fsmeta::mode_matches(&abs, &mode);
-            if already_matches && !conflict_helpers_exist(&abs) {
-                return Ok(());
-            }
-            if dry_run {
-                if !already_matches {
-                    print_action(true, "restore", rel);
-                    counts.restored += 1;
-                }
-                return Ok(());
-            }
-            if !content_matches {
-                write_blob(&abs, &hash, &mtime, &mode, store, stub_root, rel)?;
-                print_action(false, "restore", rel);
-                counts.restored += 1;
-            } else if !already_matches {
-                // Content matches but the executable bit differs: chmod only,
-                // no content rewrite.
-                crate::fsmeta::apply_mode(&abs, &mode);
-                print_action(false, "restore", rel);
-                counts.restored += 1;
-            }
-            remove_conflict_helpers(&abs);
+            plan_restore_blob_action(&abs, rel, &hash, &mtime, &mode, store, stub_root, plan)?;
         }
         Some(TreeEntry::Tree {
             hash: tree_hash,
@@ -198,25 +632,20 @@ fn restore_path(
             // Stub reconcile: update the dir stub record.
             if stub::dir_exists(stub_root, rel) {
                 // Only update the stub record; do NOT recurse into the directory.
-                // Blobs under a dir stub are not in the local cache (design/08_stub_system.md),
-                // so recursing would cause spurious ObjectNotFound errors.
-                reconcile_dir_stub_to_tree(
-                    stub_root, rel, &tree_hash, size, &mtime, blob_count, dry_run, counts,
+                // Blobs under a dir stub are not in the local cache
+                // (design/08_stub_system.md), so recursing would cause
+                // spurious ObjectNotFound errors.
+                plan_reconcile_dir_stub_to_tree(
+                    stub_root, rel, &tree_hash, size, &mtime, blob_count, plan,
                 )?;
             } else if stub::exists(stub_root, rel) {
                 // Type mismatch: file stub where clone_root has a tree.
-                reconcile_file_stub_to_tree(
-                    &abs, stub_root, rel, &tree_hash, size, &mtime, blob_count, dry_run, counts,
-                )?;
+                plan_reconcile_file_stub_to_tree(rel, &tree_hash, size, &mtime, blob_count, plan)?;
             } else {
-                // Restore all descendants.
-                restore_tree(
-                    &tree_hash, &abs, work_dir, store, stub_root, dry_run, counts,
-                )?;
-                // Remove locally-added files under this directory.
-                remove_added_files(
-                    &tree_hash, &abs, work_dir, store, stub_root, dry_run, counts,
-                )?;
+                // Plan to restore all descendants.
+                plan_tree(&tree_hash, &abs, work_dir, store, stub_root, plan)?;
+                // Plan to delete locally-added files under this directory.
+                plan_remove_added_files(&tree_hash, &abs, work_dir, store, stub_root, plan)?;
             }
         }
         Some(TreeEntry::Symlink { target, mtime, .. }) => {
@@ -226,41 +655,84 @@ fn restore_path(
             if symlink_matches(&abs, &target) {
                 return Ok(());
             }
-            if dry_run {
-                print_action(true, "restore", rel);
-                counts.restored += 1;
-                return Ok(());
-            }
-            stub::remove(stub_root, rel).ok();
-            stub::remove_dir_stub(stub_root, rel).ok();
-            crate::fsmeta::write_symlink_atomic(&abs, &target)?;
-            crate::fsmeta::restore_symlink_mtime(&abs, &mtime);
-            remove_conflict_helpers(&abs);
-            print_action(false, "restore", rel);
-            counts.restored += 1;
+            plan.actions.push(Action::RestoreSymlink {
+                rel: rel.to_string(),
+                target,
+                mtime,
+            });
         }
     }
     Ok(())
 }
 
-/// Recursively write all blobs reachable from `tree_hash` into `base_dir`.
+/// Shared decision for a `clone_root` blob entry, used by both `plan_path`
+/// and `plan_tree`'s per-entry loop. Reuses the same `needs_restore_blob` /
+/// `mode_matches` / `conflict_helpers_exist` predicates the pre-3-phase
+/// implementation used inline.
+#[allow(clippy::too_many_arguments)]
+fn plan_restore_blob_action(
+    abs: &std::path::Path,
+    rel: &str,
+    hash: &Hash,
+    mtime: &Option<chrono::DateTime<chrono::Utc>>,
+    mode: &Option<String>,
+    store: &dyn ObjectStore,
+    stub_root: &std::path::Path,
+    plan: &mut Plan,
+) -> Result<(), Error> {
+    // Check if already matching. The mode is only consulted when the
+    // content matches (the file is then known to exist on disk).
+    let content_matches = !needs_restore_blob(abs, stub_root, rel, hash);
+    let already_matches = content_matches && crate::fsmeta::mode_matches(abs, mode);
+    if already_matches && !conflict_helpers_exist(abs) {
+        return Ok(());
+    }
+    if !content_matches {
+        if !blob_fully_cached(store, hash)? {
+            plan.pending.push(hash.clone());
+        }
+        plan.actions.push(Action::RestoreBlobContent {
+            rel: rel.to_string(),
+            hash: hash.clone(),
+            mtime: *mtime,
+            mode: mode.clone(),
+        });
+    } else if !already_matches {
+        // Content matches but the executable bit differs: chmod only,
+        // no content rewrite, no fetch needed.
+        plan.actions.push(Action::RestoreBlobModeOnly {
+            rel: rel.to_string(),
+            mode: mode.clone(),
+        });
+    } else {
+        // Content and mode both match; only stray conflict helpers remain.
+        plan.actions.push(Action::CleanupOnly {
+            rel: rel.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Plan restoring all blobs reachable from `tree_hash` into `base_dir`.
 /// `work_dir` is the repository root (used for rel_path computation).
-/// `stub_root` is passed to `stub::exists`/`stub::remove` (equals `work_dir`).
-fn restore_tree(
-    tree_hash: &crate::object::Hash,
+/// `stub_root` is passed to `stub::exists`/`stub::dir_exists` (equals `work_dir`).
+fn plan_tree(
+    tree_hash: &Hash,
     base_dir: &std::path::Path,
     work_dir: &std::path::Path,
     store: &dyn ObjectStore,
     stub_root: &std::path::Path,
-    dry_run: bool,
-    counts: &mut Counts,
+    plan: &mut Plan,
 ) -> Result<(), Error> {
-    let data = codec::store_read(store, tree_hash, None)?;
-    let Tree::Normal { entries } = Tree::deserialise(&data)?;
+    let rel_base = rel_path(base_dir, work_dir);
+    let entries = match read_tree_entries(store, tree_hash, &rel_base, plan)? {
+        Some(e) => e,
+        None => return Ok(()), // deferred: recorded in plan.unresolved_trees
+    };
     // Ensure the directory itself exists (handles empty directories).
-    if !dry_run {
-        fs::create_dir_all(base_dir)?;
-    }
+    plan.actions.push(Action::EnsureDir {
+        rel: rel_base,
+    });
     for entry in entries {
         match entry {
             TreeEntry::Blob {
@@ -276,45 +748,17 @@ fn restore_tree(
 
                 // Stub reconcile: update the stub record instead of materialising.
                 if stub::exists(stub_root, &rel) {
-                    reconcile_file_stub_to_blob(
-                        stub_root, &rel, &hash, size, &mtime, &mode, dry_run, counts,
+                    plan_reconcile_file_stub_to_blob(
+                        stub_root, &rel, &hash, size, &mtime, &mode, plan,
                     )?;
                     continue;
                 }
                 // Type mismatch: dir stub where clone_root has a blob.
                 if stub::dir_exists(stub_root, &rel) {
-                    reconcile_dir_stub_to_blob(
-                        &abs, stub_root, &rel, &hash, size, &mtime, &mode, dry_run, counts,
-                    )?;
+                    plan_reconcile_dir_stub_to_blob(&rel, &hash, size, &mtime, &mode, plan)?;
                     continue;
                 }
-
-                // The mode is only consulted when the content matches (the
-                // file is then known to exist on disk).
-                let content_matches = !needs_restore_blob(&abs, stub_root, &rel, &hash);
-                let already_matches = content_matches && crate::fsmeta::mode_matches(&abs, &mode);
-                if already_matches && !conflict_helpers_exist(&abs) {
-                    continue;
-                }
-                if dry_run {
-                    if !already_matches {
-                        print_action(true, "restore", &rel);
-                        counts.restored += 1;
-                    }
-                    continue;
-                }
-                if !content_matches {
-                    write_blob(&abs, &hash, &mtime, &mode, store, stub_root, &rel)?;
-                    print_action(false, "restore", &rel);
-                    counts.restored += 1;
-                } else if !already_matches {
-                    // Content matches but the executable bit differs: chmod
-                    // only, no content rewrite.
-                    crate::fsmeta::apply_mode(&abs, &mode);
-                    print_action(false, "restore", &rel);
-                    counts.restored += 1;
-                }
-                remove_conflict_helpers(&abs);
+                plan_restore_blob_action(&abs, &rel, &hash, &mtime, &mode, store, stub_root, plan)?;
             }
             TreeEntry::Tree {
                 name,
@@ -332,86 +776,55 @@ fn restore_tree(
                     // Only update the stub record; do NOT recurse into the directory.
                     // Blobs under a dir stub are not in the local cache, so recursing
                     // would cause spurious ObjectNotFound errors (design/08_stub_system.md).
-                    reconcile_dir_stub_to_tree(
+                    plan_reconcile_dir_stub_to_tree(
                         stub_root,
                         &rel,
                         &child_hash,
                         size,
                         &mtime,
                         blob_count,
-                        dry_run,
-                        counts,
+                        plan,
                     )?;
                     continue;
                 }
                 // Type mismatch: file stub where clone_root has a tree.
                 if stub::exists(stub_root, &rel) {
-                    reconcile_file_stub_to_tree(
-                        &child_dir,
-                        stub_root,
-                        &rel,
-                        &child_hash,
-                        size,
-                        &mtime,
-                        blob_count,
-                        dry_run,
-                        counts,
-                    )?;
+                    plan_reconcile_file_stub_to_tree(&rel, &child_hash, size, &mtime, blob_count, plan)?;
                     continue;
                 }
-
-                restore_tree(
-                    &child_hash,
-                    &child_dir,
-                    work_dir,
-                    store,
-                    stub_root,
-                    dry_run,
-                    counts,
-                )?;
+                plan_tree(&child_hash, &child_dir, work_dir, store, stub_root, plan)?;
             }
-            TreeEntry::Symlink {
-                name,
-                target,
-                mtime,
-            } => {
+            TreeEntry::Symlink { name, target, mtime } => {
                 let abs = base_dir.join(&name);
                 let rel = rel_path(&abs, work_dir);
                 if symlink_matches(&abs, &target) {
                     continue;
                 }
-                if dry_run {
-                    print_action(true, "restore", &rel);
-                    counts.restored += 1;
-                    continue;
-                }
-                stub::remove(stub_root, &rel).ok();
-                stub::remove_dir_stub(stub_root, &rel).ok();
-                crate::fsmeta::write_symlink_atomic(&abs, &target)?;
-                crate::fsmeta::restore_symlink_mtime(&abs, &mtime);
-                remove_conflict_helpers(&abs);
-                print_action(false, "restore", &rel);
-                counts.restored += 1;
+                plan.actions.push(Action::RestoreSymlink { rel, target, mtime });
             }
         }
     }
     Ok(())
 }
 
-/// Delete working-tree files under `base_dir` that are absent from the tree at `tree_hash`.
-fn remove_added_files(
-    tree_hash: &crate::object::Hash,
+/// Plan deletion of working-tree files under `base_dir` that are absent from
+/// the tree at `tree_hash`.
+fn plan_remove_added_files(
+    tree_hash: &Hash,
     base_dir: &std::path::Path,
     work_dir: &std::path::Path,
     store: &dyn ObjectStore,
     stub_root: &std::path::Path,
-    dry_run: bool,
-    counts: &mut Counts,
+    plan: &mut Plan,
 ) -> Result<(), Error> {
-    let data = codec::store_read(store, tree_hash, None)?;
-    let Tree::Normal { entries } = Tree::deserialise(&data)?;
-    let known: std::collections::HashSet<String> =
-        entries.iter().map(|e| e.name().to_string()).collect();
+    let rel_base = rel_path(base_dir, work_dir);
+    let entries = match read_tree_entries(store, tree_hash, &rel_base, plan)? {
+        Some(e) => e,
+        None => return Ok(()), // deferred: recorded in plan.unresolved_trees (may
+                                // duplicate plan_tree's own entry for the same
+                                // directory; deduplicated in plan_restore).
+    };
+    let known: HashSet<String> = entries.iter().map(|e| e.name().to_string()).collect();
 
     let read_dir = match fs::read_dir(base_dir) {
         Ok(r) => r,
@@ -425,6 +838,20 @@ fn remove_added_files(
         if name == ".omemfs" {
             continue;
         }
+        // Conflict helper files (`<path>.omemfs-conflict-{base,local,remote}`)
+        // are never entries in `clone_root`, so -- like any other locally-
+        // added file -- they fall straight through to the "not in known"
+        // branch below and are planned for deletion here. This is the only
+        // place that removes a conflict helper whose own base path has no
+        // restore/delete action of its own (an unchanged directory, an
+        // unchanged symlink, or a locally-added file that is itself being
+        // deleted -- design/04_cli_spec.md, "omemfs restore" Plan bullet on
+        // conflict helpers). A helper already removed as a side effect of
+        // its base path's own Blob/Symlink action (`remove_conflict_
+        // helpers`, run earlier in `plan.actions` order for the same
+        // top-level call) is simply gone by the time this action applies --
+        // tolerated by `apply_action`'s NotFound-tolerant delete, not
+        // excluded here.
         // File stubs: check whether the logical entry is still in clone_root.
         if stub::is_stub_filename(&name) {
             // `.omemfs-stub` is the dir-stub marker; it belongs to this directory
@@ -436,13 +863,10 @@ fn remove_added_files(
             {
                 let stub_abs = base_dir.join(&name);
                 let logical_rel = rel_path(&base_dir.join(logical), work_dir);
-                if dry_run {
-                    print_action(true, "delete", &logical_rel);
-                } else {
-                    fs::remove_file(&stub_abs).map_err(Error::Io)?;
-                    print_action(false, "delete", &logical_rel);
-                }
-                counts.deleted += 1;
+                plan.actions.push(Action::DeleteOrphanFileStub {
+                    logical_rel,
+                    stub_abs,
+                });
             }
             continue;
         }
@@ -455,8 +879,8 @@ fn remove_added_files(
                 // A fully-stubbed directory must not be recursed into: its
                 // clone_root tree object (and descendant blobs) are not in the
                 // local cache after a lazy clone, so reading them would fail with
-                // ObjectNotFound. The dir stub's own entry is reconciled in
-                // restore_tree; there are no locally-added files to remove inside
+                // ObjectNotFound. The dir stub's own entry is reconciled by
+                // plan_tree; there are no locally-added files to remove inside
                 // a fully-stubbed directory. See design/08_stub_system.md.
                 if !stub::dir_exists(stub_root, &child_rel)
                     && let Some(child_entry) = entries.iter().find(|e| e.name() == name)
@@ -464,38 +888,442 @@ fn remove_added_files(
                         hash: child_hash, ..
                     } = child_entry
                 {
-                    remove_added_files(
-                        child_hash, &abs, work_dir, store, stub_root, dry_run, counts,
-                    )?;
+                    plan_remove_added_files(child_hash, &abs, work_dir, store, stub_root, plan)?;
                 }
             }
         } else {
-            // Not in clone_root: delete.
+            // Not in clone_root: plan to delete.
             let abs = base_dir.join(&name);
             let rel = rel_path(&abs, work_dir);
             if file_type.is_file() || file_type.is_symlink() {
-                if dry_run {
-                    print_action(true, "delete", &rel);
-                } else {
-                    fs::remove_file(&abs)?;
-                    stub::remove(stub_root, &rel)?;
-                    print_action(false, "delete", &rel);
-                }
-                counts.deleted += 1;
+                plan.actions.push(Action::DeleteFile { rel });
             } else if file_type.is_dir() {
-                // Recursively delete added directories (including any stubs inside).
-                remove_added_dir(&abs, work_dir, stub_root, dry_run, counts)?;
-                if !dry_run {
-                    // Remove the directory itself once contents are cleared.
-                    fs::remove_dir(&abs).ok();
-                }
+                plan.actions.push(Action::DeleteAddedDir { rel });
             }
         }
     }
     Ok(())
 }
 
-/// Recursively delete all files in an added directory.
+fn plan_reconcile_file_stub_to_blob(
+    stub_root: &std::path::Path,
+    rel: &str,
+    hash: &Hash,
+    size: u64,
+    mtime: &Option<chrono::DateTime<chrono::Utc>>,
+    mode: &Option<String>,
+    plan: &mut Plan,
+) -> Result<(), Error> {
+    let current = stub::read(stub_root, rel)?;
+    let needs_update = current
+        .is_none_or(|r| r.hash != *hash || r.size != size || r.mtime != *mtime || r.mode != *mode);
+    if needs_update {
+        plan.actions.push(Action::ReconcileFileStubToBlob {
+            rel: rel.to_string(),
+            hash: hash.clone(),
+            size,
+            mtime: *mtime,
+            mode: mode.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn plan_reconcile_dir_stub_to_tree(
+    stub_root: &std::path::Path,
+    rel: &str,
+    hash: &Hash,
+    size: u64,
+    mtime: &Option<chrono::DateTime<chrono::Utc>>,
+    blob_count: u64,
+    plan: &mut Plan,
+) -> Result<(), Error> {
+    let current = stub::read_dir_stub(stub_root, rel)?;
+    let needs_update = current.is_none_or(|r| {
+        r.hash != *hash || r.size != size || r.mtime != *mtime || r.blob_count != blob_count
+    });
+    if needs_update {
+        plan.actions.push(Action::ReconcileDirStubToTree {
+            rel: rel.to_string(),
+            hash: hash.clone(),
+            size,
+            mtime: *mtime,
+            blob_count,
+        });
+    }
+    Ok(())
+}
+
+/// Type mismatch (dir stub / clone_root blob): unconditional, matching the
+/// pre-3-phase implementation (no `needs_update` gating for a type change).
+fn plan_reconcile_dir_stub_to_blob(
+    rel: &str,
+    hash: &Hash,
+    size: u64,
+    mtime: &Option<chrono::DateTime<chrono::Utc>>,
+    mode: &Option<String>,
+    plan: &mut Plan,
+) -> Result<(), Error> {
+    plan.actions.push(Action::ReconcileDirStubToBlob {
+        rel: rel.to_string(),
+        hash: hash.clone(),
+        size,
+        mtime: *mtime,
+        mode: mode.clone(),
+    });
+    Ok(())
+}
+
+/// Type mismatch (file stub / clone_root tree): unconditional, matching the
+/// pre-3-phase implementation.
+fn plan_reconcile_file_stub_to_tree(
+    rel: &str,
+    hash: &Hash,
+    size: u64,
+    mtime: &Option<chrono::DateTime<chrono::Utc>>,
+    blob_count: u64,
+    plan: &mut Plan,
+) -> Result<(), Error> {
+    plan.actions.push(Action::ReconcileFileStubToTree {
+        rel: rel.to_string(),
+        hash: hash.clone(),
+        size,
+        mtime: *mtime,
+        blob_count,
+    });
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Report (--dry-run) and Apply (real run)
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct Counts {
+    restored: usize,
+    deleted: usize,
+    unavailable: usize,
+}
+
+/// Report a whole plan for `--dry-run`: prints and counts every action, but
+/// performs no I/O beyond reading the local cache (to tell "would restore"
+/// from "would fetch" for a `RestoreBlobContent` action).
+fn report_plan(
+    plan: &Plan,
+    local: &dyn ObjectStore,
+    work_dir: &std::path::Path,
+) -> Result<Counts, Error> {
+    let mut counts = Counts::default();
+    for action in &plan.actions {
+        report_action(action, work_dir, work_dir, local, &mut counts)?;
+    }
+    // A directory whose clone_root tree object is not locally cached: report
+    // it the same way a pending blob is reported ("would fetch:"), since a
+    // real restore's fetch phase would need to heal it before it can even
+    // determine what -- if anything -- needs restoring underneath it.
+    for (_, rel) in &plan.unresolved_trees {
+        print_action(true, "fetch", rel);
+        counts.restored += 1;
+    }
+    Ok(counts)
+}
+
+fn report_action(
+    action: &Action,
+    work_dir: &std::path::Path,
+    stub_root: &std::path::Path,
+    local: &dyn ObjectStore,
+    counts: &mut Counts,
+) -> Result<(), Error> {
+    match action {
+        Action::RestoreBlobContent { rel, hash, .. } => {
+            if blob_fully_cached(local, hash)? {
+                print_action(true, "restore", rel);
+            } else {
+                print_action(true, "fetch", rel);
+            }
+            counts.restored += 1;
+        }
+        Action::RestoreBlobModeOnly { rel, .. } | Action::RestoreSymlink { rel, .. } => {
+            print_action(true, "restore", rel);
+            counts.restored += 1;
+        }
+        Action::CleanupOnly { .. } | Action::EnsureDir { .. } => {}
+        Action::DeleteAbsent {
+            rel,
+            delete_file,
+            delete_dir_stub,
+        } => {
+            if *delete_file {
+                print_action(true, "delete", rel);
+                counts.deleted += 1;
+            }
+            if *delete_dir_stub {
+                print_action(true, "delete", rel);
+                counts.deleted += 1;
+            }
+        }
+        Action::DeleteFile { rel } => {
+            print_action(true, "delete", rel);
+            counts.deleted += 1;
+        }
+        Action::DeleteAddedDir { rel } => {
+            let abs = work_dir.join(rel);
+            remove_added_dir(&abs, work_dir, stub_root, true, counts)?;
+        }
+        Action::DeleteOrphanFileStub { logical_rel, .. } => {
+            print_action(true, "delete", logical_rel);
+            counts.deleted += 1;
+        }
+        Action::ReconcileFileStubToBlob { rel, .. }
+        | Action::ReconcileDirStubToTree { rel, .. }
+        | Action::ReconcileDirStubToBlob { rel, .. }
+        | Action::ReconcileFileStubToTree { rel, .. } => {
+            print_action(true, "restore", rel);
+            counts.restored += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Apply a single planned action for real. `still_unavailable` names blob
+/// hashes phase 2 could not resolve; a `RestoreBlobContent` action naming one
+/// of them is skipped (the working tree is left as found) and reported under
+/// `unavailable:` instead of being applied.
+#[allow(clippy::too_many_arguments)]
+fn apply_action(
+    action: Action,
+    work_dir: &std::path::Path,
+    stub_root: &std::path::Path,
+    local: &dyn ObjectStore,
+    still_unavailable: &HashSet<Hash>,
+    counts: &mut Counts,
+    unavailable_paths: &mut Vec<String>,
+) -> Result<(), Error> {
+    match action {
+        Action::RestoreBlobContent {
+            rel,
+            hash,
+            mtime,
+            mode,
+        } => {
+            if still_unavailable.contains(&hash) {
+                print_action(false, "unavailable", &rel);
+                counts.unavailable += 1;
+                unavailable_paths.push(rel);
+                return Ok(());
+            }
+            let abs = work_dir.join(&rel);
+            write_blob(&abs, &hash, &mtime, &mode, local, stub_root, &rel)?;
+            print_action(false, "restore", &rel);
+            counts.restored += 1;
+            remove_conflict_helpers(&abs);
+        }
+        Action::RestoreBlobModeOnly { rel, mode } => {
+            let abs = work_dir.join(&rel);
+            // Problem 4 (design/04_cli_spec.md, "omemfs restore" Apply
+            // bullet): Plan found the content already matching, so this
+            // action carries no fetch and normally applies immediately --
+            // but Phase 2's fetch for *other* pending blobs can still take
+            // real wall-clock time in between, during which something
+            // outside omemfs could have removed this path. Re-check right
+            // before `apply_mode`, which fails silently on a missing file
+            // (`src/fsmeta.rs`), so without this check the command would
+            // otherwise print "restored:" for a path that no longer exists.
+            if !abs.exists() {
+                print_action(false, "unavailable", &rel);
+                counts.unavailable += 1;
+                unavailable_paths.push(rel);
+                return Ok(());
+            }
+            crate::fsmeta::apply_mode(&abs, &mode);
+            print_action(false, "restore", &rel);
+            counts.restored += 1;
+            remove_conflict_helpers(&abs);
+        }
+        Action::CleanupOnly { rel } => {
+            let abs = work_dir.join(&rel);
+            remove_conflict_helpers(&abs);
+        }
+        Action::RestoreSymlink { rel, target, mtime } => {
+            let abs = work_dir.join(&rel);
+            stub::remove(stub_root, &rel).ok();
+            stub::remove_dir_stub(stub_root, &rel).ok();
+            crate::fsmeta::write_symlink_atomic(&abs, &target)?;
+            crate::fsmeta::restore_symlink_mtime(&abs, &mtime);
+            remove_conflict_helpers(&abs);
+            print_action(false, "restore", &rel);
+            counts.restored += 1;
+        }
+        Action::DeleteAbsent {
+            rel,
+            delete_file,
+            delete_dir_stub,
+        } => {
+            let abs = work_dir.join(&rel);
+            // Problem 4: `delete_file` was decided at Plan time from a
+            // one-shot `abs.is_file() || stub::exists(...)` check. Re-check
+            // at Apply time too -- Phase 2's fetch may have given enough
+            // wall-clock time for something outside omemfs to create this
+            // path after Plan found nothing here, and a path clone_root
+            // does not have must still not survive `restore`.
+            let delete_file = delete_file || abs.is_file() || stub::exists(stub_root, &rel);
+            if delete_file {
+                remove_file_tolerant(&abs)?;
+                stub::remove(stub_root, &rel)?;
+                print_action(false, "delete", &rel);
+                counts.deleted += 1;
+            }
+            if delete_dir_stub {
+                stub::remove_dir_stub(stub_root, &rel)?;
+                // Remove the directory if it is now empty.
+                fs::remove_dir(&abs).ok();
+                print_action(false, "delete", &rel);
+                counts.deleted += 1;
+            }
+            remove_conflict_helpers(&abs);
+        }
+        Action::DeleteFile { rel } => {
+            let abs = work_dir.join(&rel);
+            // Problem 1 (design/04_cli_spec.md, "omemfs restore" Errors):
+            // tolerate the target already being gone -- either because a
+            // duplicate/overlapping path argument already planned (and
+            // applied) the same delete once, because this file is a
+            // conflict helper already removed as a side effect of its base
+            // path's own action (problem 2), or because it raced with an
+            // external delete between Plan and Apply. Mirrors `stub::
+            // remove`'s NotFound-tolerant pattern (`src/stub.rs`).
+            remove_file_tolerant(&abs)?;
+            stub::remove(stub_root, &rel)?;
+            print_action(false, "delete", &rel);
+            counts.deleted += 1;
+        }
+        Action::DeleteAddedDir { rel } => {
+            let abs = work_dir.join(&rel);
+            remove_added_dir(&abs, work_dir, stub_root, false, counts)?;
+            // Remove the directory itself once contents are cleared.
+            fs::remove_dir(&abs).ok();
+        }
+        Action::EnsureDir { rel } => {
+            fs::create_dir_all(work_dir.join(&rel))?;
+        }
+        Action::DeleteOrphanFileStub {
+            logical_rel,
+            stub_abs,
+        } => {
+            // NotFound-tolerant for the same reasons as `Action::DeleteFile`
+            // above (problem 1).
+            remove_file_tolerant(&stub_abs)?;
+            print_action(false, "delete", &logical_rel);
+            counts.deleted += 1;
+        }
+        Action::ReconcileFileStubToBlob {
+            rel,
+            hash,
+            size,
+            mtime,
+            mode,
+        } => {
+            stub::write(
+                stub_root,
+                &rel,
+                &StubRecord {
+                    target_type: StubTargetType::Blob,
+                    hash,
+                    size,
+                    mtime,
+                    mode,
+                    blob_count: 0,
+                },
+            )?;
+            print_action(false, "restore", &rel);
+            counts.restored += 1;
+        }
+        Action::ReconcileDirStubToTree {
+            rel,
+            hash,
+            size,
+            mtime,
+            blob_count,
+        } => {
+            stub::write_dir_stub(
+                stub_root,
+                &rel,
+                &StubRecord {
+                    target_type: StubTargetType::Tree,
+                    hash,
+                    size,
+                    mtime,
+                    mode: None,
+                    blob_count,
+                },
+            )?;
+            print_action(false, "restore", &rel);
+            counts.restored += 1;
+        }
+        Action::ReconcileDirStubToBlob {
+            rel,
+            hash,
+            size,
+            mtime,
+            mode,
+        } => {
+            stub::remove_dir_stub(stub_root, &rel)?;
+            let abs = work_dir.join(&rel);
+            if abs.exists() {
+                fs::remove_dir_all(&abs)?;
+            }
+            stub::write(
+                stub_root,
+                &rel,
+                &StubRecord {
+                    target_type: StubTargetType::Blob,
+                    hash,
+                    size,
+                    mtime,
+                    mode,
+                    blob_count: 0,
+                },
+            )?;
+            print_action(false, "restore", &rel);
+            counts.restored += 1;
+        }
+        Action::ReconcileFileStubToTree {
+            rel,
+            hash,
+            size,
+            mtime,
+            blob_count,
+        } => {
+            stub::remove(stub_root, &rel)?;
+            let abs = work_dir.join(&rel);
+            fs::create_dir_all(&abs)?;
+            stub::write_dir_stub(
+                stub_root,
+                &rel,
+                &StubRecord {
+                    target_type: StubTargetType::Tree,
+                    hash,
+                    size,
+                    mtime,
+                    mode: None,
+                    blob_count,
+                },
+            )?;
+            print_action(false, "restore", &rel);
+            counts.restored += 1;
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Shared filesystem helpers (unchanged decision/mutation logic)
+// ---------------------------------------------------------------------------
+
+/// Recursively delete all files in an added directory. Shared by `report_action`
+/// (dry_run == true: enumerate and print only) and `apply_action` (dry_run ==
+/// false: actually delete).
 fn remove_added_dir(
     dir: &std::path::Path,
     work_dir: &std::path::Path,
@@ -526,7 +1354,9 @@ fn remove_added_dir(
             if dry_run {
                 print_action(true, "delete", &rel);
             } else {
-                fs::remove_file(&abs)?;
+                // NotFound-tolerant for the same reasons as
+                // `Action::DeleteFile` (problem 1).
+                remove_file_tolerant(&abs)?;
                 stub::remove(stub_root, &rel)?;
                 print_action(false, "delete", &rel);
             }
@@ -541,11 +1371,25 @@ fn remove_added_dir(
     Ok(())
 }
 
+/// Remove a file, tolerating the file already being absent. Problem 1:
+/// without this, two planned delete actions that ended up targeting the same
+/// path (a duplicate/overlapping path argument, or a conflict helper already
+/// removed as a side effect of its base path's own action -- problem 2)
+/// aborted the whole Apply phase with a bare ENOENT on the second attempt.
+/// Mirrors `stub::remove`'s (`src/stub.rs`) NotFound-tolerant pattern.
+fn remove_file_tolerant(path: &std::path::Path) -> Result<(), Error> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(Error::Io(e)),
+    }
+}
+
 /// Write a blob to `abs_path`, restoring mtime and the executable-bit mode.
 /// Removes any stub for this path.
 fn write_blob(
     abs: &std::path::Path,
-    hash: &crate::object::Hash,
+    hash: &Hash,
     mtime: &Option<chrono::DateTime<chrono::Utc>>,
     mode: &Option<String>,
     store: &dyn ObjectStore,
@@ -575,7 +1419,7 @@ fn needs_restore_blob(
     abs: &std::path::Path,
     stub_root: &std::path::Path,
     rel: &str,
-    expected_hash: &crate::object::Hash,
+    expected_hash: &Hash,
 ) -> bool {
     // If a stub exists, the real file is absent — needs restore.
     if stub::exists(stub_root, rel) {
@@ -590,166 +1434,9 @@ fn needs_restore_blob(
     crate::object::blob_hash(&content) != *expected_hash
 }
 
-// ---------------------------------------------------------------------------
-// Stub reconcile helpers (design/08_stub_system.md — reconcile table)
-// ---------------------------------------------------------------------------
-
-/// blob entry in clone_root / file stub on disk: update stub fields if stale.
-fn reconcile_file_stub_to_blob(
-    stub_root: &std::path::Path,
-    rel: &str,
-    hash: &crate::object::Hash,
-    size: u64,
-    mtime: &Option<chrono::DateTime<chrono::Utc>>,
-    mode: &Option<String>,
-    dry_run: bool,
-    counts: &mut Counts,
-) -> Result<(), Error> {
-    let current = stub::read(stub_root, rel)?;
-    let needs_update = current
-        .is_none_or(|r| r.hash != *hash || r.size != size || r.mtime != *mtime || r.mode != *mode);
-    if !needs_update {
-        return Ok(());
-    }
-    if dry_run {
-        print_action(true, "restore", rel);
-        counts.restored += 1;
-        return Ok(());
-    }
-    stub::write(
-        stub_root,
-        rel,
-        &StubRecord {
-            target_type: StubTargetType::Blob,
-            hash: hash.clone(),
-            size,
-            mtime: *mtime,
-            mode: mode.clone(),
-            blob_count: 0,
-        },
-    )?;
-    print_action(false, "restore", rel);
-    counts.restored += 1;
-    Ok(())
-}
-
-/// tree entry in clone_root / dir stub on disk: update stub fields if stale.
-fn reconcile_dir_stub_to_tree(
-    stub_root: &std::path::Path,
-    rel: &str,
-    hash: &crate::object::Hash,
-    size: u64,
-    mtime: &Option<chrono::DateTime<chrono::Utc>>,
-    blob_count: u64,
-    dry_run: bool,
-    counts: &mut Counts,
-) -> Result<(), Error> {
-    let current = stub::read_dir_stub(stub_root, rel)?;
-    let needs_update = current.is_none_or(|r| {
-        r.hash != *hash || r.size != size || r.mtime != *mtime || r.blob_count != blob_count
-    });
-    if !needs_update {
-        return Ok(());
-    }
-    if dry_run {
-        print_action(true, "restore", rel);
-        counts.restored += 1;
-        return Ok(());
-    }
-    stub::write_dir_stub(
-        stub_root,
-        rel,
-        &StubRecord {
-            target_type: StubTargetType::Tree,
-            hash: hash.clone(),
-            size,
-            mtime: *mtime,
-            mode: None,
-            blob_count,
-        },
-    )?;
-    print_action(false, "restore", rel);
-    counts.restored += 1;
-    Ok(())
-}
-
-/// blob entry in clone_root / dir stub on disk (type mismatch): replace dir stub with file stub.
-fn reconcile_dir_stub_to_blob(
-    abs: &std::path::Path,
-    stub_root: &std::path::Path,
-    rel: &str,
-    hash: &crate::object::Hash,
-    size: u64,
-    mtime: &Option<chrono::DateTime<chrono::Utc>>,
-    mode: &Option<String>,
-    dry_run: bool,
-    counts: &mut Counts,
-) -> Result<(), Error> {
-    if dry_run {
-        print_action(true, "restore", rel);
-        counts.restored += 1;
-        return Ok(());
-    }
-    stub::remove_dir_stub(stub_root, rel)?;
-    if abs.exists() {
-        fs::remove_dir_all(abs)?;
-    }
-    stub::write(
-        stub_root,
-        rel,
-        &StubRecord {
-            target_type: StubTargetType::Blob,
-            hash: hash.clone(),
-            size,
-            mtime: *mtime,
-            mode: mode.clone(),
-            blob_count: 0,
-        },
-    )?;
-    print_action(false, "restore", rel);
-    counts.restored += 1;
-    Ok(())
-}
-
-/// tree entry in clone_root / file stub on disk (type mismatch): replace file stub with dir stub.
-fn reconcile_file_stub_to_tree(
-    abs: &std::path::Path,
-    stub_root: &std::path::Path,
-    rel: &str,
-    hash: &crate::object::Hash,
-    size: u64,
-    mtime: &Option<chrono::DateTime<chrono::Utc>>,
-    blob_count: u64,
-    dry_run: bool,
-    counts: &mut Counts,
-) -> Result<(), Error> {
-    if dry_run {
-        print_action(true, "restore", rel);
-        counts.restored += 1;
-        return Ok(());
-    }
-    stub::remove(stub_root, rel)?;
-    fs::create_dir_all(abs)?;
-    stub::write_dir_stub(
-        stub_root,
-        rel,
-        &StubRecord {
-            target_type: StubTargetType::Tree,
-            hash: hash.clone(),
-            size,
-            mtime: *mtime,
-            mode: None,
-            blob_count,
-        },
-    )?;
-    print_action(false, "restore", rel);
-    counts.restored += 1;
-    Ok(())
-}
-
 fn print_summary(counts: &Counts, dry_run: bool) {
     let total = counts.restored + counts.deleted;
-    if total == 0 {
+    if total == 0 && counts.unavailable == 0 {
         print_action(false, "plain", "Nothing to restore.");
         return;
     }
@@ -759,19 +1446,29 @@ fn print_summary(counts: &Counts, dry_run: bool) {
             "plain",
             &format!("{} path(s) would be restored.", total),
         );
+    } else if counts.unavailable > 0 {
+        print_action(
+            false,
+            "plain",
+            &format!(
+                "{} path(s) restored, {} path(s) unavailable.",
+                total, counts.unavailable
+            ),
+        );
     } else {
         print_action(false, "plain", &format!("{} path(s) restored.", total));
     }
 }
 
-/// Print a single action line. `kind` selects a color:
-/// "restore" → added (green), "delete" → deleted (red), "plain" → unstyled.
+/// Print a single action line. `kind` selects a color and prefix:
+/// "restore"/"delete" → the usual indented action lines (added/deleted
+/// colors); "fetch" → an un-indented "would fetch:" line, used only by
+/// `--dry-run` reporting (see "Missing objects", design/04_cli_spec.md);
+/// "unavailable" → an un-indented "unavailable:" line, used only by a real
+/// (non-dry-run) run that could not resolve an object; "plain" → unstyled.
 ///
 /// Uses `progress::emit_output_line` so the line is interleaved correctly
 /// with the TTY progress window.
-/// Print one restore/delete action line for `path`, or an already-fully-
-/// formatted summary line when `kind == "plain"` (`path` is then the whole
-/// message, e.g. "3 path(s) restored.").
 ///
 /// For `"restore"`/`"delete"`, the "  <verb>: <path>" text is built exactly
 /// once, here, from the verb and `path` directly. The previous version took
@@ -797,6 +1494,20 @@ fn print_action(dry_run: bool, kind: &str, path: &str) {
                 format!("  {}: {}", paint(colored, styles.deleted, prefix), path)
             } else {
                 format!("  {}: {}", prefix, path)
+            }
+        }
+        "fetch" => {
+            if colored {
+                format!("{}: {}", paint(colored, styles.modified, "would fetch"), path)
+            } else {
+                format!("would fetch: {}", path)
+            }
+        }
+        "unavailable" => {
+            if colored {
+                format!("{}: {}", paint(colored, styles.deleted, "unavailable"), path)
+            } else {
+                format!("unavailable: {}", path)
             }
         }
         _ => path.to_string(),
@@ -830,4 +1541,461 @@ fn rel_path(abs: &std::path::Path, work_dir: &std::path::Path) -> String {
     abs.strip_prefix(work_dir)
         .map(|p| p.to_string_lossy().replace('\\', "/"))
         .unwrap_or_else(|_| abs.to_string_lossy().replace('\\', "/"))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::local::LocalStore;
+    use tempfile::TempDir;
+
+    /// Store `content` as a blob (in-memory path, matching `chunk.rs`'s own
+    /// test helper) in `store` and return its logical hash.
+    fn store_blob(store: &LocalStore, content: &[u8]) -> Hash {
+        let hash = crate::object::blob_hash(content);
+        let serialised = crate::object::serialise_blob(content);
+        codec::chunk::store_chunked(store, &hash, &serialised, None).unwrap();
+        hash
+    }
+
+    /// Build and store a `Tree::Normal` with the given entries; returns its hash.
+    fn store_tree(store: &LocalStore, entries: Vec<TreeEntry>) -> Hash {
+        let bytes = Tree::Normal { entries }.serialise();
+        let hash = Hash::compute(&bytes);
+        codec::store_write(store, &hash, &bytes, None).unwrap();
+        hash
+    }
+
+    fn blob_entry(name: &str, hash: Hash, size: u64) -> TreeEntry {
+        TreeEntry::Blob {
+            name: name.to_string(),
+            hash,
+            size,
+            mtime: None,
+            mode: None,
+        }
+    }
+
+    fn tree_entry(name: &str, hash: Hash, blob_count: u64) -> TreeEntry {
+        TreeEntry::Tree {
+            name: name.to_string(),
+            hash,
+            size: 0,
+            mtime: None,
+            blob_count,
+        }
+    }
+
+    #[test]
+    fn plan_pending_is_empty_when_blob_is_already_fully_cached() {
+        // Content differs from the working tree (so a RestoreBlobContent
+        // action IS created), but the object is already fully cached
+        // locally -- the fetch phase must have nothing to do.
+        let local_dir = TempDir::new().unwrap();
+        let local = LocalStore::for_cache(local_dir.path());
+        let content = b"clone-root content".to_vec();
+        let hash = store_blob(&local, &content);
+        let root = store_tree(&local, vec![blob_entry("file.txt", hash, content.len() as u64)]);
+
+        let work_dir = TempDir::new().unwrap();
+        fs::write(work_dir.path().join("file.txt"), b"different local content").unwrap();
+
+        let plan = plan_restore(
+            &root,
+            &[work_dir.path().to_path_buf()],
+            work_dir.path(),
+            work_dir.path(),
+            &local,
+        )
+        .unwrap();
+
+        assert!(
+            plan.pending.is_empty(),
+            "object is already fully cached locally; pending must be empty"
+        );
+        assert!(
+            plan
+                .actions
+                .iter()
+                .any(|a| matches!(a, Action::RestoreBlobContent { .. })),
+            "a restore action must still be planned for the differing content"
+        );
+    }
+
+    #[test]
+    fn plan_pending_has_one_entry_when_blob_is_missing() {
+        // Same as above, but the blob object was never stored locally at
+        // all -- the fetch phase must have exactly this one hash to fetch.
+        let local_dir = TempDir::new().unwrap();
+        let local = LocalStore::for_cache(local_dir.path());
+        let content = b"clone-root content, never cached locally".to_vec();
+        let hash = crate::object::blob_hash(&content);
+        let root = store_tree(&local, vec![blob_entry("file.txt", hash.clone(), content.len() as u64)]);
+
+        let work_dir = TempDir::new().unwrap();
+        // File absent from the working tree entirely (e.g. a deleted stub).
+
+        let plan = plan_restore(
+            &root,
+            &[work_dir.path().to_path_buf()],
+            work_dir.path(),
+            work_dir.path(),
+            &local,
+        )
+        .unwrap();
+
+        assert_eq!(plan.pending, vec![hash]);
+        assert!(plan.unresolved_trees.is_empty());
+    }
+
+    #[test]
+    fn plan_does_not_descend_into_a_dir_stub_and_leaves_pending_empty() {
+        // A directory that is currently a dir stub, whose recorded blobs are
+        // NOT cached locally at all. The plan must only reconcile the stub
+        // record -- never plan to restore (or fetch) anything underneath it.
+        let local_dir = TempDir::new().unwrap();
+        let local = LocalStore::for_cache(local_dir.path());
+        let uncached_content = b"never touched by the plan walk".to_vec();
+        let uncached_hash = crate::object::blob_hash(&uncached_content);
+        let sub_tree = store_tree(
+            &local,
+            vec![blob_entry(
+                "big.bin",
+                uncached_hash,
+                uncached_content.len() as u64,
+            )],
+        );
+        let root = store_tree(&local, vec![tree_entry("sub", sub_tree.clone(), 1)]);
+
+        let work_dir = TempDir::new().unwrap();
+        fs::create_dir_all(work_dir.path().join("sub")).unwrap();
+        // A stale dir stub record (size deliberately wrong) so a reconcile
+        // action is expected.
+        stub::write_dir_stub(
+            work_dir.path(),
+            "sub",
+            &StubRecord {
+                target_type: StubTargetType::Tree,
+                hash: sub_tree,
+                size: 999,
+                mtime: None,
+                mode: None,
+                blob_count: 1,
+            },
+        )
+        .unwrap();
+
+        let plan = plan_restore(
+            &root,
+            &[work_dir.path().to_path_buf()],
+            work_dir.path(),
+            work_dir.path(),
+            &local,
+        )
+        .unwrap();
+
+        assert!(
+            plan.pending.is_empty(),
+            "nothing under a dir stub must ever be planned for fetch"
+        );
+        // The only visible (non-`EnsureDir`) action must be the dir-stub
+        // reconcile itself -- nothing underneath the stub is ever planned.
+        // `EnsureDir` for the root directory itself is expected (emitted
+        // unconditionally for every `plan_tree` call, including the root),
+        // is silent in both report and apply, and carries no fetch risk.
+        let visible: Vec<&Action> = plan
+            .actions
+            .iter()
+            .filter(|a| !matches!(a, Action::EnsureDir { .. }))
+            .collect();
+        assert_eq!(visible.len(), 1, "only the dir-stub reconcile itself");
+        assert!(matches!(visible[0], Action::ReconcileDirStubToTree { .. }));
+    }
+
+    #[test]
+    fn plan_records_unresolved_tree_without_misdetecting_pending() {
+        // The root tree references a child tree whose OWN object was never
+        // written to the local store at all (simulating a clone_root tree
+        // object missing from the local cache). The plan must record it in
+        // `unresolved_trees` and must NOT throw, abort the whole walk, or
+        // report any blob as pending (it never got far enough to see one).
+        let local_dir = TempDir::new().unwrap();
+        let local = LocalStore::for_cache(local_dir.path());
+
+        // Build (but do not store) the child tree, so its hash is known but
+        // unreadable from `local`.
+        let content = b"lives inside the unreadable subtree".to_vec();
+        let missing_blob_hash = crate::object::blob_hash(&content);
+        let child_bytes = Tree::Normal {
+            entries: vec![blob_entry(
+                "deep.bin",
+                missing_blob_hash,
+                content.len() as u64,
+            )],
+        }
+        .serialise();
+        let child_hash = Hash::compute(&child_bytes);
+        // Deliberately NOT written to `local`.
+
+        let root = store_tree(&local, vec![tree_entry("sub", child_hash.clone(), 1)]);
+
+        let work_dir = TempDir::new().unwrap();
+        // "sub" does not exist in the working tree at all (the "D" state).
+
+        let plan = plan_restore(
+            &root,
+            &[work_dir.path().to_path_buf()],
+            work_dir.path(),
+            work_dir.path(),
+            &local,
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.unresolved_trees,
+            vec![(child_hash, "sub".to_string())]
+        );
+        assert!(
+            plan.pending.is_empty(),
+            "a blob inside an unreadable subtree must never be reported as pending"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Problem 1: path dedup / collapse
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn collapse_dedup_paths_drops_exact_duplicates() {
+        assert_eq!(
+            collapse_dedup_paths(vec!["sub".to_string(), "sub".to_string()]),
+            vec!["sub".to_string()]
+        );
+    }
+
+    #[test]
+    fn collapse_dedup_paths_collapses_descendant_into_ancestor() {
+        let mut result = collapse_dedup_paths(vec!["a".to_string(), "a/b".to_string()]);
+        result.sort();
+        assert_eq!(result, vec!["a".to_string()]);
+
+        let mut result = collapse_dedup_paths(vec!["a/b".to_string(), "a".to_string()]);
+        result.sort();
+        assert_eq!(result, vec!["a".to_string()], "order must not matter");
+    }
+
+    #[test]
+    fn collapse_dedup_paths_empty_string_subsumes_everything() {
+        // An empty rel means "the whole working tree" (`plan_restore`'s
+        // caller passes `[work_dir]` for a no-argument restore, which
+        // normalises to ""). It must collapse every other path, matching
+        // `omemfs restore . sub` behaving exactly like `omemfs restore`.
+        assert_eq!(
+            collapse_dedup_paths(vec!["".to_string(), "sub".to_string()]),
+            vec!["".to_string()]
+        );
+        assert_eq!(
+            collapse_dedup_paths(vec!["sub".to_string(), "".to_string()]),
+            vec!["".to_string()]
+        );
+    }
+
+    #[test]
+    fn collapse_dedup_paths_keeps_unrelated_siblings_and_similar_prefixes() {
+        // "sub" and "subdir" share a string prefix but are NOT an
+        // ancestor/descendant pair (no "/" boundary) -- both must survive.
+        let mut result = collapse_dedup_paths(vec!["sub".to_string(), "subdir".to_string()]);
+        result.sort();
+        assert_eq!(result, vec!["sub".to_string(), "subdir".to_string()]);
+    }
+
+    #[test]
+    fn plan_restore_duplicate_path_arguments_do_not_duplicate_actions() {
+        // End-to-end reproduction of the reported regression at the
+        // `plan_restore` level: `restore sub sub` (an exact duplicate
+        // argument) must plan exactly one delete for a locally-added file
+        // under `sub`, not two.
+        let local_dir = TempDir::new().unwrap();
+        let local = LocalStore::for_cache(local_dir.path());
+        let root = store_tree(&local, vec![tree_entry("sub", store_tree(&local, vec![]), 0)]);
+
+        let work_dir = TempDir::new().unwrap();
+        fs::create_dir_all(work_dir.path().join("sub")).unwrap();
+        fs::write(work_dir.path().join("sub/extra.txt"), b"added").unwrap();
+
+        let sub_path = work_dir.path().join("sub");
+        let plan = plan_restore(
+            &root,
+            &[sub_path.clone(), sub_path],
+            work_dir.path(),
+            work_dir.path(),
+            &local,
+        )
+        .unwrap();
+
+        let delete_count = plan
+            .actions
+            .iter()
+            .filter(|a| matches!(a, Action::DeleteFile { rel } if rel == "sub/extra.txt"))
+            .count();
+        assert_eq!(
+            delete_count, 1,
+            "a duplicate path argument must not duplicate the delete action"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Problem 2: conflict helper cleanup when the base path has no action
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn plan_remove_added_files_plans_deletion_of_conflict_helpers_for_a_directory_base_path() {
+        // "sub" is a directory in clone_root; conflict helper files named
+        // after it (`sub.omemfs-conflict-*`) are never seen by the
+        // TreeEntry::Tree branch (it only recurses), so they must be picked
+        // up here as ordinary unknown files in the parent scan.
+        let local_dir = TempDir::new().unwrap();
+        let local = LocalStore::for_cache(local_dir.path());
+        let sub_tree = store_tree(&local, vec![]);
+        let root = store_tree(&local, vec![tree_entry("sub", sub_tree, 0)]);
+
+        let work_dir = TempDir::new().unwrap();
+        fs::create_dir_all(work_dir.path().join("sub")).unwrap();
+        fs::write(
+            work_dir.path().join("sub.omemfs-conflict-base"),
+            b"base",
+        )
+        .unwrap();
+
+        let plan = plan_restore(
+            &root,
+            &[work_dir.path().to_path_buf()],
+            work_dir.path(),
+            work_dir.path(),
+            &local,
+        )
+        .unwrap();
+
+        assert!(
+            plan.actions.iter().any(
+                |a| matches!(a, Action::DeleteFile { rel } if rel == "sub.omemfs-conflict-base")
+            ),
+            "a conflict helper for a directory base path must still be planned for deletion"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Problem 4: apply-time re-verification against a Plan/Apply race
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn apply_restore_blob_mode_only_reports_unavailable_if_file_vanished_before_apply() {
+        // Simulates the race the audit describes: Plan decided only a mode
+        // fix was needed (content already matched), but by the time Apply
+        // runs this action the file is gone -- e.g. removed externally
+        // during Phase 2's fetch for some other, unrelated pending blob.
+        let work_dir = TempDir::new().unwrap();
+        let abs = work_dir.path().join("script.sh");
+        fs::write(&abs, b"content").unwrap();
+        fs::remove_file(&abs).unwrap();
+
+        let action = Action::RestoreBlobModeOnly {
+            rel: "script.sh".to_string(),
+            mode: Some("755".to_string()),
+        };
+        let local_dir = TempDir::new().unwrap();
+        let local = LocalStore::for_cache(local_dir.path());
+        let mut counts = Counts::default();
+        let mut unavailable_paths = Vec::new();
+        apply_action(
+            action,
+            work_dir.path(),
+            work_dir.path(),
+            &local,
+            &HashSet::new(),
+            &mut counts,
+            &mut unavailable_paths,
+        )
+        .unwrap();
+
+        assert_eq!(counts.unavailable, 1);
+        assert_eq!(counts.restored, 0);
+        assert_eq!(unavailable_paths, vec!["script.sh".to_string()]);
+        assert!(!abs.exists());
+    }
+
+    #[test]
+    fn apply_delete_absent_removes_a_file_that_appeared_after_planning() {
+        // Plan-time found nothing at this path (`delete_file: false`), but
+        // by Apply time something outside omemfs created it -- e.g. during
+        // Phase 2's fetch for an unrelated pending blob. Apply must still
+        // remove it rather than silently leaving a path clone_root does not
+        // have.
+        let work_dir = TempDir::new().unwrap();
+        let abs = work_dir.path().join("late.txt");
+        fs::write(&abs, b"raced in after planning").unwrap();
+
+        let action = Action::DeleteAbsent {
+            rel: "late.txt".to_string(),
+            delete_file: false,
+            delete_dir_stub: false,
+        };
+        let local_dir = TempDir::new().unwrap();
+        let local = LocalStore::for_cache(local_dir.path());
+        let mut counts = Counts::default();
+        let mut unavailable_paths = Vec::new();
+        apply_action(
+            action,
+            work_dir.path(),
+            work_dir.path(),
+            &local,
+            &HashSet::new(),
+            &mut counts,
+            &mut unavailable_paths,
+        )
+        .unwrap();
+
+        assert!(!abs.exists());
+        assert_eq!(counts.deleted, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Problem 1: NotFound-tolerant deletes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn apply_delete_file_tolerates_the_target_already_being_gone() {
+        // Simulates two planned actions racing to delete the same path
+        // (duplicate/overlapping path arguments, or a conflict helper
+        // already removed by its base path's own action): the second
+        // Action::DeleteFile must not error just because the first one
+        // already removed the file.
+        let work_dir = TempDir::new().unwrap();
+        // Deliberately never created: `rel` names a path that is already
+        // absent by the time this action applies.
+        let action = Action::DeleteFile {
+            rel: "already-gone.txt".to_string(),
+        };
+        let local_dir = TempDir::new().unwrap();
+        let local = LocalStore::for_cache(local_dir.path());
+        let mut counts = Counts::default();
+        let mut unavailable_paths = Vec::new();
+        apply_action(
+            action,
+            work_dir.path(),
+            work_dir.path(),
+            &local,
+            &HashSet::new(),
+            &mut counts,
+            &mut unavailable_paths,
+        )
+        .unwrap();
+
+        assert_eq!(counts.deleted, 1);
+        assert!(unavailable_paths.is_empty());
+    }
 }

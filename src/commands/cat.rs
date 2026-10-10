@@ -26,6 +26,8 @@ pub struct CatOptions {
     pub target: String,
     /// Print only the resolved 64-character hash instead of object content
     pub hash_only: bool,
+    /// Print the ordered chunk-hash manifest as JSON instead of object content
+    pub manifest_only: bool,
     /// Remote name (default: "origin")
     pub remote_name: String,
 }
@@ -36,6 +38,11 @@ pub fn run(opts: CatOptions) -> Result<(), Error> {
         if opts.hash_only {
             return Err(Error::Other(
                 "--hash is not supported for pack-layer objects".to_string(),
+            ));
+        }
+        if opts.manifest_only {
+            return Err(Error::Other(
+                "--manifest is not supported for pack-layer objects".to_string(),
             ));
         }
         let repo = Repo::open(&opts.work_dir)?;
@@ -99,7 +106,13 @@ pub fn run(opts: CatOptions) -> Result<(), Error> {
                         ) {
                             Ok(()) => (hash, None),
                             Err(Error::ObjectNotFound(_)) => {
-                                return print_pack_object(&hash, &pack_reader, &remote, &remote_key);
+                                return print_pack_object(
+                                    &hash,
+                                    &pack_reader,
+                                    &remote,
+                                    &remote_key,
+                                    opts.manifest_only,
+                                );
                             }
                             Err(e) => return Err(e),
                         }
@@ -161,10 +174,22 @@ pub fn run(opts: CatOptions) -> Result<(), Error> {
 
     let data = codec::store_read(&local, &final_hash, None)?;
 
+    // The tree check must run before the --manifest branch: trees are never
+    // chunked (see the "Trees are never chunked" comment below), so
+    // `--manifest` on a tree is an error rather than a fabricated manifest.
     if let Ok(tree) = Tree::deserialise(&data) {
+        if opts.manifest_only {
+            return Err(Error::Other(
+                "--manifest is not applicable to a tree object".to_string(),
+            ));
+        }
         let value = serde_json::to_value(&tree).map_err(Error::Json)?;
         println_json(&value)?;
         phase.complete("tree");
+    } else if opts.manifest_only {
+        let value = manifest_json(&data, &final_hash);
+        println_json(&value)?;
+        phase.complete("manifest");
     } else {
         // Stream the blob to stdout chunk by chunk (bounded memory). This also
         // handles chunked manifests: for_each_blob_chunk walks the chunk list
@@ -185,6 +210,43 @@ pub fn run(opts: CatOptions) -> Result<(), Error> {
         out.finish().map_err(Error::Io)?;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// --manifest helpers
+// ---------------------------------------------------------------------------
+
+/// Determine the ordered chunk-hash list reported by `--manifest` for a
+/// decoded (decrypted + decompressed) logical object at `logical_hash`:
+///
+/// - If `data` is a chunked manifest (`ED F2`), its chunk hash list, in
+///   storage/reassembly order (never reordered).
+/// - Otherwise `data` is an unchunked blob, stored directly at
+///   `logical_hash` with no manifest object at all (design/02_storage_format.md,
+///   "Single-chunk special case"). `logical_hash` itself is then the sole
+///   "chunk", so callers iterating the returned list never need to special-case
+///   the unchunked case.
+///
+/// Callers must ensure `data` is not a tree first: trees are never chunked, so
+/// this function has no tree-aware branch of its own -- `--manifest` on a tree
+/// is rejected before this is called.
+fn chunk_manifest_hashes(data: &[u8], logical_hash: &Hash) -> Vec<Hash> {
+    match crate::object::deserialise_manifest(data) {
+        Some(hashes) => hashes,
+        None => vec![logical_hash.clone()],
+    }
+}
+
+/// Build the `--manifest` JSON value for a decoded logical object at
+/// `logical_hash`. See `chunk_manifest_hashes` for the chunk-list rule.
+fn manifest_json(data: &[u8], logical_hash: &Hash) -> serde_json::Value {
+    let chunks = chunk_manifest_hashes(data, logical_hash);
+    let chunk_hex: Vec<&str> = chunks.iter().map(|h| h.as_str()).collect();
+    serde_json::json!({
+        "chunk_count": chunk_hex.len(),
+        "chunks": chunk_hex,
+        "hash": logical_hash.as_str(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -308,6 +370,7 @@ fn print_pack_object(
     pack_reader: &crate::codec::pack::reader::PackReader,
     remote: &LocalStore,
     remote_key: &Option<EncryptKey>,
+    manifest_only: bool,
 ) -> Result<(), Error> {
     let storage_key = remote.storage_key_of(hash);
 
@@ -315,6 +378,13 @@ fn print_pack_object(
 
     // Check leading 2 bytes before decryption: pack files are not encrypted.
     if raw.len() >= 2 && raw[0] == 0xED && raw[1] == 0xE0 {
+        // Pack file: not a logical (chunkable) object, so --manifest errors
+        // rather than falling back to the usual pack-layer summary view.
+        if manifest_only {
+            return Err(Error::Other(
+                "--manifest is not supported for pack-layer objects".to_string(),
+            ));
+        }
         // Pack file — show stored byte count only.
         let obj = serde_json::json!({
             "type": "pack-file",
@@ -336,12 +406,23 @@ fn print_pack_object(
     match (plaintext[0], plaintext[1]) {
         (0xED, 0xE2) => {
             // Index file (hot / delta / cold) — never a logical object, so no
-            // "outside the snapshot" warning applies here.
+            // "outside the snapshot" warning applies here. Likewise never
+            // chunked, so --manifest errors just as for a pack file.
+            if manifest_only {
+                return Err(Error::Other(
+                    "--manifest is not supported for pack-layer objects".to_string(),
+                ));
+            }
             let idx = IndexFile::deserialise(&plaintext)?;
             print_index_file_json(&idx, hash, &storage_key)
         }
         (0xED, 0xE4) => {
-            // Bloom filter — likewise never a logical object.
+            // Bloom filter — likewise never a logical object, never chunked.
+            if manifest_only {
+                return Err(Error::Other(
+                    "--manifest is not supported for pack-layer objects".to_string(),
+                ));
+            }
             let bf = BloomFilter::deserialise(&plaintext)?;
             print_bloom_json(&bf, hash, &storage_key)
         }
@@ -358,25 +439,42 @@ fn print_pack_object(
                     hash.as_str()
                 );
             }
-            print_logical_object(&data, pack_reader, remote_key.as_ref())
+            print_logical_object(&data, pack_reader, remote_key.as_ref(), hash, manifest_only)
         }
     }
 }
 
 /// Display already-decoded (decrypted + decompressed) logical-object bytes:
-/// a tree as pretty JSON, a blob (or chunked blob) streamed raw to stdout.
-/// Mirrors the local-cache-hit display in `run()`, but operates on bytes
-/// already fetched via LiveFallback rather than re-reading from a store, and
-/// resolves any chunk hashes of a manifest through `pack_reader` (ordinary
-/// SnapshotOnly resolution — only the manifest itself was found to be an
-/// orphan; its chunks are expected to still be indexed normally).
+/// a tree as pretty JSON, a blob (or chunked blob) streamed raw to stdout, or
+/// (with `manifest_only`) the ordered chunk-hash manifest as JSON. Mirrors the
+/// local-cache-hit display in `run()`, but operates on bytes already fetched
+/// via LiveFallback rather than re-reading from a store, and resolves any
+/// chunk hashes of a manifest through `pack_reader` (ordinary SnapshotOnly
+/// resolution — only the manifest itself was found to be an orphan; its
+/// chunks are expected to still be indexed normally). `hash` is the logical
+/// hash `data` was fetched at — needed for `--manifest`'s unchunked fallback
+/// (see `chunk_manifest_hashes`).
 fn print_logical_object(
     data: &[u8],
     pack_reader: &crate::codec::pack::reader::PackReader,
     remote_key: Option<&EncryptKey>,
+    hash: &Hash,
+    manifest_only: bool,
 ) -> Result<(), Error> {
+    // The tree check must run before the --manifest branch, same as in
+    // run(): trees are never chunked, so --manifest on a tree is an error.
     if let Ok(tree) = Tree::deserialise(data) {
+        if manifest_only {
+            return Err(Error::Other(
+                "--manifest is not applicable to a tree object".to_string(),
+            ));
+        }
         let value = serde_json::to_value(&tree).map_err(Error::Json)?;
+        return println_json(&value);
+    }
+
+    if manifest_only {
+        let value = manifest_json(data, hash);
         return println_json(&value);
     }
 
@@ -460,12 +558,25 @@ fn print_bloom_json(
     logical_hash: &Hash,
     storage_key: &Hash,
 ) -> Result<(), Error> {
+    use crate::codec::pack::bloom;
+
     let set_bits = count_set_bits_public(bf);
     let fill_rate = if bf.num_bits > 0 {
         set_bits as f64 / bf.num_bits as f64
     } else {
         0.0
     };
+
+    // design/02 "Fill-rate reporting": the capacity this filter's own
+    // num_bits was designed for (inverting capacity_for's bit-count
+    // formula), and an estimated current false-positive rate from
+    // (element_count, num_bits, num_hash_functions) alone -- so this works
+    // for any loaded filter, regardless of what capacity it happened to be
+    // built for (design/02 "Filter sizing": a size mismatch is no longer
+    // rejected).
+    let designed_capacity = bloom::designed_capacity(bf.num_bits);
+    let estimated_fp_rate =
+        bloom::estimated_fp_rate(bf.element_count, bf.num_bits, bf.num_hash_functions);
 
     let obj = serde_json::json!({
         "type": "bloom-filter",
@@ -475,6 +586,8 @@ fn print_bloom_json(
         "num_bits": bf.num_bits,
         "element_count": bf.element_count,
         "fill_rate": (fill_rate * 1_000_000.0).round() / 1_000_000.0,
+        "designed_capacity": designed_capacity,
+        "estimated_fp_rate": (estimated_fp_rate * 1_000_000.0).round() / 1_000_000.0,
     });
     println_json(&obj)
 }
@@ -695,7 +808,39 @@ fn ensure_in_local_cache(
 
 #[cfg(test)]
 mod tests {
-    use super::split_target;
+    use super::{chunk_manifest_hashes, split_target};
+    use crate::object::Hash;
+
+    fn hash_of(byte: u8) -> Hash {
+        Hash::from_hex(&format!("{:02x}", byte).repeat(32)).unwrap()
+    }
+
+    #[test]
+    fn chunk_manifest_hashes_returns_manifest_list_when_present() {
+        // A chunked manifest (ED F2) reports its own ordered chunk-hash list,
+        // in storage order, regardless of the logical hash passed alongside it.
+        let h0 = hash_of(0x11);
+        let h1 = hash_of(0x22);
+        let manifest_bytes = crate::object::serialise_manifest(&[h0.clone(), h1.clone()]);
+        let logical = hash_of(0x99);
+        assert_eq!(
+            chunk_manifest_hashes(&manifest_bytes, &logical),
+            vec![h0, h1]
+        );
+    }
+
+    #[test]
+    fn chunk_manifest_hashes_falls_back_to_logical_hash_when_unchunked() {
+        // design/02_storage_format.md "Single-chunk special case": an
+        // unchunked blob has no manifest object -- it is stored directly at
+        // the logical hash, so that hash is the sole "chunk".
+        let logical = hash_of(0x33);
+        let blob_bytes = b"not a manifest, just ordinary blob content";
+        assert_eq!(
+            chunk_manifest_hashes(blob_bytes, &logical),
+            vec![logical]
+        );
+    }
 
     #[test]
     fn bare_hash_has_no_subpath() {

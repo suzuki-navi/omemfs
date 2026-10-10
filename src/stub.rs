@@ -319,6 +319,38 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<(String, StubRecord)>) -> Resu
 }
 
 // ---------------------------------------------------------------------------
+// Stub frontier lookup (used by `expand` to resolve a path nested inside an
+// unexpanded directory stub -- design/04_cli_spec.md, "Paths below the stub
+// frontier").
+// ---------------------------------------------------------------------------
+
+/// Find the deepest on-disk directory-stub record that is a *proper* ancestor
+/// of `rel_path` (never `rel_path` itself -- callers only reach this after a
+/// direct match on `rel_path` has already failed).
+///
+/// Checks every ancestor directory from deepest to shallowest and returns the
+/// first (deepest) one with an on-disk directory-stub marker, along with its
+/// `rel_path` and `StubRecord`. Returns `None` when no ancestor is stubbed.
+///
+/// Deepest-first also makes this naturally resume a previously interrupted
+/// `expand` lowering: if an ancestor was already partially lowered, this walk
+/// finds whichever deeper level is still marked, not the original top-level
+/// ancestor.
+pub fn deepest_ancestor_stub(
+    work_dir: &Path,
+    rel_path: &str,
+) -> Result<Option<(String, StubRecord)>, Error> {
+    let components: Vec<&str> = rel_path.split('/').filter(|c| !c.is_empty()).collect();
+    for end in (1..components.len()).rev() {
+        let ancestor = components[..end].join("/");
+        if let Some(record) = read_dir_stub(work_dir, &ancestor)? {
+            return Ok(Some((ancestor, record)));
+        }
+    }
+    Ok(None)
+}
+
+// ---------------------------------------------------------------------------
 // Filename helpers
 // ---------------------------------------------------------------------------
 
@@ -331,4 +363,60 @@ pub fn is_stub_filename(name: &str) -> bool {
 /// Returns `None` if the name does not end with the suffix.
 pub fn logical_name(stub_name: &str) -> Option<&str> {
     stub_name.strip_suffix(STUB_SUFFIX)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn dummy_record() -> StubRecord {
+        StubRecord {
+            target_type: StubTargetType::Tree,
+            hash: Hash::compute(b"dummy"),
+            size: 100,
+            mtime: None,
+            mode: None,
+            blob_count: 0,
+        }
+    }
+
+    #[test]
+    fn deepest_ancestor_stub_finds_nearest_marker() {
+        let dir = TempDir::new().unwrap();
+        write_dir_stub(dir.path(), "a", &dummy_record()).unwrap();
+        let found = deepest_ancestor_stub(dir.path(), "a/b/c").unwrap();
+        assert_eq!(found.map(|(rel, _)| rel), Some("a".to_string()));
+    }
+
+    #[test]
+    fn deepest_ancestor_stub_prefers_deepest_when_multiple_ancestors_stubbed() {
+        let dir = TempDir::new().unwrap();
+        write_dir_stub(dir.path(), "a", &dummy_record()).unwrap();
+        write_dir_stub(dir.path(), "a/b", &dummy_record()).unwrap();
+        let found = deepest_ancestor_stub(dir.path(), "a/b/c/d").unwrap();
+        assert_eq!(found.map(|(rel, _)| rel), Some("a/b".to_string()));
+    }
+
+    #[test]
+    fn deepest_ancestor_stub_returns_none_with_no_stubbed_ancestor() {
+        let dir = TempDir::new().unwrap();
+        let found = deepest_ancestor_stub(dir.path(), "a/b/c").unwrap();
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn deepest_ancestor_stub_ignores_a_marker_at_the_path_itself() {
+        let dir = TempDir::new().unwrap();
+        // A marker at "a/b" itself (not a proper ancestor of "a/b") must not
+        // be returned -- callers only reach this function after a direct
+        // match on the path itself has already failed.
+        write_dir_stub(dir.path(), "a/b", &dummy_record()).unwrap();
+        let found = deepest_ancestor_stub(dir.path(), "a/b").unwrap();
+        assert!(found.is_none());
+    }
 }

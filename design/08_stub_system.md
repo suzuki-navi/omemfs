@@ -171,6 +171,22 @@ expanded). Recursing into a fully-stubbed directory (no real files) is also
 incorrect because blob objects are not guaranteed to be in the local cache for
 stubbed paths; the reconcile simply updates the stub record.
 
+The table above covers every path that **is** a stub. It says nothing about a
+third state: a path present in `clone_root` but currently neither a stub nor a
+real file on disk (`ls`'s `D` status — see `04_cli_spec.md`). This state is
+reached whenever a materialised file or a stub is deleted directly (`rm`)
+instead of through `omemfs stub`/an `omemfs restore` that reconciles it, and it
+is deliberately **not** in the reconcile table above: reconcile only ever
+updates or removes an *existing* stub record, it never creates a new one for a
+path that has none. A `D` path is `restore`'s job, not reconcile's — it is
+exactly the "plan to restore a blob" case in `04_cli_spec.md`'s "omemfs
+restore", and if the blob (or one of its chunks) named by `clone_root` is not
+in the local cache, it is what `restore`'s fetch phase fetches (see "Missing
+objects" in that same section). Before `restore` gained a fetch phase, this was
+also the state that produced the `error: object not found: <hash>` failure
+this document's stub reconcile table was never responsible for guarding
+against, because the failing path was never a stub in the first place.
+
 ---
 
 ## Commands
@@ -211,6 +227,13 @@ Materialise one or more stubbed files or directories.
 
 **Behaviour**:
 
+0. If a requested `<path>` does not match any on-disk stub record, but a proper
+   ancestor directory does have an on-disk directory stub, lower the stub
+   frontier one tree level at a time until the requested path itself is an
+   on-disk stub record (or is found to already be materialised, or an error is
+   raised). See "Lowering the stub frontier past a `.git` entry" below and
+   `design/04_cli_spec.md`, "Paths below the stub frontier", for the full
+   algorithm.
 1. Collect stub records for the specified paths (or all stubs if no path is given).
 2. Apply the size filter: stubs at or above `--stub-threshold` are kept stubbed
    unless `-r` / `--recursive` is set.
@@ -324,6 +347,42 @@ Concretely, when `omemfs clone` and `omemfs expand` walk a tree:
 
 This guarantees a materialised Git working tree is fully real on disk (never
 partially stubbed), while still permitting a large Git repo to be stubbed as a unit.
+
+**Lowering the stub frontier past a `.git` entry.** When `omemfs expand
+<path>` targets a path nested inside an unexpanded directory stub, the
+frontier is lowered one level at a time (see `design/04_cli_spec.md`, "Paths
+below the stub frontier"), and a level may contain a `.git` Tree entry as an
+ordinary sibling of the path being resolved. Lowering such a level is
+permitted: `.git` becomes a single atomic directory stub, never split and
+never partially expanded — the same all-or-nothing treatment already allowed
+above for a whole Git repo root, applied to `.git` as a sibling encountered
+mid-lowering.
+
+Two constraints apply:
+
+- Within one level's lowering, the `.git` child (if present) is written
+  **last**, after every other sibling's stub-or-materialise decision has
+  already been made and written. `stub_would_be_visible_to_git`'s enclosing-
+  worktree lookup detects a Git working tree by the physical existence of a
+  `.git` entry alone, and writing a directory stub for `.git` makes it
+  physically exist (as a directory containing only `.omemfs-stub`, with no
+  `HEAD`). Writing `.git` first would make every remaining sibling's
+  Git-visibility check invoke `git check-ignore` inside that non-functional
+  repository, fail (exit 128), and hit the fail-safe "visible" answer —
+  silently forcing every remaining sibling to be fully materialised instead of
+  stubbed. Writing `.git` last avoids this deterministically.
+- Resolving a requested path that lies on or below a `.git` entry (the target
+  requires descending into `.git`, or the target *is* `.git`) is refused, even
+  though `.git` itself would just become an atomic stub like any other
+  sibling. The reason is what `expand` does next: the whole point of the
+  command is to materialise the resolved target, and materialising `.git`
+  while its sibling project files remain individual stub markers is exactly
+  the half-stubbed, half-real Git working tree state this section forbids —
+  once `.git` is real and functional, `git status` in that directory would
+  really report the sibling `.omemfs-stub` files as untracked or dirty. The
+  error directs the user to expand the enclosing directory as a whole instead,
+  which correctly expands `.git` together with every sibling in one atomic
+  step.
 
 `omemfs stub` (the explicit, user-invoked command) additionally refuses to place a
 stub that would be visible to Git when stubbing inside — but not as the root of — a

@@ -120,6 +120,12 @@ enum Command {
     Restore {
         /// Paths to restore (default: entire working tree)
         paths: Vec<PathBuf>,
+        /// Remote to fetch missing objects from, if any are needed
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        /// Never contact the remote; report unavailable paths instead of fetching
+        #[arg(long)]
+        no_remote: bool,
         /// Show what would be restored without making changes
         #[arg(long)]
         dry_run: bool,
@@ -130,8 +136,11 @@ enum Command {
         /// hash, clone-root, remote-root, index-root, or ref[:path] (path may also be separated by /)
         target: String,
         /// Print only the resolved 64-character hash instead of the object content
-        #[arg(long)]
+        #[arg(long, conflicts_with = "manifest")]
         hash: bool,
+        /// Print the ordered chunk-hash manifest as JSON instead of the object content
+        #[arg(long, conflicts_with = "hash")]
+        manifest: bool,
         /// Remote name (default: origin)
         #[arg(long, default_value = "origin")]
         remote: String,
@@ -443,21 +452,30 @@ fn main() {
             },
         }),
 
-        Command::Restore { paths, dry_run } => restore::run(restore::RestoreOptions {
+        Command::Restore {
+            paths,
+            remote,
+            no_remote,
+            dry_run,
+        } => restore::run(restore::RestoreOptions {
             work_dir,
             current_dir: cwd.clone(),
             paths,
             dry_run,
+            remote_name: remote,
+            no_remote,
         }),
 
         Command::Cat {
             target,
             hash,
+            manifest,
             remote,
         } => cat::run(cat::CatOptions {
             work_dir,
             target,
             hash_only: hash,
+            manifest_only: manifest,
             remote_name: remote,
         }),
 

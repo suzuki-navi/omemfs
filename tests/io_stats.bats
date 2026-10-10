@@ -179,3 +179,35 @@ teardown() {
     last_io_line=$(echo "$output" | grep "Last I/O")
     [[ "$last_io_line" == *"pack"* ]]
 }
+
+# ---------------------------------------------------------------------------
+# Test 7: a restore that fetches missing objects writes a "restore" record
+# (design/04_cli_spec.md, "omemfs restore" -> Behaviour, Phase 2 "Fetch
+# missing objects").
+# ---------------------------------------------------------------------------
+
+@test "io_stats: restore that fetches missing objects writes a record to io_stats.jsonl" {
+    printf 'x%.0s' {1..100} > big.bin
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    local second_dir
+    second_dir="$(mktemp -d)"
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" --stub-threshold 10 "$second_dir"
+    [ "$status" -eq 0 ]
+
+    pushd "$second_dir" > /dev/null
+    rm big.bin.omemfs-stub
+
+    run "$OMEMFS" restore
+    [ "$status" -eq 0 ]
+    [ -f big.bin ]
+
+    local jsonl=".omemfs/io_stats.jsonl"
+    [ -f "$jsonl" ]
+    run grep '"cmd":"restore"' "$jsonl"
+    [ "$status" -eq 0 ]
+
+    popd > /dev/null
+    rm -rf "$second_dir"
+}

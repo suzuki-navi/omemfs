@@ -737,28 +737,74 @@ Backup remote configured.
 Discard local working tree changes for one or more paths by restoring the content recorded in `clone_root`.
 
 ```
-omemfs restore [<path>...]
+omemfs restore [--remote <name>] [--no-remote] [--dry-run] [<path>...]
 ```
 
 **Arguments**
 - `<path>...`: paths to restore, resolved relative to the cwd. If omitted, restore the entire working tree — unlike `push`/`pull`/`ls`, the no-argument default is always the whole tree, not the cwd subtree, because restoring is a deliberate destructive action that should not silently narrow to the current directory.
+  - Paths are normalised and deduplicated before the plan is built: an exact duplicate (`restore sub sub`), or one path nested inside another (`restore . sub`, `. ` being the whole tree), is collapsed to a single occurrence of its outermost ancestor. This makes the plan (and therefore its actions) independent of how many times an equivalent path was named — no directory scan or delete is ever planned twice for the same path.
 
 **Options**
-- `--dry-run`: show what would be restored without making changes
+- `--remote <name>`: remote to fetch missing objects from, if any are needed (default: `origin`)
+- `--no-remote`: never contact the remote. A path that needs an object absent from the local cache is left un-restored and reported under `unavailable:` instead of being fetched — see "Missing objects" below.
+- `--dry-run`: show what would be restored without making changes. Performs no remote I/O at all, regardless of `--remote`/`--no-remote`: a path whose object is not locally cached is reported as `would fetch:` instead of being downloaded — see "Missing objects" below.
 
 **Behaviour**
 
-1. Read `clone_root`. If absent (repository has never been synced), error out.
-2. For each path specified (or the entire tree if none):
-   - If the path is present in `clone_root` as a blob: overwrite the working tree file with the clone root content. Restore `mtime` and the executable-bit `mode` from the tree entry.
-   - If the working tree content already matches the clone root blob but the executable bit differs, only the mode is fixed (chmod, no content rewrite). The path is still reported and counted as restored.
-   - If the path is present in `clone_root` as a tree (directory): recursively restore all descendant blobs.
-   - If the path is absent from `clone_root`: delete the file from the working tree (it was locally added and is being discarded).
-   - If the path is not present in the working tree and not in `clone_root`: no-op.
-   - For each restored or deleted path, also delete any corresponding conflict helper files (`<path>.omemfs-conflict-{base,local,remote}`) if they exist.
-3. `clone_root` is **not** modified. The remote is not accessed.
+`restore` runs in three phases: plan, fetch, apply.
 
-This operation is the inverse of local edits: after `restore`, the working tree at `<path>` matches the clone root exactly. Any conflict helper files for restored paths are removed as part of the restore.
+1. **Plan.** Read `clone_root`. If absent (repository has never been synced), error out. Walk `clone_root` against the working tree, purely locally and without writing anything, deciding the action for every path:
+   - If the path is present in `clone_root` as a blob: plan to overwrite the working tree file with the clone root content, restoring `mtime` and the executable-bit `mode` from the tree entry.
+   - If the working tree content already matches the clone root blob but the executable bit differs, only the mode is fixed (chmod, no content rewrite). The path is still reported and counted as restored.
+   - If the path is present in `clone_root` as a tree (directory): recursively plan to restore all descendant blobs.
+   - If the path is absent from `clone_root`: plan to delete the file from the working tree (it was locally added and is being discarded).
+   - If the path is not present in the working tree and not in `clone_root`: no-op.
+   - A path that is currently a stub is reconciled (the stub record is updated to match `clone_root`) instead of being materialised, and nothing below it is planned for fetch — see `08_stub_system.md`, "Stub reconcile (pull and restore)".
+   - Conflict helper files (`<path>.omemfs-conflict-{base,local,remote}`) are always planned for removal when the directory scan for locally-added/unknown entries finds them, regardless of whether `<path>` itself has its own restore or delete action — this also covers `<path>` being an unchanged directory, an unchanged symlink, or a locally-added file that is itself being deleted, none of which plan any action of their own for `<path>`. A conflict helper already removed as a side effect of `<path>`'s own action by the time this delete runs is treated as already-gone, not an error (see "Errors" below).
+   - While walking, every blob whose object (or, for a chunked blob, any of its chunks) is missing from the local cache is noted, along with any `clone_root` tree object the walk itself could not read locally. A local cache miss here is not evidence that the object was lost — see "Missing objects" below.
+   - `--dry-run` stops here: nothing beyond the plan is computed, and nothing is fetched or written.
+2. **Fetch missing objects.** If the plan found nothing missing — every planned blob and every `clone_root` tree object the walk needed was already in the local cache — this phase does nothing at all: no remote is contacted, no configuration is read, and no cloud client is constructed. This preserves today's fully offline behaviour whenever the local cache is already complete. If `--no-remote` was given, this phase is likewise skipped, and the paths that would otherwise have been fetched are instead recorded as unavailable. Otherwise, the missing objects — and any unreadable `clone_root` tree object, healed one level at a time through the same lazy tree store `pull`/`ls` use (`03_sync_model.md`, "Lazy tree reads") — are fetched from `--remote` in one batched, concurrent transfer (the same multi-root batching `expand` uses; see `02_storage_format.md`, "Multi-root batching"). Only objects reachable from `clone_root` are ever fetched — the remote root is never read, and `restore` never advances the working tree beyond what `clone_root` already records.
+3. **Apply.** Every planned action is applied: files are written, deletions performed, stubs reconciled, conflict helper files removed. Every object the plan needs was resolved (or explicitly declared unavailable) in phase 2, so a failure applying the plan is a genuine I/O error, never a cache miss discovered mid-write. A delete is tolerant of the target already being gone (whether because an earlier action in the same plan already removed it, or because it was removed from outside `restore` between plan and apply) rather than treating that as an error. Because phase 2's fetch can take real wall-clock time, a mode-only fix re-checks that its target still exists immediately before applying, and a delete that phase 1 found nothing to remove re-checks whether something now exists to remove; either check finding the working tree changed since phase 1 is reported rather than crashing apply. This is a cheap presence check only — `restore` does not re-verify byte-for-byte content that phase 1 already found matching.
+
+`clone_root` is **not** modified by `restore`, and the remote root is never read.
+
+This operation is the inverse of local edits: after `restore`, the working tree at `<path>` matches the clone root exactly, except for any path reported `unavailable:`, which is left as it was found. Any conflict helper files for restored paths are removed as part of the restore.
+
+**Missing objects**
+
+A path can need an object that is not yet in the local cache — most commonly after a partial `expand`/`pull`, or when a stub was deleted from the working tree without ever being expanded (the working tree entry is gone, but the stub record — and therefore the object — was never fetched in the first place). This is expected and recoverable, not a sign of data loss: every object reachable from `clone_root` is guaranteed to have an index entry on the remote (see `02_storage_format.md`, "Snapshot read path"), so a local cache miss during the plan phase means "not fetched into this clone yet", never "gone".
+
+By default `restore` fetches whatever is missing (phase 2 above) and the working tree ends up fully restored. With `--no-remote`, or when the remote cannot be reached, `restore` still applies every action that does not require a missing object, and reports the rest:
+
+```
+$ omemfs restore --no-remote
+  restored: src/lib.rs
+unavailable: build/libs/app.war
+1 path(s) restored, 1 path(s) unavailable.
+```
+
+Each `unavailable:` line names the working-tree **path**, never a bare object hash. This matters most for a chunk hash: a chunk is never referenced by any tree entry, so there is no way to work backward from a chunk hash alone to the path that needed it. `restore` exits non-zero whenever the `unavailable:` list is non-empty, even though every other applicable action was applied.
+
+A fetch failure that is *not* simply an object not yet fetched into this clone — an authentication or DEK mismatch, corrupted/invalid remote data, a misconfigured or mistyped `--remote`, a full local disk, and so on — is never silently folded into an ordinary `unavailable:` line with no further explanation. `restore` still applies every action that does not need the failed fetch and reports `unavailable:` for the rest exactly as above, but it additionally prints one line naming the real cause after the summary:
+
+```
+$ omemfs restore --remote typo-ed-remote
+  restored: src/lib.rs
+unavailable: build/libs/app.war
+1 path(s) restored, 1 path(s) unavailable.
+warning: fetch from 'typo-ed-remote' failed: remote 'typo-ed-remote' not configured
+```
+
+This warning is omitted for the ordinary "not yet fetched" case (including `--no-remote` and a genuinely unreachable remote) — those are expected and already fully explained by the `unavailable:` lines themselves.
+
+`--dry-run` reports the same missing objects without fetching anything, so it doubles as a pre-flight check of how much a subsequent `restore` would need to download:
+
+```
+$ omemfs restore --dry-run
+  would restore: src/lib.rs
+would fetch: build/libs/app.war
+2 path(s) would be restored.
+```
 
 **Output example**
 
@@ -774,6 +820,7 @@ $ omemfs restore src/lib.rs docs/
 
 - No `clone_root` (repository never synced): `error: no clone_root — repository has never been synced`
 - Path not inside work_dir: `error: path '<path>' is not inside the working tree`
+- An object needed to complete the restore could not be fetched (remote unreachable, not configured, or `--no-remote`): the affected path is listed under `unavailable:` in the summary and the command exits non-zero — see "Missing objects" above. `restore` never reports `error: object not found: <hash>`: a bare hash names no path a user could act on, and, per "Missing objects" above, a cache miss during restore's plan phase is not evidence that the object was lost.
 
 ---
 
@@ -782,7 +829,7 @@ $ omemfs restore src/lib.rs docs/
 Print the content of an object to stdout.
 
 ```
-omemfs cat [--hash] [--remote <name>] <target>
+omemfs cat [--hash] [--manifest] [--remote <name>] <target>
 ```
 
 **Arguments**
@@ -797,6 +844,7 @@ omemfs cat [--hash] [--remote <name>] <target>
 
 **Options**
 - `--hash`: print only the resolved 64-character hash to stdout, instead of the object content. Useful for scripting (e.g. `HASH=$(omemfs cat --hash clone-root)`). Not supported for pack-layer objects.
+- `--manifest`: print the resolved object's ordered chunk-hash manifest as JSON instead of the object content. Mutually exclusive with `--hash`. Not applicable to tree objects; not supported for pack-layer objects. See **Chunk manifest output** below.
 - `--remote <name>`: remote to use when reading from the remote store (default: `origin`).
 
 **Resolution order for hash targets**
@@ -816,6 +864,7 @@ If no step resolves the object, an error is returned.
 - Symlinks have no associated object; `<ref>/<path>` targeting a symlink is an error.
 - With `--hash`, `/<path>` traversal still occurs; the hash of the resolved leaf object is printed.
 - LiveFallback (see **Resolution order for hash targets**, step 3): when a full-hash target is displayed only because it was found outside the current snapshot, a warning is printed to stderr, e.g. `warning: <hash> was found outside the current snapshot (no delta/hot/cold index entry references it; likely an orphan from an interrupted or obsolete write) -- it is not reachable from any recorded root`. This never happens for a hash resolved through the local cache or through the snapshot index (steps 1–2).
+- With `--manifest`, the resolved object's ordered chunk-hash list is printed as JSON instead of the object content (see **Chunk manifest output** below). `/<path>` traversal still occurs first; the manifest reported is for the resolved leaf object. `--manifest` is honoured at every resolution step (local cache, SnapshotOnly, and LiveFallback for a full hash) — including LiveFallback, where the usual stderr warning is still printed even though stdout carries only the manifest JSON. A tree object resolved this way is an error, not a manifest (trees are never chunked); a pack-layer artifact (pack file / index file / Bloom filter) resolved via LiveFallback is likewise an error, not the usual **Pack-layer output** view.
 
 **Output examples**
 
@@ -855,12 +904,36 @@ $ omemfs cat clone-root
 
 ```
 $ omemfs cat --hash clone-root
-a3f89b2c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2
+a3f89b2c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a
 ```
 
 ```
 $ omemfs cat --hash clone-root/docs/guide.md
 b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3
+```
+
+```
+$ omemfs cat --manifest clone-root/daily/0803/big.zip
+{
+  "chunk_count": 3,
+  "chunks": [
+    "2b2de5a00c86c06e25f80cd82ecdadcbffd9dcf1af51f5c2a4f9512bd89b04e1",
+    "74e516fc697e07cd3195107902c08c57fec9eb0f8cb23b570d659749604b4486",
+    "748b4c6d14b26077481505ce0e70c9dcf0d4a4e64b9fde27fe6b5062a136c2a5"
+  ],
+  "hash": "5c19f35002667c03d05222276185e84b13b3290eaa89a5b48fb76efd0f1888be"
+}
+```
+
+```
+$ omemfs cat --manifest clone-root/README.md   # small file: never chunked
+{
+  "chunk_count": 1,
+  "chunks": [
+    "a3f89b2c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a"
+  ],
+  "hash": "a3f89b2c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a"
+}
 ```
 
 **Errors**
@@ -872,6 +945,36 @@ b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3
 - No clone root: `error: no clone_root — repository has never been synced`
 - No remote root (index root absent): `error: no index root on origin`
 - `--hash` used with a pack-layer object: `error: --hash is not supported for pack-layer objects`
+- `--manifest` used on a tree object: `error: --manifest is not applicable to a tree object`
+- `--manifest` used on a pack-layer object: `error: --manifest is not supported for pack-layer objects`
+
+---
+
+#### Chunk manifest output
+
+`--manifest` prints the resolved object's ordered chunk-hash list as JSON instead of the object content:
+
+```json
+{
+  "chunk_count": 3,
+  "chunks": [
+    "<chunk hash 0>",
+    "<chunk hash 1>",
+    "<chunk hash 2>"
+  ],
+  "hash": "<resolved logical hash>"
+}
+```
+
+- `hash`: the resolved logical hash (64 hex characters) — the traversed leaf hash for `<ref>:<path>` targets.
+- `chunks`: the chunk hashes in **storage order** (the order the file is reassembled from), exactly as recorded in the chunk manifest object (`ED F2`, see design/02_storage_format.md, "Object type tags" and "L3: chk"). Never reordered.
+- `chunk_count`: the length of `chunks`.
+
+**Unchunked blobs report their own hash as the sole chunk.** A blob small enough that FastCDC produces only one chunk is stored whole at the logical hash with no `ED F2` manifest object (design/02_storage_format.md, "Single-chunk special case"). For such a blob, `--manifest` reports `chunk_count: 1` and `chunks: [<logical hash>]` — the logical hash is the only chunk, because it and the sole chunk are the same stored object. This keeps `--manifest`'s output shape uniform (a caller iterating `chunks` never needs to special-case the unchunked case) at the cost of the array's one entry being redundant with `hash` in that case.
+
+A tree object has no chunk manifest — trees are never chunked (design/04_cli_spec.md, this section, "Behaviour": trees are pretty-printed as JSON; design/02_storage_format.md's read algorithm never runs FastCDC over tree bytes) — so `--manifest` on a tree is an error, not a one-element or empty array.
+
+A pack-layer object (pack file / index file / Bloom filter), reached only via LiveFallback for a full hash that misses the snapshot index, is likewise not a chunked logical object, so `--manifest` errors instead of falling back to the **Pack-layer output** view.
 
 ---
 
@@ -1026,13 +1129,13 @@ omemfs expand [<path>...] [-r | --recursive] [--stub-threshold <size>] [--remote
 ```
 
 **Arguments**
-- `<path>...`: paths to expand (relative to the current working directory). If omitted, all `*.omemfs-stub` files found in the working tree are considered. Explicitly named paths are always expanded regardless of `--stub-threshold`.
+- `<path>...`: paths to expand (relative to the current working directory). If omitted, all `*.omemfs-stub` files found in the working tree are considered. Explicitly named paths are always expanded regardless of `--stub-threshold`. A path nested inside an unexpanded directory stub (no on-disk stub record matches it directly) is resolved by lowering the stub frontier down to it one tree level at a time — see "Paths below the stub frontier" below.
 
 **Options**
 - `-r`, `--recursive`: expand all stubs regardless of size. Equivalent to `--stub-threshold 0`; overrides a simultaneously-given `--stub-threshold`.
 - `--stub-threshold <size>`: only expand stubs whose size is strictly below this value; stubs at or above remain stubbed (default: `1M`). Format: `1024` / `100K` / `100M` / `100G`. Use `0` to expand everything (equivalent to `-r`). Invalid size strings (e.g. `1GB`, non-numeric input) are a hard CLI error.
 - `--remote <name>`: remote to download blobs from when they are not in the local cache (default: `origin`)
-- `--dry-run`: show what would be expanded without writing files or removing stub records
+- `--dry-run`: show what would be expanded without writing files or removing stub records. For a path nested inside an unexpanded directory stub, this still reads (but never caches) whatever tree objects are needed to confirm the path exists — see "Paths below the stub frontier" below.
 
 **Behaviour**
 
@@ -1045,6 +1148,41 @@ omemfs expand [<path>...] [-r | --recursive] [--stub-threshold <size>] [--remote
 The reported `N file(s) expanded` count is the number of **files (blobs and symlinks) actually materialised** into the working tree, not the number of top-level stub records processed. Expanding a directory stub materialises its whole subtree (down to any nested stubs left in place by `--stub-threshold`), so the count reflects every file written, which may be far greater than one.
 
 Path arguments are normalised before matching: a trailing slash (as appended by shell tab-completion, e.g. `expand foo/`) is stripped so a directory passed with a trailing slash matches its stub record rather than silently expanding nothing.
+
+**Paths below the stub frontier**
+
+`stub::list()` never recurses past a directory-stub marker, so a requested path nested inside an unexpanded directory stub (e.g. `expand ai-labo/ja-tochigi` when `ai-labo` is a single-marker directory stub and `ja-tochigi` only exists inside `ai-labo`'s recorded tree object) matches nothing on disk. Before reporting "Nothing to expand.", `expand` resolves such a path by *lowering the stub frontier*:
+
+1. Find the deepest on-disk ancestor directory stub of the requested path.
+2. Read that ancestor's recorded tree object (one object, via the local cache or the remote pack index) and replace its directory-stub marker with a real directory whose every child becomes its own individual stub record, written purely from that child's tree-entry fields (hash, size, mtime, mode, blob_count) — no download required for this step. A child that is a symlink is materialised instead (symlinks are never stubbable). A child whose stub would be visible to Git (see "Stubs and Git repositories" in `08_stub_system.md`) is materialised instead of stubbed. A child already present on disk is left untouched. The directory-stub marker itself is removed last, after every child is written, so an interrupted lowering is safely resumable.
+3. Repeat one level at a time until the requested path is itself an on-disk stub record, then proceed with steps 1-5 above unchanged.
+
+Siblings passed over while descending toward the requested path stay stubbed regardless of `--stub-threshold` / `-r`: those flags govern how much of the *target* is expanded once reached, not how much of the ancestor is pulled in to reach it. (`-r` is exactly `--stub-threshold 0`; the opposite rule would make a targeted nested `expand -r` download the whole ancestor directory.)
+
+Multiple `<path>` arguments that share a common ancestor read that ancestor's tree object only once, not once per target.
+
+A path requiring descent into, or naming, a stubbed `.git` directory is refused (see `08_stub_system.md`, "Lowering the stub frontier past a `.git` entry"):
+
+```
+error: cannot expand 'ai-labo/gitproj/.git/config': 'ai-labo/gitproj/.git' is a stubbed
+Git directory and can only be expanded together with its working tree — expand
+'ai-labo/gitproj' as a whole ('omemfs expand ai-labo/gitproj')
+```
+
+A path that does not exist inside a resolved ancestor's tree is an error:
+
+```
+error: cannot expand 'ai-labo/no-such-dir': 'ai-labo/no-such-dir' does not exist
+```
+
+A path whose resolution would require descending into a file (a tree entry that is a blob or symlink, not a directory) is also an error:
+
+```
+error: cannot expand 'ai-labo/readme.txt/inner': 'ai-labo/readme.txt' is a file, not a
+directory
+```
+
+`--dry-run` during frontier lowering may read tree objects (unavoidable — a directory-stub record carries no child names, so this is the only way to learn whether the path even exists), but never writes to `.omemfs/objects/` and never creates, modifies, or removes any stub record or working-tree file. When an intermediate tree object is not already cached locally, `--dry-run` reads it once from the remote and discards the bytes afterward rather than caching them, so `.omemfs/objects/` stays byte-identical to before the dry run.
 
 **Output example**
 
@@ -1063,6 +1201,17 @@ $ omemfs expand --dry-run
 ```
 $ omemfs expand
 2 file(s) expanded, 1 stub(s) at or above threshold kept.
+```
+
+```
+$ omemfs expand ai-labo/ja-tochigi
+1 file(s) expanded.
+```
+
+```
+$ omemfs expand --dry-run ai-labo/ja-tochigi
+  would expand: ai-labo/ja-tochigi
+1 stub(s) would be expanded.
 ```
 
 ---

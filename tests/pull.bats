@@ -287,6 +287,42 @@ setup_two_clones() {
     [ ! -f gitproject/data.bin.omemfs-stub ]
 }
 
+@test "pull: whole-stubs a newly-pulled directory that is itself a git repo root" {
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone1
+    [ "$status" -eq 0 ]
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone2
+    [ "$status" -eq 0 ]
+
+    cd clone1
+    mkdir -p gitproject
+    git -C gitproject init -q
+    # Large file (above threshold 10) inside a git working tree, pushed as
+    # part of the remote tree including .git itself.
+    printf '%020d' 0 > gitproject/large.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    # clone2 has no local gitproject at all, so the entry is newly added from
+    # pull's diff perspective (base_tree_hash is None). It must be
+    # whole-stubbed, not materialised, even though it is a git repo root --
+    # see design/08_stub_system.md "Stubs and Git repositories" and
+    # src/commands/clone.rs's expand_or_stub for the reference behaviour
+    # omemfs pull must match.
+    cd clone2
+    run "$OMEMFS" pull --stub-threshold 10
+    [ "$status" -eq 0 ]
+    [ -f gitproject/.omemfs-stub ]
+    [ ! -f gitproject/large.txt ]
+    [ ! -e gitproject/.git ]
+
+    # expand restores the repo intact, including the file.
+    run "$OMEMFS" expand gitproject
+    [ "$status" -eq 0 ]
+    [ -f gitproject/large.txt ]
+    [ ! -f gitproject/.omemfs-stub ]
+}
+
 @test "pull: conflict writes helper files and exits non-zero" {
     setup_two_clones
 

@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::codec::encrypt::EncryptKey;
-use crate::codec::pack::bloom::{BloomFilter, DEFAULT_NUM_HASH_FUNCTIONS};
+use crate::codec::pack::bloom::{self, BloomFilter};
 use crate::codec::pack::index::{IndexEntry, IndexFile, PackEntry};
 use crate::codec::pack::index_root::IndexRoot;
 use crate::codec::pack::root_pointer::RootToken;
@@ -154,6 +154,7 @@ pub fn run(opts: PackOptions) -> Result<(), Error> {
     // -----------------------------------------------------------------------
     let bloom = regenerate_bloom(&hot_entries, &cold_shard_files);
     detail.bloom_elements = bloom.element_count;
+    detail.bloom_num_bits = bloom.num_bits;
     let bloom_bytes = bloom.serialise();
     let bloom_hash = Hash::compute(&bloom_bytes);
     let bloom_stored = encrypt_object(&bloom_bytes, remote_key.as_ref(), &bloom_hash);
@@ -727,11 +728,18 @@ fn split_cold_shards(
 // Step 5: Bloom filter regeneration
 // ---------------------------------------------------------------------------
 
+/// Regenerate the Bloom filter from all entries reachable from the hot index
+/// and cold shards. Sized dynamically from the actual element count about to
+/// be inserted (design/02 "Filter sizing"): `omemfs pack` is the only
+/// operation that resizes the filter, so this is also the only place a
+/// capacity is chosen from real data rather than a hint.
 fn regenerate_bloom(
     hot_entries: &[IndexEntry],
     cold_shard_files: &HashMap<String, IndexFile>,
 ) -> BloomFilter {
-    let mut bf = BloomFilter::new(100_000, 0.01, DEFAULT_NUM_HASH_FUNCTIONS);
+    let cold_entry_count: usize = cold_shard_files.values().map(IndexFile::len).sum();
+    let estimated_elements = (hot_entries.len() + cold_entry_count) as u64;
+    let mut bf = bloom::sized_for(estimated_elements);
 
     for entry in hot_entries {
         bf.insert(entry.hash());

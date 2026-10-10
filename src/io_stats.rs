@@ -77,6 +77,15 @@ pub struct PackDetail {
     pub hot_index_entries: u64,
     /// Element count of the regenerated bloom filter.
     pub bloom_elements: u64,
+    /// `num_bits` of the regenerated bloom filter. Recorded alongside
+    /// `bloom_elements` so `omemfs stats` can invert `capacity_for` (via
+    /// `codec::pack::bloom::designed_capacity`) to report the capacity this
+    /// filter was actually sized for, and an estimated current
+    /// false-positive rate (design/02 "Fill-rate reporting"). Records
+    /// written before this field existed lack the key and deserialise to 0
+    /// (the struct-level `#[serde(default)]` above); `designed_capacity(0)`
+    /// is 0, so old records simply show no capacity figure.
+    pub bloom_num_bits: u64,
     /// Sizes of the newly-written consolidated pack files.
     pub pack_sizes_after: Vec<u64>,
     /// Lower-bound estimate of bytes made unreachable from INDEX_ROOT by this
@@ -304,6 +313,7 @@ mod tests {
             cold_splits: 1,
             hot_index_entries: 128,
             bloom_elements: 140,
+            bloom_num_bits: 9586,
             pack_sizes_after: vec![1153433, 716800],
             orphaned_bytes: 2097152,
         });
@@ -321,8 +331,27 @@ mod tests {
         assert_eq!(d.cold_splits, 1);
         assert_eq!(d.hot_index_entries, 128);
         assert_eq!(d.bloom_elements, 140);
+        assert_eq!(d.bloom_num_bits, 9586);
         assert_eq!(d.pack_sizes_after, vec![1153433, 716800]);
         assert_eq!(d.orphaned_bytes, 2097152);
+    }
+
+    #[test]
+    fn pack_detail_without_bloom_num_bits_defaults_to_zero() {
+        // A pack_detail JSON blob written before bloom_num_bits existed (no
+        // key at all) must still deserialise, with bloom_num_bits defaulting
+        // to 0 via PackDetail's struct-level #[serde(default)].
+        let json = r#"{"ts":"2026-06-13T00:00:00Z","cmd":"pack","remote":"origin",
+            "exists_found":0,"exists_miss":0,"writes":1,"write_bytes":10,
+            "reads":0,"read_bytes":0,"pack_files_written":0,"pack_sizes_bytes":[],
+            "pack_detail":{"deltas_merged":1,"packs_before":0,"packs_after":0,
+            "consolidated_bytes_in":0,"consolidated_bytes_out":0,"cold_splits":0,
+            "hot_index_entries":5,"bloom_elements":5,"pack_sizes_after":[],
+            "orphaned_bytes":0}}"#;
+        let back: IoStatsRecord = serde_json::from_str(json).unwrap();
+        let d = back.pack_detail.expect("pack_detail must parse");
+        assert_eq!(d.bloom_num_bits, 0);
+        assert_eq!(d.bloom_elements, 5);
     }
 
     #[test]

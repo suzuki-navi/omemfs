@@ -276,10 +276,14 @@ omemfs restore --at <ref> <path>...
 
 Restore the given path(s) to their content in snapshot `<ref>`, writing into the
 working tree. This extends the existing `omemfs restore` (`04_cli_spec.md`,
-"omemfs restore"), which today restores to the `clone_root` state. Content is
-fetched on demand through the lazy tree store. As with the current `restore`,
-this changes the working tree only; `clone_root` is updated per the normal push
-flow when the restored state is subsequently pushed.
+"omemfs restore"), which today restores to the `clone_root` state, substituting
+the historical root for `clone_root` as the plan phase's comparison target;
+the plan/fetch/apply structure and the fetch phase's batched, SnapshotOnly
+transfer (`04_cli_spec.md`, "Missing objects") are otherwise unchanged, and the
+same "not evidence of loss" reasoning applies equally to an object reachable
+from a historical root. As with the current `restore`, this changes the
+working tree only; `clone_root` is updated per the normal push flow when the
+restored state is subsequently pushed.
 
 ## Open question: externalising the list
 

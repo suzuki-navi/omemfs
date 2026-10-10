@@ -1944,11 +1944,18 @@ fn diff_recursive(
                     in_git_ctx || name == ".git" || tree_contains_git_dir(store, hash);
 
                 // Stub the entire subtree when the entry is newly added, large, and
-                // not inside a git working tree (where stub files are not allowed).
+                // not already inside a git working tree that is being materialised.
+                // Whether this entry is itself a git repo root does not block
+                // whole-unit stubbing (design/08_stub_system.md, "Stubs and Git
+                // repositories": a git repo root at/above the threshold is always
+                // stubbed as a unit) -- `child_in_git` only matters once we decide
+                // to descend instead, to keep this entry's own children from being
+                // partially stubbed. Matches `clone.rs`'s `expand_or_stub`, which
+                // gates its analogous `should_stub` on the inherited flag only.
                 let should_stub = base_tree_hash.is_none()
                     && stub_threshold > 0
                     && *size >= stub_threshold
-                    && !child_in_git;
+                    && !in_git_ctx;
 
                 if should_stub {
                     result.insert(

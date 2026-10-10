@@ -469,6 +469,8 @@ After L5 decrypt + L4 decompress of the object at the logical hash, inspect the 
 
 `omemfs cat` writes chunks sequentially to stdout instead of a temp file. Pull's conflict helper files (`.omemfs-conflict-{base,local,remote}`) are produced with the same sequential chunk write-through, so a GB-class conflicted file never buffers a whole side in memory.
 
+To inspect an object's ordered chunk-hash list itself — without materialising or streaming the reassembled content — use `omemfs cat --manifest`; see design/04_cli_spec.md, `omemfs cat`, "Chunk manifest output".
+
 **In-memory assembly** (`load_assembled`) is retained for small objects and internal consumers (e.g. tree JSON deserialisation), where the caller needs the complete byte buffer anyway.
 
 ---
@@ -577,14 +579,31 @@ indexes, loaded cold shards, and Bloom filter in memory. A command that needs a
 newer remote state constructs a new reader; an existing reader is never
 refreshed implicitly.
 
-Normal `pull`, `expand`, clone materialisation, and lazy-tree reads use
-**SnapshotOnly** lookup semantics. They resolve an object only through this
-snapshot's delta/hot/cold indexes and do not issue a per-object remote `HEAD`
-for a standalone fallback. A successful push uploads every referenced object
-and publishes its index entry before the index-root CAS, so all objects
-reachable from the snapshot remote root are resolvable from that snapshot. An
-unindexed standalone object is an orphan from an interrupted or obsolete write
-and is outside normal command semantics.
+Normal `pull`, `expand`, `restore`, clone materialisation, and lazy-tree reads
+use **SnapshotOnly** lookup semantics. They resolve an object only through
+this snapshot's delta/hot/cold indexes and do not issue a per-object remote
+`HEAD` for a standalone fallback. A successful push uploads every referenced
+object and publishes its index entry before the index-root CAS, so all
+objects reachable from the snapshot remote root are resolvable from that
+snapshot. An unindexed standalone object is an orphan from an interrupted or
+obsolete write and is outside normal command semantics.
+
+`restore` resolves objects reachable from `clone_root` rather than from the
+remote root, but the same guarantee covers it: the hot index's reachability
+set is defined over the working tree, `clone_root`, **and** `remote_root` of
+the local clone (see "Three-tier index" below), and objects that age out of
+the hot index are recorded in a cold shard rather than deleted (see
+"Reclaiming unreferenced objects" below) — so a `clone_root`-reachable object
+is always resolvable through SnapshotOnly, and never needs an unindexed
+standalone fallback. `restore` must not use LiveFallback: unlike `cat`'s
+single diagnostic hash lookup, restore's fetch phase can resolve thousands of
+objects in one batched transfer, so LiveFallback's extra per-miss
+`remote.exists` probe (see "Implementation" below) would multiply into a
+per-object cost restore cannot amortise the way `cat`'s "single extra round
+trip" does; and unlike `cat`, restore is a destructive bulk operation, so
+silently materialising an unindexed orphan into the working tree would
+contradict "restore reproduces exactly what `clone_root` records", not merely
+display a diagnostic warning about it.
 
 An explicit diagnostic/raw-hash operation may opt into **LiveFallback** lookup.
 Only that mode may probe the remote standalone key after a SnapshotOnly miss,
@@ -612,8 +631,8 @@ local cache: `cat` first attempts ordinary SnapshotOnly resolution (the same
 only when that misses does it fall to `resolve_diagnostic`. A hash **prefix**
 (4..63 chars) never uses LiveFallback — there is no exact remote key to probe
 for a prefix, so an unresolved prefix is reported as not found exactly as
-before. `ls`, `pull`, `expand`, and clone materialisation are unaffected and
-remain strictly SnapshotOnly, as described above.
+before. `ls`, `pull`, `expand`, `restore`, and clone materialisation are
+unaffected and remain strictly SnapshotOnly, as described above.
 
 When `cat` displays an object obtained via LiveFallback (`outside_snapshot ==
 true`), it prints a warning to **stderr** (stdout carries only the decoded

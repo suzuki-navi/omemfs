@@ -13,11 +13,12 @@
 ///   4. CAS-update INDEX_ROOT on remote.
 ///
 /// PackWriter also implements ObjectStore for transparent drop-in use.
+use std::collections::HashMap;
 use std::io;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::codec::encrypt::EncryptKey;
-use crate::codec::pack::bloom::{BloomFilter, DEFAULT_NUM_HASH_FUNCTIONS};
+use crate::codec::pack::bloom::{self, BloomFilter};
 use crate::codec::pack::index::{IndexEntry, IndexFile, InlineEntry, PackEntry, StandaloneEntry};
 use crate::codec::pack::index_root::IndexRoot;
 use crate::codec::pack::root_pointer::{RootPointer, RootToken};
@@ -49,10 +50,6 @@ pub const PACK_MAGIC: [u8; 2] = [0xED, 0xE1];
 /// this prefix so they are distinguishable from L6 internal objects.
 pub const STANDALONE_ESCAPE_MAGIC: [u8; 2] = [0xED, 0xE0];
 
-/// Default expected elements for the Bloom filter.
-const BLOOM_EXPECTED: u64 = 100_000;
-const BLOOM_FP_RATE: f64 = 0.01;
-
 // ---------------------------------------------------------------------------
 // PackWriter
 // ---------------------------------------------------------------------------
@@ -65,6 +62,13 @@ pub struct PackWriter {
     /// cached here because its hash changes on every push and a cached copy would
     /// never be reused.
     objcache: LocalStore,
+    /// Resident, per-push cache of already-deserialised index files, keyed by
+    /// hash. `objcache` above avoids a remote fetch on a cache hit but still
+    /// re-deserialises the cached plaintext bytes on every call; this cache
+    /// avoids that too, mirroring `PackReader::indexes` (design/02 "Index
+    /// lookup cost on the push path"). Purely an in-memory addition -- it
+    /// changes no on-disk or on-wire format.
+    indexes: Mutex<HashMap<Hash, Arc<IndexFile>>>,
     /// Backend-pluggable index-root pointer. Captured once at construction (its
     /// `read` provides the push-start snapshot + CAS token) and reused at
     /// `finish()` for the CAS write — both ends of the CAS go through this single
@@ -155,6 +159,7 @@ impl PackWriter {
         Ok(PackWriter {
             remote,
             objcache,
+            indexes: Mutex::new(HashMap::new()),
             root_pointer,
             remote_key,
             delta: Mutex::new(IndexFile::new()),
@@ -398,6 +403,27 @@ impl PackWriter {
         (count, sizes)
     }
 
+    /// Returns `Some((element_count, designed_capacity))` when the in-memory
+    /// Bloom filter -- after `finish()` has inserted this push's new hashes
+    /// -- holds more elements than the capacity its current `num_bits` was
+    /// designed for. Per design/02 "Filter sizing", a filter stays at its
+    /// designed false-positive rate until the element count it was built for
+    /// grows by 50% (the ×1.5 margin baked into `capacity_for`), so crossing
+    /// `designed_capacity` means the filter is now producing more false
+    /// positives than intended and only `omemfs pack` can resize it (push
+    /// itself never rebuilds/resizes the filter it loaded). Call after
+    /// `finish()` so the count reflects this push's insertions. Returns
+    /// `None` when still within capacity.
+    pub fn bloom_over_capacity(&self) -> Option<(u64, u64)> {
+        let bloom = self.bloom.lock().unwrap();
+        let capacity = bloom::designed_capacity(bloom.num_bits);
+        if bloom.element_count > capacity {
+            Some((bloom.element_count, capacity))
+        } else {
+            None
+        }
+    }
+
     // -----------------------------------------------------------------------
     // INDEX_ROOT helpers
     // -----------------------------------------------------------------------
@@ -452,21 +478,31 @@ impl PackWriter {
         Ok(false)
     }
 
-    /// Load and decrypt an index file (delta / hot / cold shard) from the objcache
-    /// if already present; otherwise fetch from remote, decrypt, write plaintext
-    /// to objcache, and deserialize.
+    /// Load and deserialise an index file (delta / hot / cold shard), keeping
+    /// the parsed result resident in `self.indexes` for the rest of this push
+    /// so a given hash is deserialised at most once per `PackWriter`
+    /// (design/02 "Index lookup cost on the push path"). On an in-memory
+    /// cache miss: check the objcache disk cache if already present;
+    /// otherwise fetch from remote, decrypt, and write plaintext to objcache.
     ///
     /// Index files are content-addressed and immutable: the same hash always
-    /// maps to the same plaintext. Caching them locally avoids re-fetching on
-    /// every push. The objcache stores plaintext (unencrypted); decryption
-    /// is performed once on the first remote fetch, mirroring PackReader.
-    fn load_index_file(&self, hash: &Hash) -> Result<IndexFile, Error> {
-        crate::codec::pack::load_index_file(
+    /// maps to the same plaintext. The objcache stores plaintext
+    /// (unencrypted); decryption is performed once on the first remote
+    /// fetch, mirroring PackReader.
+    fn load_index_file(&self, hash: &Hash) -> Result<Arc<IndexFile>, Error> {
+        if let Some(index) = self.indexes.lock().unwrap().get(hash).cloned() {
+            return Ok(index);
+        }
+        let index = crate::codec::pack::load_index_file(
             self.remote.as_ref(),
             &self.objcache,
             self.remote_key.as_ref(),
             hash,
-        )
+        )?;
+        let mut cache = self.indexes.lock().unwrap();
+        Ok(Arc::clone(
+            cache.entry(hash.clone()).or_insert_with(|| Arc::new(index)),
+        ))
     }
 
     /// Provide access to the inner remote store (as `&dyn ObjectStore`).
@@ -499,54 +535,69 @@ impl PackWriter {
 
 /// Load the remote Bloom filter referenced by the snapshot's `bloom_hash`.
 ///
-/// Returns a fresh empty filter (sized for the current configuration) when:
+/// Per design/02 "Filter sizing": push never rebuilds an empty filter merely
+/// because the loaded filter's size does not match the current design
+/// target. A structurally valid filter (`num_bits >= 1` and
+/// `num_hash_functions >= 1`) that is successfully fetched, decrypted, and
+/// deserialised is accepted and used AS-IS, whatever its `(num_bits,
+/// num_hash_functions)` happen to be -- only `omemfs pack` resizes the
+/// filter.
+///
+/// A fresh (empty) filter is only built when there is nothing valid to load
+/// at all:
 ///   - there is no snapshot, or `bloom_hash` is all-zero (never generated), or
 ///   - the stored filter cannot be fetched / decrypted / deserialised, or
-///   - the stored filter's parameters (num_bits / num_hash_functions) do not
-///     match the current configuration.
+///   - the stored filter is structurally unusable (`num_bits == 0`, which
+///     would divide by zero inside `may_contain`, or `num_hash_functions ==
+///     0`, which is well-defined but useless).
 ///
-/// Rebuilding on mismatch (rather than merging) avoids corrupting membership
-/// state when the filter sizing changes; the cost is that already-present
-/// objects may be re-uploaded once (a tolerated false negative), never a
-/// missing remote object.
+/// The fresh filter's capacity hint is `capacity_for(loaded.element_count)`
+/// when a filter WAS read but rejected for being structurally unusable (its
+/// `element_count` field is still meaningful even though its bit array is
+/// not); otherwise (nothing could be read at all) the hint is `0`, which
+/// `capacity_for` floors at `MIN_CAPACITY` -- the same size the old fixed
+/// constant always produced.
 fn load_remote_bloom(
     remote: &dyn ObjectStore,
     snapshot_root: Option<&IndexRoot>,
     key: Option<&EncryptKey>,
 ) -> BloomFilter {
-    let fresh = || BloomFilter::new(BLOOM_EXPECTED, BLOOM_FP_RATE, DEFAULT_NUM_HASH_FUNCTIONS);
+    let fresh = |hint_element_count: u64| bloom::sized_for(hint_element_count);
 
     let Some(ir) = snapshot_root else {
-        return fresh();
+        return fresh(0);
     };
     let Some(bloom_hash) = ir.bloom_hash_opt() else {
-        return fresh();
+        return fresh(0);
     };
 
     use std::io::Read as _;
     let mut r = match remote.open_read(&bloom_hash) {
         Ok(r) => r,
-        Err(_) => return fresh(),
+        Err(_) => return fresh(0),
     };
     let mut stored = Vec::new();
     if r.read_to_end(&mut stored).is_err() {
-        return fresh();
+        return fresh(0);
     }
     let plaintext = match crate::codec::encrypt::decrypt(stored, key, bloom_hash.as_bytes_array()) {
         Ok(pt) => pt,
-        Err(_) => return fresh(),
+        Err(_) => return fresh(0),
     };
     let loaded = match BloomFilter::deserialise(&plaintext) {
         Ok(bf) => bf,
-        Err(_) => return fresh(),
+        Err(_) => return fresh(0),
     };
-    // Rebuild if the stored filter's sizing differs from the current config.
-    let expected = fresh();
-    if loaded.num_bits != expected.num_bits
-        || loaded.num_hash_functions != expected.num_hash_functions
-    {
-        return fresh();
+
+    // Structurally unusable: rebuild fresh, using the just-read filter's
+    // element_count (still meaningful even though its bit array is not) as
+    // the capacity hint.
+    if loaded.num_bits == 0 || loaded.num_hash_functions == 0 {
+        return fresh(loaded.element_count);
     }
+
+    // Any other structurally valid filter is accepted as-is, whatever size
+    // it happens to be.
     loaded
 }
 
@@ -642,7 +693,7 @@ impl ObjectStore for PackWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::pack::root_pointer::LocalRootPointer;
+    use crate::codec::pack::root_pointer::{LocalRootPointer, RootPointer, RootToken};
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -1370,5 +1421,370 @@ mod tests {
             heads_after > heads_before,
             "exists() must fall back to a remote HEAD when the index lookup misses"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Filter sizing (design/02_storage_format.md "Filter sizing") --
+    // load_remote_bloom acceptance / fallback rules.
+    // -------------------------------------------------------------------------
+
+    /// Publish `root` as the (unencrypted) INDEX_ROOT at `base`, bypassing
+    /// `PackWriter::finish`'s CAS-from-snapshot flow entirely -- lets a test
+    /// control the `bloom_hash` field directly against a remote that has
+    /// never been pushed to (`RootToken::Absent`).
+    fn publish_raw_index_root(base: &std::path::Path, root: &IndexRoot) {
+        let bytes = root.serialise().unwrap();
+        let rp = LocalRootPointer::new(base.to_path_buf(), None);
+        rp.cas_write(&RootToken::Absent, &bytes).unwrap();
+    }
+
+    /// Build a fresh remote-backend directory layout (objects/ + tmp/) under
+    /// `tmp` and return its base path.
+    fn make_remote_base(tmp: &TempDir) -> PathBuf {
+        let base = tmp.path().to_path_buf();
+        std::fs::create_dir_all(base.join("objects")).unwrap();
+        std::fs::create_dir_all(base.join("tmp")).unwrap();
+        base
+    }
+
+    /// The direct proof that the old "size mismatch -> rebuild empty" bug
+    /// (design/02 "Filter sizing") is gone: a remote Bloom filter whose
+    /// (num_bits, num_hash_functions) differ from both the old fixed
+    /// BLOOM_EXPECTED=100_000 default AND the current
+    /// `bloom::sized_for(0)` default must still be loaded AS-IS -- same
+    /// size, membership preserved -- by a `PackWriter` constructed against
+    /// that remote.
+    #[test]
+    fn accepts_structurally_valid_bloom_filter_of_different_size() {
+        let tmp = TempDir::new().unwrap();
+        let base = make_remote_base(&tmp);
+
+        // Deliberately small capacity (50) and a hash-function count (5)
+        // distinct from DEFAULT_NUM_HASH_FUNCTIONS (7).
+        let mut custom_bloom = BloomFilter::new(50, 0.01, 5);
+        let present = make_hash_from_data(b"pre-existing-member");
+        custom_bloom.insert(&present);
+        let bloom_bytes = custom_bloom.serialise();
+        let bloom_hash = Hash::compute(&bloom_bytes);
+        LocalStore::for_remote(&base)
+            .write_from(&bloom_hash, &mut io::Cursor::new(&bloom_bytes))
+            .unwrap();
+
+        let mut root = IndexRoot::new_empty();
+        root.bloom_hash = *bloom_hash.as_bytes_array();
+        publish_raw_index_root(&base, &root);
+
+        let writer = PackWriter::new(
+            Box::new(LocalStore::for_remote(&base)),
+            Box::new(LocalRootPointer::new(base.clone(), None)),
+            LocalStore::for_cache(tmp.path().join("objcache")),
+            None,
+        )
+        .unwrap();
+
+        let loaded = writer.bloom.lock().unwrap();
+        assert_eq!(
+            loaded.num_bits, custom_bloom.num_bits,
+            "a structurally valid remote filter must be loaded with its OWN \
+             num_bits, not rebuilt to a fixed default size"
+        );
+        assert_eq!(loaded.num_hash_functions, 5);
+        assert!(
+            loaded.may_contain(&present),
+            "membership for a hash present in the loaded custom-sized filter \
+             must be preserved -- a rebuild-to-empty would turn this into a \
+             false negative and cause a needless re-upload"
+        );
+    }
+
+    #[test]
+    fn load_remote_bloom_falls_back_to_fresh_on_zero_num_bits() {
+        let tmp = TempDir::new().unwrap();
+        let base = make_remote_base(&tmp);
+
+        // Structurally unusable: num_bits == 0 would divide by zero inside
+        // may_contain. element_count == 42 is still meaningful and must be
+        // used as the fresh filter's capacity hint.
+        let unusable = BloomFilter::from_parts(7, 0, 42, vec![]).unwrap();
+        let bytes = unusable.serialise();
+        let bloom_hash = Hash::compute(&bytes);
+        LocalStore::for_remote(&base)
+            .write_from(&bloom_hash, &mut io::Cursor::new(&bytes))
+            .unwrap();
+
+        let mut root = IndexRoot::new_empty();
+        root.bloom_hash = *bloom_hash.as_bytes_array();
+        publish_raw_index_root(&base, &root);
+
+        let writer = PackWriter::new(
+            Box::new(LocalStore::for_remote(&base)),
+            Box::new(LocalRootPointer::new(base.clone(), None)),
+            LocalStore::for_cache(tmp.path().join("objcache")),
+            None,
+        )
+        .unwrap();
+
+        let loaded = writer.bloom.lock().unwrap();
+        assert!(
+            loaded.num_bits >= 1,
+            "the fresh fallback must never have num_bits == 0"
+        );
+        // Must not panic when used.
+        let probe = make_hash_from_data(b"anything");
+        let _ = loaded.may_contain(&probe);
+        assert_eq!(
+            crate::codec::pack::bloom::designed_capacity(loaded.num_bits),
+            crate::codec::pack::bloom::capacity_for(42),
+            "the fresh filter's capacity must be sized from the rejected \
+             filter's element_count, not MIN_CAPACITY"
+        );
+    }
+
+    #[test]
+    fn load_remote_bloom_falls_back_to_fresh_on_zero_num_hash_functions() {
+        let tmp = TempDir::new().unwrap();
+        let base = make_remote_base(&tmp);
+
+        // num_hash_functions == 0 is well-defined (may_contain trivially
+        // returns true, insert is a no-op) but useless -- must still be
+        // rejected.
+        let unusable = BloomFilter::from_parts(0, 64, 7, vec![0u8; 8]).unwrap();
+        let bytes = unusable.serialise();
+        let bloom_hash = Hash::compute(&bytes);
+        LocalStore::for_remote(&base)
+            .write_from(&bloom_hash, &mut io::Cursor::new(&bytes))
+            .unwrap();
+
+        let mut root = IndexRoot::new_empty();
+        root.bloom_hash = *bloom_hash.as_bytes_array();
+        publish_raw_index_root(&base, &root);
+
+        let writer = PackWriter::new(
+            Box::new(LocalStore::for_remote(&base)),
+            Box::new(LocalRootPointer::new(base.clone(), None)),
+            LocalStore::for_cache(tmp.path().join("objcache")),
+            None,
+        )
+        .unwrap();
+
+        let loaded = writer.bloom.lock().unwrap();
+        assert!(
+            loaded.num_hash_functions >= 1,
+            "the fresh fallback must never have num_hash_functions == 0"
+        );
+        let probe = make_hash_from_data(b"anything-else");
+        let _ = loaded.may_contain(&probe);
+    }
+
+    #[test]
+    fn load_remote_bloom_falls_back_to_fresh_on_corrupted_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let base = make_remote_base(&tmp);
+
+        // Garbage bytes: not a valid Bloom filter at all (bad magic).
+        let garbage = vec![0u8; 40];
+        let bloom_hash = Hash::compute(&garbage);
+        LocalStore::for_remote(&base)
+            .write_from(&bloom_hash, &mut io::Cursor::new(&garbage))
+            .unwrap();
+
+        let mut root = IndexRoot::new_empty();
+        root.bloom_hash = *bloom_hash.as_bytes_array();
+        publish_raw_index_root(&base, &root);
+
+        let writer = PackWriter::new(
+            Box::new(LocalStore::for_remote(&base)),
+            Box::new(LocalRootPointer::new(base.clone(), None)),
+            LocalStore::for_cache(tmp.path().join("objcache")),
+            None,
+        )
+        .unwrap();
+
+        let loaded = writer.bloom.lock().unwrap();
+        assert!(loaded.num_bits >= 1);
+        let probe = make_hash_from_data(b"corrupted-fallback-probe");
+        let _ = loaded.may_contain(&probe);
+        // Nothing valid could be read at all -> the MIN_CAPACITY hint, not an
+        // element-count-derived one.
+        assert_eq!(
+            crate::codec::pack::bloom::designed_capacity(loaded.num_bits),
+            crate::codec::pack::bloom::capacity_for(0)
+        );
+    }
+
+    /// Encrypt `root` into the same `nonce (12B) || AES-256-GCM ciphertext ||
+    /// tag` layout `PackWriter::encrypt_index_root` produces, so a test can
+    /// publish an INDEX_ROOT that a `PackWriter` constructed with `key` will
+    /// decode successfully -- needed to isolate a decrypt failure to the
+    /// Bloom filter object alone, rather than failing earlier at INDEX_ROOT
+    /// decode time.
+    fn encrypt_index_root_for_test(root: &IndexRoot, key: &crate::codec::encrypt::EncryptKey) -> Vec<u8> {
+        let plaintext = root.serialise().unwrap();
+        let nonce = [9u8; 12];
+        let mut pseudo_hash = [0u8; 32];
+        pseudo_hash[..12].copy_from_slice(&nonce);
+        let encrypted = crate::codec::encrypt::encrypt(plaintext, Some(key), &pseudo_hash);
+        let mut out = Vec::with_capacity(12 + encrypted.len());
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&encrypted);
+        out
+    }
+
+    #[test]
+    fn load_remote_bloom_falls_back_to_fresh_on_decrypt_failure() {
+        use crate::codec::encrypt::EncryptKey;
+
+        let tmp = TempDir::new().unwrap();
+        let base = make_remote_base(&tmp);
+
+        let key = EncryptKey::new([7u8; 32]);
+
+        // Store a WELL-FORMED plaintext filter, but UNENCRYPTED -- reading it
+        // back with a configured key must fail GCM tag verification (the
+        // bytes are not valid ciphertext||tag for that key), triggering the
+        // fresh fallback rather than propagating a decrypt error.
+        let plaintext_bloom = BloomFilter::new(50, 0.01, 5);
+        let bytes = plaintext_bloom.serialise();
+        let bloom_hash = Hash::compute(&bytes);
+        LocalStore::for_remote(&base)
+            .write_from(&bloom_hash, &mut io::Cursor::new(&bytes))
+            .unwrap();
+
+        // The INDEX_ROOT itself IS properly encrypted for `key`, so
+        // `PackWriter::new` decodes it successfully and only the Bloom
+        // filter's own decrypt fails.
+        let mut root = IndexRoot::new_empty();
+        root.bloom_hash = *bloom_hash.as_bytes_array();
+        let root_bytes = encrypt_index_root_for_test(&root, &key);
+        let rp = LocalRootPointer::new(base.clone(), None);
+        rp.cas_write(&RootToken::Absent, &root_bytes).unwrap();
+
+        let writer = PackWriter::new(
+            Box::new(LocalStore::for_remote(&base)),
+            Box::new(LocalRootPointer::new(base.clone(), None)),
+            LocalStore::for_cache(tmp.path().join("objcache")),
+            Some(key),
+        )
+        .unwrap();
+
+        let loaded = writer.bloom.lock().unwrap();
+        assert!(loaded.num_bits >= 1);
+        let probe = make_hash_from_data(b"decrypt-failure-fallback-probe");
+        let _ = loaded.may_contain(&probe);
+    }
+
+    // -------------------------------------------------------------------------
+    // Resident index-file cache (design/02 "Index lookup cost on the push
+    // path").
+    // -------------------------------------------------------------------------
+
+    /// The direct proof that `load_index_file` deserialises an index file at
+    /// most ONCE per push: two calls for the SAME hash must return the SAME
+    /// `Arc<IndexFile>` instance (`Arc::ptr_eq`), not two separately
+    /// deserialised (but content-equal) copies.
+    #[test]
+    fn load_index_file_deserialises_once_via_resident_cache() {
+        let tmp = TempDir::new().unwrap();
+        let base = make_remote_base(&tmp);
+
+        // Produce a real delta index on the remote via a first push.
+        let data = vec![0x77u8; 100];
+        let hash = make_hash_from_data(&data);
+        let objcache1 = LocalStore::for_cache(tmp.path().join("objcache1"));
+        let mut w1 = PackWriter::new(
+            Box::new(LocalStore::for_remote(&base)),
+            Box::new(LocalRootPointer::new(base.clone(), None)),
+            objcache1,
+            None,
+        )
+        .unwrap();
+        w1.write_from(&hash, &mut io::Cursor::new(&data)).unwrap();
+        w1.finish(&Hash::compute(b"root")).unwrap();
+
+        let objcache2 = LocalStore::for_cache(tmp.path().join("objcache2"));
+        let w2 = PackWriter::new(
+            Box::new(LocalStore::for_remote(&base)),
+            Box::new(LocalRootPointer::new(base.clone(), None)),
+            objcache2,
+            None,
+        )
+        .unwrap();
+
+        let delta_hash = w2
+            .snapshot_root
+            .as_ref()
+            .unwrap()
+            .delta_hashes_as_hashes()
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let first = w2.load_index_file(&delta_hash).unwrap();
+        let second = w2.load_index_file(&delta_hash).unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "two load_index_file calls for the same hash within one \
+             PackWriter must return the SAME Arc<IndexFile> instance -- \
+             proof that the index was deserialised only once, not once per \
+             call"
+        );
+
+        // Sanity: exists() through the normal call path must still find the
+        // previously pushed hash via this cached index.
+        assert!(w2.exists(&hash).unwrap());
+    }
+
+    // -------------------------------------------------------------------------
+    // Over-capacity reporting (design/02 "Fill-rate reporting").
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn bloom_over_capacity_none_when_within_capacity() {
+        let tmp = TempDir::new().unwrap();
+        let (remote, base) = setup_remote(&tmp);
+        let writer = PackWriter::new(
+            Box::new(remote),
+            Box::new(LocalRootPointer::new(base, None)),
+            LocalStore::for_cache(tmp.path().join("objcache")),
+            None,
+        )
+        .unwrap();
+        // A freshly-built filter (MIN_CAPACITY-sized) with zero elements is
+        // nowhere near its designed capacity.
+        assert!(writer.bloom_over_capacity().is_none());
+    }
+
+    #[test]
+    fn bloom_over_capacity_reports_when_element_count_exceeds_designed_capacity() {
+        let tmp = TempDir::new().unwrap();
+        let (remote, base) = setup_remote(&tmp);
+        let writer = PackWriter::new(
+            Box::new(remote),
+            Box::new(LocalRootPointer::new(base, None)),
+            LocalStore::for_cache(tmp.path().join("objcache")),
+            None,
+        )
+        .unwrap();
+
+        // Replace the in-memory filter with a tiny one, then push it well
+        // past its designed capacity.
+        {
+            let mut bloom = writer.bloom.lock().unwrap();
+            *bloom = BloomFilter::new(10, 0.01, crate::codec::pack::bloom::DEFAULT_NUM_HASH_FUNCTIONS);
+            let capacity = crate::codec::pack::bloom::designed_capacity(bloom.num_bits);
+            for i in 0..(capacity + 5) {
+                let h = make_hash_from_data(format!("elem-{i}").as_bytes());
+                bloom.insert(&h);
+            }
+        }
+
+        let over = writer.bloom_over_capacity();
+        assert!(
+            over.is_some(),
+            "a filter holding more elements than its designed capacity must \
+             be reported as over capacity"
+        );
+        let (elements, capacity) = over.unwrap();
+        assert!(elements > capacity);
     }
 }

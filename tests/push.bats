@@ -532,6 +532,140 @@ PY
     [ "$second_routes" -le 3 ]
 }
 
+# ---------------------------------------------------------------------------
+# Filter sizing (design/02_storage_format.md "Filter sizing"): a
+# structurally valid remote Bloom filter must be accepted regardless of its
+# size, instead of being rejected and rebuilt empty (the old bug that made
+# every already-pushed object look "definitely absent" and re-upload
+# everything on the next push).
+# ---------------------------------------------------------------------------
+
+# Build a tiny, fully-saturated (all bits set) Bloom filter and swap it in as
+# the remote's current filter: write the filter object under
+# $REMOTE_DIR/objects/ and patch INDEX_ROOT's bloom_hash field in place.
+# Because every bit is set, may_contain() answers "maybe present" for every
+# hash -- a worst-case-but-structurally-valid filter that gives no useful
+# "definitely absent" fast path at all, so any dedup correctness after the
+# swap comes entirely from the real index (hot/delta/cold), not from the
+# filter's own accuracy. `element_count` is set far past the tiny filter's
+# own designed capacity so the same fixture also exercises the "over
+# capacity" warning path.
+#
+# Assumes an unencrypted remote (the default for `clone --new` with no
+# `--encrypt` in a non-interactive test run), so both the Bloom filter object
+# and INDEX_ROOT are plaintext and can be built/patched directly.
+swap_in_tiny_saturated_bloom_filter() {
+    local remote_dir="$1"
+    python3 - "$remote_dir" <<'PY'
+import hashlib
+import os
+import sys
+
+remote_dir = sys.argv[1]
+
+num_hash_functions = 7
+num_bits = 64
+element_count = 1000  # far past this tiny filter's own designed capacity
+bits = bytes([0xFF] * ((num_bits + 7) // 8))
+body = (
+    bytes([0xED, 0xE4, 0x01, num_hash_functions])
+    + num_bits.to_bytes(8, "big")
+    + element_count.to_bytes(8, "big")
+    + bits
+)
+bloom_hash = hashlib.sha256(body).digest()
+hex_hash = bloom_hash.hex()
+
+objects_dir = os.path.join(
+    remote_dir, "objects", hex_hash[0:2], hex_hash[2:4], hex_hash[4:6]
+)
+os.makedirs(objects_dir, exist_ok=True)
+with open(os.path.join(objects_dir, hex_hash[6:]), "wb") as f:
+    f.write(body)
+
+# Patch INDEX_ROOT's bloom_hash field in place (fixed offset: 2 magic +
+# 1 version + 1 reserved + 32 remote_root + 32 hot_hash = 68 bytes; see
+# design/02_storage_format.md "INDEX_ROOT (index root object)").
+root_path = os.path.join(remote_dir, "INDEX_ROOT")
+with open(root_path, "rb") as f:
+    root = bytearray(f.read())
+offset = 2 + 1 + 1 + 32 + 32
+root[offset:offset + 32] = bloom_hash
+with open(root_path, "wb") as f:
+    f.write(root)
+PY
+}
+
+@test "push: second push against an oversaturated remote Bloom filter only uploads new objects" {
+    # Regression guard for the "rebuild empty filter on size mismatch" bug.
+    # Before this fix, PackWriter rejected any remote Bloom filter whose
+    # (num_bits, num_hash_functions) differed from the fixed push-time
+    # default and silently rebuilt an EMPTY filter, which made every
+    # already-pushed object look "definitely absent" and triggered a full
+    # re-upload on the very next push. After the fix, ANY structurally
+    # valid filter is accepted and used as-is, so dedup still works via the
+    # real index even when the filter itself is this degenerate.
+    mkdir -p a b
+    echo "alpha" > a/one.txt
+    echo "beta"  > b/two.txt
+    echo "gamma" > c.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    # Merge everything into the hot index so the second push's dedup check
+    # exercises the hot-index lookup path.
+    run "$OMEMFS" pack
+    [ "$status" -eq 0 ]
+
+    swap_in_tiny_saturated_bloom_filter "$REMOTE_DIR"
+
+    # Clear logs so the next push's routing is counted in isolation.
+    rm -f .omemfs/logs/*-push.log
+
+    echo "delta" > new.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    local second_routes
+    second_routes="$(cat .omemfs/logs/*-push.log | grep -c 'route ' || true)"
+
+    # Only the new blob plus the rewritten root tree object may be routed --
+    # the unchanged a/one.txt, b/two.txt, c.txt blobs must NOT be re-uploaded
+    # even though the Bloom filter's own (tiny, saturated) state never says
+    # "definitely absent" for anything.
+    [ "$second_routes" -ge 1 ]
+    [ "$second_routes" -le 3 ]
+
+    # A fresh clone must still see all four files with correct content.
+    local clone2
+    clone2="$(mktemp -d)"
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" "$clone2"
+    [ "$status" -eq 0 ]
+    [ "$(cat "$clone2/a/one.txt")" = "alpha" ]
+    [ "$(cat "$clone2/b/two.txt")" = "beta" ]
+    [ "$(cat "$clone2/c.txt")" = "gamma" ]
+    [ "$(cat "$clone2/new.txt")" = "delta" ]
+    rm -rf "$clone2"
+}
+
+@test "push: warns on stderr when the Bloom filter exceeds its designed capacity" {
+    # design/02 "Fill-rate reporting": push never resizes the filter it
+    # loaded (only `omemfs pack` does), so it must warn instead when this
+    # push's insertions leave the filter holding more elements than its
+    # current num_bits was designed for.
+    echo "seed" > seed.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    swap_in_tiny_saturated_bloom_filter "$REMOTE_DIR"
+
+    echo "trigger" > trigger.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Bloom filter"* ]]
+    [[ "$output" == *"pack"* ]]
+}
+
 @test "push: scoped push preserves STAT_CACHE entries for out-of-scope files" {
     # Scope-limited STAT_CACHE load (design/07): a scoped push must scan and
     # write back only the in-scope slice, but the writeback merge must preserve

@@ -50,7 +50,7 @@ immediately on the next attempt.
 |---|---|---|
 | `omemfs push` | yes | reads and writes `clone_root` |
 | `omemfs pull` | yes | reads `clone_root`, updates working tree, writes `clone_root` |
-| `omemfs restore` | yes | reads `clone_root`, modifies working tree |
+| `omemfs restore` | yes | reads `clone_root`, modifies working tree, may fetch missing objects from the remote |
 | `omemfs stub` | yes | verifies working tree against `clone_root` before modifying files |
 | `omemfs pack` | yes | modifies pack index under `.omemfs/`; must not race with push/pull |
 | `omemfs expand` | yes | writes working-tree files; lock prevents races with push scanning a partially-written file |
@@ -77,6 +77,19 @@ acquires the lock to prevent races with a concurrent `push` that might scan
 while `expand` is writing files.  Each file is written through `atomic_write`
 (temp-file → rename) so a concurrent observer always sees either the old
 content or the fully-written new content — never a partial write.
+
+### `omemfs restore`
+
+`restore` acquires the lock for the whole command, including its remote fetch
+phase (`04_cli_spec.md`, "omemfs restore"), not just the final apply phase that
+touches working-tree files — the same reasoning as `expand` above: a concurrent
+`push` must not scan a file `restore` is partway through fetching or writing.
+This means the lock can be held for as long as the remote transfer takes when a
+large amount of content is missing from the local cache; `restore` does not
+release and reacquire it between the fetch and apply phases. A `push` or `pull`
+that starts while a large `restore` is fetching simply waits for the lock like
+it would for any other slow holder — there is no separate timeout or fallback
+for this case.
 
 ---
 

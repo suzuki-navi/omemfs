@@ -981,6 +981,18 @@ fn upload_and_finalize(
         io_record.set_pack_stats(pack_count, pack_sizes);
         phase.complete("ok");
     }
+    // design/02 "Fill-rate reporting": push never resizes the Bloom filter
+    // itself (only `omemfs pack` does), so once this push's insertions push
+    // it past the capacity its current size was designed for, warn so the
+    // user knows to run `omemfs pack` rather than silently accumulating
+    // false positives until the next scheduled pack.
+    if let Some((elements, capacity)) = writer.bloom_over_capacity() {
+        eprintln!(
+            "warning: Bloom filter has {} elements but was designed for ~{} \
+             -- run `omemfs pack` to resize it",
+            elements, capacity
+        );
+    }
     Ok(())
 }
 

@@ -357,6 +357,41 @@ teardown() {
     [[ "$output" == *'"fill_rate"'* ]]
 }
 
+@test "cat: hash of remote bloom filter prints designed_capacity and estimated_fp_rate" {
+    # design/02_storage_format.md "Fill-rate reporting": a loaded filter's
+    # fill state must be reportable from the fields it already carries
+    # (element_count, num_bits), without any format change.
+    echo "hello" > file.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    local bloom_hash
+    bloom_hash="$("$OMEMFS" cat index-root | grep '"bloom_hash"' | grep -oE '[0-9a-f]{64}')"
+    [ -n "$bloom_hash" ]
+
+    run "$OMEMFS" cat "${bloom_hash}"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *'"designed_capacity"'* ]]
+    [[ "$output" == *'"estimated_fp_rate"'* ]]
+
+    local designed_capacity estimated_fp_rate num_bits
+    designed_capacity="$(echo "$output" \
+        | python -c "import sys,json; d=json.load(sys.stdin); print(d['designed_capacity'])")"
+    estimated_fp_rate="$(echo "$output" \
+        | python -c "import sys,json; d=json.load(sys.stdin); print(d['estimated_fp_rate'])")"
+    num_bits="$(echo "$output" \
+        | python -c "import sys,json; d=json.load(sys.stdin); print(d['num_bits'])")"
+
+    # A fresh push-time filter is sized at MIN_CAPACITY (100_000); its
+    # designed_capacity should reflect a comparably large figure, not zero
+    # or a tiny mismatched value.
+    [ "$designed_capacity" -gt 50000 ]
+    [ "$num_bits" -gt 0 ]
+    # estimated_fp_rate is a probability in [0, 1]; for a lightly-loaded
+    # fresh filter it must be very small (well under the 1% design target).
+    python3 -c "assert 0.0 <= float('$estimated_fp_rate') < 0.01, '$estimated_fp_rate out of expected range'"
+}
+
 @test "cat: remote pack-layer hash with unknown full hash returns error" {
     echo "hello" > file.txt
     run "$OMEMFS" push
@@ -494,4 +529,210 @@ print(count)
 
     run "$OMEMFS" pull
     [ "$status" -eq 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# --manifest (design/04_cli_spec.md, "omemfs cat", "Chunk manifest output")
+# ---------------------------------------------------------------------------
+
+@test "cat: --manifest reports chunk_count and hex chunk hashes for a multi-chunk blob" {
+    # 20 MiB reliably produces >= 2 chunks (FastCDC's cut points are content-
+    # defined with substantial variance around avg_size (4 MiB), so a file
+    # only slightly above avg_size can land as a single chunk; 20 MiB is the
+    # same size tests/chunk.bats already relies on for a >= 2 assertion).
+    head -c $((20 * 1024 * 1024)) /dev/urandom > big.bin
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    local hash
+    hash="$("$OMEMFS" ls --full-hash big.bin | awk '{print $1}')"
+    run "$OMEMFS" cat --manifest "$hash"
+    [ "$status" -eq 0 ]
+
+    local chunk_count array_len invalid_count
+    chunk_count="$(echo "$output" | python -c "import sys,json; print(json.load(sys.stdin)['chunk_count'])")"
+    array_len="$(echo "$output" | python -c "import sys,json; print(len(json.load(sys.stdin)['chunks']))")"
+    [ "$chunk_count" -ge 2 ]
+    [ "$chunk_count" -eq "$array_len" ]
+
+    invalid_count="$(echo "$output" | python -c "
+import sys, json, re
+d = json.load(sys.stdin)
+print(sum(1 for h in d['chunks'] if not re.fullmatch(r'[0-9a-f]{64}', h)))
+")"
+    [ "$invalid_count" -eq 0 ]
+}
+
+@test "cat: --manifest chunk order reconstructs the original file byte-exact" {
+    # This is the correctness core of --manifest: the chunk list must be in
+    # storage/reassembly order, never reordered.
+    #
+    # The first byte is fixed to 'A' (not in the ED F0..FF blob-escape range)
+    # so the assembled FastCDC input never gets the ED F0 escape prefix
+    # (design/02_storage_format.md, "Streaming design": the escape is
+    # prepended to the whole stream before chunking, so it would otherwise
+    # land inside chunk 0's bytes and complicate this test's byte accounting).
+    # 20 MiB reliably produces >= 2 chunks; see the size comment above.
+    { printf 'A'; head -c $((20 * 1024 * 1024 - 1)) /dev/urandom; } > big.bin
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    local hash
+    hash="$("$OMEMFS" ls --full-hash big.bin | awk '{print $1}')"
+    run "$OMEMFS" cat --manifest "$hash"
+    [ "$status" -eq 0 ]
+    local manifest_json="$output"
+
+    local chunk_count
+    chunk_count="$(echo "$manifest_json" | python -c "import sys,json; print(json.load(sys.stdin)['chunk_count'])")"
+    [ "$chunk_count" -ge 2 ]
+
+    : > reconstructed.bin
+    local i chash
+    for ((i = 0; i < chunk_count; i++)); do
+        chash="$(echo "$manifest_json" | python -c "import sys,json; print(json.load(sys.stdin)['chunks'][$i])")"
+        [[ "$chash" =~ ^[0-9a-f]{64}$ ]]
+        # Each chunk is stored standalone as `ED F3 | chunk_bytes`
+        # (src/object.rs TYPE_TAG_CHUNK). A plain `cat` of a chunk hash treats
+        # it as an ordinary (unchunked) blob -- deserialise_blob only strips
+        # the ED F0 blob-escape, not ED F3 -- so the raw output carries the
+        # 2-byte ED F3 tag unstripped. Strip it ourselves before reassembling.
+        "$OMEMFS" cat "$chash" > chunk_raw.bin
+        tail -c +3 chunk_raw.bin >> reconstructed.bin
+    done
+
+    cmp big.bin reconstructed.bin
+    rm -f chunk_raw.bin reconstructed.bin
+}
+
+@test "cat: --manifest for a small unchunked blob reports itself as the sole chunk" {
+    printf 'small manifest content' > small.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    local hash
+    hash="$("$OMEMFS" ls --full-hash small.txt | awk '{print $1}')"
+    run "$OMEMFS" cat --manifest "$hash"
+    [ "$status" -eq 0 ]
+
+    local chunk_count sole_chunk manifest_hash
+    chunk_count="$(echo "$output" | python -c "import sys,json; print(json.load(sys.stdin)['chunk_count'])")"
+    sole_chunk="$(echo "$output" | python -c "import sys,json; print(json.load(sys.stdin)['chunks'][0])")"
+    manifest_hash="$(echo "$output" | python -c "import sys,json; print(json.load(sys.stdin)['hash'])")"
+    [ "$chunk_count" -eq 1 ]
+    [ "$sole_chunk" = "$hash" ]
+    [ "$manifest_hash" = "$hash" ]
+}
+
+@test "cat: --manifest on a tree object errors" {
+    mkdir -p subdir
+    echo "a" > subdir/a.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    run "$OMEMFS" cat --manifest clone-root
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"not applicable to a tree object"* ]]
+}
+
+@test "cat: --hash and --manifest together is rejected by clap" {
+    echo "hello" > file.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    local hash
+    hash="$("$OMEMFS" ls --full-hash file.txt | awk '{print $1}')"
+    run "$OMEMFS" cat --hash --manifest "$hash"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"--hash"* ]]
+    [[ "$output" == *"--manifest"* ]]
+}
+
+@test "cat: <ref>:<path> traversal works with --manifest" {
+    head -c $((20 * 1024 * 1024)) /dev/urandom > big.bin
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    local blob_hash
+    blob_hash="$("$OMEMFS" ls --full-hash big.bin | awk '{print $1}')"
+    run "$OMEMFS" cat --manifest "clone-root:big.bin"
+    [ "$status" -eq 0 ]
+
+    local reported_hash chunk_count
+    reported_hash="$(echo "$output" | python -c "import sys,json; print(json.load(sys.stdin)['hash'])")"
+    chunk_count="$(echo "$output" | python -c "import sys,json; print(json.load(sys.stdin)['chunk_count'])")"
+    [ "$reported_hash" = "$blob_hash" ]
+    [ "$chunk_count" -ge 2 ]
+}
+
+@test "cat: --manifest resolves a full hash via SnapshotOnly when absent from the local cache" {
+    head -c $((20 * 1024 * 1024)) /dev/urandom > big.bin
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    local hash
+    hash="$("$OMEMFS" ls --full-hash big.bin | awk '{print $1}')"
+
+    # A fresh clone from the same remote, never pulled: its local object cache
+    # has nothing beyond the initial clone_root, so resolving this full hash
+    # exercises the remote SnapshotOnly index lookup (design/04_cli_spec.md,
+    # "Resolution order for hash targets", step 2), not the local cache.
+    local clone2
+    clone2="$(mktemp -d)"
+    "$OMEMFS" clone --existing --url "$REMOTE_DIR" "$clone2"
+    run bash -c "cd '$clone2' && '$OMEMFS' cat --manifest '$hash'"
+    [ "$status" -eq 0 ]
+
+    local chunk_count
+    chunk_count="$(echo "$output" | python -c "import sys,json; print(json.load(sys.stdin)['chunk_count'])")"
+    [ "$chunk_count" -ge 2 ]
+    rm -rf "$clone2"
+}
+
+@test "cat: --manifest works through LiveFallback and still warns on stderr" {
+    # Same orphan-splicing setup as "cat: LiveFallback resolves an orphaned
+    # standalone object and warns on stderr" above, but exercising --manifest
+    # instead of plain content output. The orphan is a single standalone
+    # object (>= 1 MiB, below the ~4 MiB chunking average), so it is
+    # unchunked: --manifest reports it as its own sole chunk.
+    local donor_dir donor_remote orphan_hash
+    donor_dir="$(mktemp -d)"
+    donor_remote="$(mktemp -d)"
+    (
+        cd "$donor_dir"
+        "$OMEMFS" clone --new --url "$donor_remote" . >/dev/null
+        head -c 1048577 /dev/urandom > orphan.bin
+        "$OMEMFS" push >/dev/null
+    )
+    orphan_hash="$(cd "$donor_dir" && "$OMEMFS" ls --full-hash orphan.bin | awk '{print $1}')"
+
+    local p1="${orphan_hash:0:2}" p2="${orphan_hash:2:2}" p3="${orphan_hash:4:2}" rest="${orphan_hash:6}"
+    local donor_obj_path="$donor_remote/objects/$p1/$p2/$p3/$rest"
+    [ -f "$donor_obj_path" ]
+
+    echo "unrelated tracked content" > tracked.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    local target_obj_path="$REMOTE_DIR/objects/$p1/$p2/$p3/$rest"
+    mkdir -p "$(dirname "$target_obj_path")"
+    cp "$donor_obj_path" "$target_obj_path"
+
+    "$OMEMFS" cat --manifest "$orphan_hash" > out.json 2> err.txt
+    local cat_status=$?
+    [ "$cat_status" -eq 0 ]
+
+    # stdout carries only the manifest JSON.
+    local chunk_count sole_chunk manifest_hash
+    chunk_count="$(python -c "import sys,json; print(json.load(open('out.json'))['chunk_count'])")"
+    sole_chunk="$(python -c "import sys,json; print(json.load(open('out.json'))['chunks'][0])")"
+    manifest_hash="$(python -c "import sys,json; print(json.load(open('out.json'))['hash'])")"
+    [ "$chunk_count" -eq 1 ]
+    [ "$sole_chunk" = "$orphan_hash" ]
+    [ "$manifest_hash" = "$orphan_hash" ]
+
+    # The LiveFallback warning is still printed to stderr, never stdout.
+    grep -q "outside the current snapshot" err.txt
+    ! grep -aq "outside the current snapshot" out.json
+
+    rm -rf "$donor_dir" "$donor_remote" out.json err.txt
 }

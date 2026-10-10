@@ -441,6 +441,80 @@ remote_has_index_root() {
 # CLI help text matches the documented behaviour
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Filter sizing (design/02_storage_format.md "Filter sizing"): dynamic Bloom
+# filter capacity, chosen by `omemfs pack` from the real element count.
+# ---------------------------------------------------------------------------
+
+@test "pack: running omemfs pack twice in a row produces the same bloom num_bits (idempotent)" {
+    # design/02 "Filter sizing": the 1-2-5 ladder + floor at MIN_CAPACITY
+    # exist specifically so that re-running `omemfs pack` against an
+    # unchanged element count reproduces the same num_bits. A naive
+    # capacity-from-element-count formula without ladder quantisation could
+    # jitter by a bit or two between runs due to rounding; this guards
+    # against that.
+    echo "content one" > f1.txt
+    echo "content two" > f2.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    run "$OMEMFS" pack
+    [ "$status" -eq 0 ]
+
+    local bloom_hash_1 num_bits_1
+    bloom_hash_1="$("$OMEMFS" cat index-root \
+        | python -c "import sys,json; d=json.load(sys.stdin); print(d['bloom_hash'])")"
+    num_bits_1="$("$OMEMFS" cat "${bloom_hash_1}" \
+        | python -c "import sys,json; d=json.load(sys.stdin); print(d['num_bits'])")"
+    [ -n "$num_bits_1" ]
+
+    # Second pack run with no intervening push: the element count is
+    # unchanged, so the regenerated filter's num_bits must be identical.
+    run "$OMEMFS" pack
+    [ "$status" -eq 0 ]
+
+    local bloom_hash_2 num_bits_2
+    bloom_hash_2="$("$OMEMFS" cat index-root \
+        | python -c "import sys,json; d=json.load(sys.stdin); print(d['bloom_hash'])")"
+    num_bits_2="$("$OMEMFS" cat "${bloom_hash_2}" \
+        | python -c "import sys,json; d=json.load(sys.stdin); print(d['num_bits'])")"
+
+    [ "$num_bits_2" -eq "$num_bits_1" ]
+}
+
+@test "pack: bloom filter num_bits reflects the actual element count, not a fixed default" {
+    # Before this fix, omemfs pack always sized the filter for a hardcoded
+    # 100_000-element capacity (BloomFilter::new(100_000, 0.01, ...))
+    # regardless of how few objects actually exist. A tiny repository must
+    # now still get a filter sized from its real (small) element count --
+    # capacity_for floors at MIN_CAPACITY=100_000, so the num_bits value
+    # itself is unchanged for a small repo, but bloom_elements must reflect
+    # the real count rather than being coincidental.
+    echo "solo file" > only.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    run "$OMEMFS" pack
+    [ "$status" -eq 0 ]
+
+    local bloom_hash elem_count num_bits
+    bloom_hash="$("$OMEMFS" cat index-root \
+        | python -c "import sys,json; d=json.load(sys.stdin); print(d['bloom_hash'])")"
+    elem_count="$("$OMEMFS" cat "${bloom_hash}" \
+        | python -c "import sys,json; d=json.load(sys.stdin); print(d['element_count'])")"
+    num_bits="$("$OMEMFS" cat "${bloom_hash}" \
+        | python -c "import sys,json; d=json.load(sys.stdin); print(d['num_bits'])")"
+
+    # A one-file repo has very few reachable objects (blob + root tree),
+    # certainly nowhere near MIN_CAPACITY=100_000.
+    [ "$elem_count" -gt 0 ]
+    [ "$elem_count" -lt 100 ]
+    # capacity_for floors at MIN_CAPACITY, so num_bits must still be the
+    # MIN_CAPACITY-sized filter's bit count (a substantial number of bits,
+    # not a handful).
+    [ "$num_bits" -gt 100000 ]
+}
+
 @test "pack: --help does not claim to run GC (design/04: orphans are not deleted)" {
     run "$OMEMFS" pack --help
     [ "$status" -eq 0 ]

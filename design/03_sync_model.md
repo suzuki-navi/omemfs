@@ -23,6 +23,20 @@ working tree  ──────────►  remote root
 clone root: the last successfully synced state, held locally
 ```
 
+These arrows describe **state** relationships only — which of the three states
+a command reads from and writes to. They say nothing about where a command is
+allowed to resolve an *object* from once it knows which state it needs. Object
+resolution is a separate, lower layer (the local cache, the lazy tree store,
+and — for a diagnostic-only command — LiveFallback; see `02_storage_format.md`,
+"Snapshot read path"). In particular, `restore`'s arrow points only at the
+working tree and `clone_root`: it never reads or advances the remote root. That
+does not mean `restore` is barred from talking to the remote at all — it may
+still need to fetch, from the remote, objects that `clone_root` already
+records but the local cache does not yet hold (see `04_cli_spec.md`, "omemfs
+restore" → "Missing objects"). Fetching a `clone_root`-reachable object is
+resolving state `restore` already owns by this diagram, not advancing to a
+different state, so it adds no new arrow here.
+
 ## Change detection
 
 Push and pull determine what changed by comparing all three states:
@@ -417,7 +431,10 @@ The same lazy tree store backs:
 - the conflict-helper "base" side, which resolves a single clone-root blob hash,
 - `ls`'s local (clone-root vs working-tree) diff (see `04_cli_spec.md`, "Local
   diff self-healing") — the one other command that reads clone-root tree
-  objects the same way pull does.
+  objects the same way pull does,
+- `restore`'s plan-phase walk of `clone_root` against the working tree (see
+  `04_cli_spec.md`, "omemfs restore"), when that walk hits a clone-root tree
+  object the local cache does not hold.
 
 This is a shared abstraction (`tree_ops::LazyTreeStore`, `pub(crate)`), not
 pull-exclusive: pull's own uses above are unbounded (pull's entire purpose is

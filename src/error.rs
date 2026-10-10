@@ -56,4 +56,36 @@ impl Error {
             _ => false,
         }
     }
+
+    /// A failure encountered while `restore` (or anything else that heals a
+    /// local cache miss from the remote) tries to fetch an object is
+    /// "recoverable" when it is exactly the case `04_cli_spec.md`'s "Missing
+    /// objects" section describes: every object reachable from `clone_root`
+    /// is guaranteed to exist on the remote, so a cache miss during the plan
+    /// phase means "not fetched into this clone yet", never "gone" -- safe to
+    /// silently downgrade to an `unavailable:` report.
+    ///
+    /// Everything else -- a GCM auth-tag mismatch (DEK mismatch or
+    /// tampering), a corrupt/invalid object, a misconfigured or mistyped
+    /// `--remote` (surfaces as `Error::Other("remote '<name>' not
+    /// configured")`), a CAS failure, a permission or disk-full error, or any
+    /// other unclassified failure -- is NOT recoverable: it indicates
+    /// something is genuinely wrong and must be surfaced to the user, never
+    /// silently swallowed as a bland "unavailable".
+    pub fn is_recoverable_fetch_miss(&self) -> bool {
+        match self {
+            Error::ObjectNotFound(_) => true,
+            // Mirrors `is_live_path_race`'s I/O kinds: on the local-directory
+            // backend restore's own tests exercise, an unreachable remote
+            // surfaces as exactly one of these (e.g. the remote root having
+            // been moved or removed out from under a configured path).
+            Error::Io(error) => matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::NotADirectory
+                    | std::io::ErrorKind::IsADirectory
+            ),
+            _ => false,
+        }
+    }
 }

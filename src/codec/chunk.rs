@@ -444,6 +444,42 @@ pub fn is_chunked(
     }
 }
 
+/// True when the blob at `hash` can be materialised from `local` alone: the
+/// object itself is present, and -- if it is a chunk manifest -- every chunk
+/// it names is present too.
+///
+/// `local.exists(hash)` alone is NOT sufficient: an interrupted transfer can
+/// leave a cached manifest whose chunks were never fetched (an `ED F2`
+/// manifest object written but one or more of the `ED F3` chunk objects it
+/// names missing). Materialising from such a manifest fails partway through
+/// with `Error::ObjectNotFound` for a *chunk* hash, which never appears in any
+/// tree entry, so there is no way to report it by path -- see `restore`'s
+/// "Missing objects" (`design/04_cli_spec.md`). Both `restore`'s plan phase
+/// and `expand` (`src/commands/expand.rs`) use this instead of a bare
+/// `local.exists` check so a partial manifest is treated as "still needs
+/// fetching", not "already cached".
+///
+/// Reads only `local` (never the remote), so this is always local-cache-only
+/// and cheap: at most one extra read of the manifest's own (typically small)
+/// bytes plus one `exists` check per chunk it names.
+pub(crate) fn blob_fully_cached(local: &dyn ObjectStore, hash: &Hash) -> Result<bool, Error> {
+    if !local.exists(hash)? {
+        return Ok(false);
+    }
+    let raw = codec::store_read(local, hash, None)?;
+    match object::deserialise_manifest(&raw) {
+        None => Ok(true),
+        Some(chunk_hashes) => {
+            for chunk_hash in &chunk_hashes {
+                if !local.exists(chunk_hash)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+    }
+}
+
 /// Read and reassemble an object from `store` at `logical_hash` into a single
 /// in-memory buffer. If the stored object is a chunked manifest (ED F2), all
 /// chunks are fetched and concatenated to reconstruct the original serialised
@@ -886,6 +922,63 @@ mod tests {
             result
         );
         assert!(!dest.exists(), "no partial file must be visible at dest");
+    }
+
+    // --- blob_fully_cached (restore's "Missing objects", design/04) -----
+
+    #[test]
+    fn blob_fully_cached_true_for_present_single_object() {
+        // Below CDC_MIN -> stored whole, no manifest.
+        let content = pseudo_random(0x1111_2222, 64 * 1024);
+        let store_dir = TempDir::new().unwrap();
+        let (store, hash) = store_blob(store_dir.path(), &content);
+        assert!(!is_chunked(&store, &hash, None));
+        assert!(blob_fully_cached(&store, &hash).unwrap());
+    }
+
+    #[test]
+    fn blob_fully_cached_false_when_object_absent() {
+        let store_dir = TempDir::new().unwrap();
+        let store = LocalStore::for_cache(store_dir.path());
+        let hash = object::blob_hash(b"never stored");
+        assert!(!blob_fully_cached(&store, &hash).unwrap());
+    }
+
+    #[test]
+    fn blob_fully_cached_true_when_manifest_and_all_chunks_present() {
+        let content = pseudo_random(0x3333_4444, 10 * 1024 * 1024);
+        let store_dir = TempDir::new().unwrap();
+        let (store, hash) = store_blob(store_dir.path(), &content);
+        assert!(is_chunked(&store, &hash, None), "expected a manifest");
+        assert!(blob_fully_cached(&store, &hash).unwrap());
+    }
+
+    #[test]
+    fn blob_fully_cached_false_when_manifest_present_but_one_chunk_missing() {
+        // Core regression: an interrupted transfer that wrote the manifest
+        // but not every chunk it names must be detected as NOT fully cached,
+        // unlike a bare `local.exists(hash)` check (which only sees the
+        // manifest object itself and would wrongly report "cached").
+        let content = pseudo_random(0x5555_6666, 10 * 1024 * 1024);
+        let store_dir = TempDir::new().unwrap();
+        let (store, hash) = store_blob(store_dir.path(), &content);
+
+        let raw = codec::store_read(&store, &hash, None).unwrap();
+        let chunk_hashes = object::deserialise_manifest(&raw).expect("manifest");
+        assert!(chunk_hashes.len() >= 2);
+
+        // The manifest object itself is present (a bare `exists` check on the
+        // logical hash would report true), but delete exactly one chunk it
+        // names to simulate an interrupted fetch.
+        assert!(store.exists(&hash).unwrap());
+        let missing_chunk_path = store.objects_path(&chunk_hashes[0]).expect("chunk path");
+        fs::remove_file(&missing_chunk_path).unwrap();
+        assert!(!store.exists(&chunk_hashes[0]).unwrap());
+
+        assert!(
+            !blob_fully_cached(&store, &hash).unwrap(),
+            "a manifest with a missing chunk must not be reported as fully cached"
+        );
     }
 
     #[test]
