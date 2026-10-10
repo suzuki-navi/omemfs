@@ -537,6 +537,80 @@ A remote `AddedTree` (an auto-stubbed new directory, reported at the directory's
 
 The one exception is a local change beneath a `.git` entry (`d/.git/...`): a pre-existing local Git worktree at the `AddedTree`'s path is the case design/08 ("Stubs and Git repositories") already handles by materialising into it instead of stubbing, so it is not treated as a conflict. A local change beside the `.git` entry (`d/notes.txt`) is still a conflict.
 
+### Re-verifying a path immediately before it is overwritten
+
+The scan that decides "this path has no local change" happens before the
+remote blobs are downloaded, and on a slow link the download can take minutes.
+A user who edits, creates or deletes a file in that time would otherwise have
+the edit overwritten by the pull, because the decision was made against a
+working tree that no longer exists.
+
+Immediately before pull overwrites or deletes an existing working-tree path,
+it re-checks that path against what the scan saw:
+
+- For a path the scan recorded as a regular file (present in the scan's
+  `files`), the file's current `(mtime, size)` must equal the recorded pair.
+- For a path the scan **saw as something other than a regular file** (a
+  symlink, a directory, a stub marker, or an ignored or unreadable entry), the
+  scan holds no `(mtime, size)` for it, so the check is only that it is still
+  present. Such a path is neither "absent" nor comparable; treating it as
+  either would abort ordinary pulls (for example a remote change to a symlink
+  the working tree already has).
+- For a path the scan did not see at all, it must still be absent (no file,
+  symlink or directory has appeared there).
+- A path that is going to be **created** (`Added`) where nothing existed at
+  scan time is checked the same way: something appearing there since is a
+  local addition that the write would replace.
+
+To tell the last two cases apart the scan records, in its side data, every
+path it saw that is not a regular file (`seen_other`), alongside the per-file
+`(mtime, size)` map.
+
+**A file stub is a path with no file on disk.** `big.bin.omemfs-stub` stands
+for `big.bin`, whose real file is absent by design (design/08). The scan
+records `big.bin` in `seen_other`, but "still present" would be false for it at
+every check, and a pull that updates the stub record (`Modified` on a stubbed
+path) or removes the stub (`Deleted`) would abort on every run. For a path whose
+stub marker existed at scan time the expected state is therefore **"the real
+file is still absent"**: the check fails only if a real file has appeared at that
+path since the scan. The scan records these paths separately (`seen_stub`), not
+in `seen_other`, so the two meanings never share a set.
+
+**The pull's own removals are not user edits.** Applying a diff removes files
+and then prunes the directories they leave empty, before it writes the new
+content: a directory replaced by a file loses its children first, and the
+now-empty directory is pruned, all before the file is written at the same path.
+The per-path check just before that write would otherwise see the directory the
+scan observed missing and report the pull's own deletion as a concurrent edit.
+The pull therefore records every path it removes itself (the deleted files and
+the pruned directories) and treats those paths as "present at scan time, then
+removed by this pull", which is not a change. Only a path whose state differs
+from **both** what the scan saw and what the pull itself did counts.
+
+The check compares `(mtime, size)`, the same cheap signal the scan itself uses
+to decide a file is unchanged. It does not re-hash: re-hashing every file
+would cost as much as the scan. Consequently a change that preserves both
+mtime (at nanosecond resolution) and size is not detected, which is exactly the
+blind spot the scan already has (see "Racily clean detection" in
+`07_stat_cache.md`).
+
+If any path fails the check, the pull is aborted exactly like a conflict
+detected up front: `clone_root` is **not** advanced, an `Error::Conflict` is
+returned, and a conflict helper set is written for each path that changed
+underneath the pull, so `omemfs conflict` can resolve it the usual way. Paths
+the pull had already applied before the check failed stay applied; applying a
+diff is idempotent, so running `omemfs pull` again completes it. To keep that
+set small, the check for **every** path runs before the first write, in a
+single pass over the clean diff, and again for each path individually
+immediately before its own write.
+
+Residual window: between a path's final check and its `rename` the file can
+still change. That window is a few system calls, not the duration of the
+download. Closing it entirely would require the rename to be conditional on the
+target's identity, which POSIX does not offer for a path (only for an open
+descriptor); this is the same limit as the scoped-push window in the "Write
+safety" section below.
+
 ### Conflict helper files
 
 For each conflicting path `<path>`, pull writes three helper files alongside the original:
@@ -589,7 +663,20 @@ Resolve conflicts and push:
 
 If a conflicting path was added by one side (absent at `clone_root`) or deleted by one side, the corresponding helper file for the absent side is not written. Only the sides that have content produce a helper file.
 
-**Clearing stale residue before writing.** Before writing any of the (up to three) helper files and the metadata sidecar for a path, `pull` first removes every existing `.omemfs-conflict-*` artifact (all three helpers plus the sidecar, i.e. `conflict::CONFLICT_ARTIFACT_SUFFIXES`) for that exact path, then writes only the sides that currently have content. This matters because a conflict on the same path can recur: the user leaves an earlier conflict unresolved, the remote advances again in the meantime (e.g. the remote side that used to be a blob is now deleted, or vice versa), and the next `pull` re-detects the same path as conflicting with a different shape on one or more sides. Without clearing first, a side that is a "missing side" (no helper written) in the *new* conflict would silently keep the helper file left over from the *previous* one — stale content with no connection to the diff `pull` just computed. `conflict accept-remote`/`accept-local`/`accept-base` decide what to apply purely from "does the helper file for this side exist" (see "Advancing clone_root on resolution" above), so a stale helper is indistinguishable from a genuine one and gets applied as if it were current, silently reintroducing content the remote (or local, or base) side no longer holds. Clearing first closes this gap: a "missing side" in the new conflict is guaranteed to have no helper file, exactly as if this were the first time the path conflicted.
+**Clearing stale residue before writing.** Before writing any of the (up to three) helper files and the metadata sidecar for a path, `pull` first removes every existing `.omemfs-conflict-*` artifact (all three helpers plus the sidecar, i.e. `conflict::CONFLICT_ARTIFACT_SUFFIXES`) for that exact path, then writes only the sides that currently have content. This matters because a conflict on the same path can recur: the user leaves an earlier conflict unresolved, the remote advances again in the meantime (e.g. the remote side that used to be a blob is now deleted, or vice versa), and the next `pull` re-detects the same path as conflicting with a different shape on one or more sides. Without clearing first, a side that is a "missing side" (no helper written) in the *new* conflict would silently keep the helper file left over from the *previous* one — stale content with no connection to the diff `pull` just computed. Before the metadata sidecar recorded which sides exist (see "The sidecar records which sides exist" below), `conflict accept-remote`/`accept-local`/`accept-base` decided what to apply purely from "does the helper file for this side exist", so a stale helper was indistinguishable from a genuine one and got applied as if it were current, silently reintroducing content the remote (or local, or base) side no longer holds. Clearing first closes this gap at the source: a "missing side" in the new conflict is guaranteed to have no helper file, exactly as if this were the first time the path conflicted. The recorded sides (next section) are the second line of defence for the cases clearing cannot cover.
+
+### The sidecar records which sides exist
+
+Whether a side "has content" must not be inferred from the presence of a helper file: a helper can be missing because it was deleted by accident, or present because it is residue. `pull` therefore records the answer explicitly in the `.omemfs-conflict-meta` sidecar as `sides`: three booleans (`base`, `local`, `remote`), each true exactly when `pull` wrote the corresponding `.omemfs-conflict-{base,local,remote}` helper for this conflict. `accept-*` reads `sides` for the accepted side instead of probing the filesystem:
+
+- Recorded present and the helper file exists: the helper's content is applied.
+- Recorded absent and no helper file exists (a "missing side"): the working-tree path is deleted, or, for a remote side recorded as a symlink, replaced with that symlink (see below).
+- Recorded present but the helper file is missing, or recorded absent but a helper file exists: the artifacts no longer match what `pull` wrote. `accept-*` aborts with an error naming the path **before changing anything** (including `clone_root`), because guessing here would either delete a file the user still needs or apply content `pull` never intended. The user can re-run `omemfs pull` (which clears and rewrites the artifacts), run `omemfs conflict clean`, or `omemfs restore <path>`.
+- No `sides` field (no sidecar, an unreadable sidecar, or one written by an older omemfs version): fall back to helper-file presence, as before. This keeps hand-made or legacy conflict helpers resolvable.
+
+`--dry-run` applies the same rules and reports the same error, so a dry run never predicts a resolution the real run would refuse.
+
+**Single owner.** All reading, writing, and removal of conflict artifacts lives in `src/commands/conflict.rs`. `pull` supplies the content sources for each side (the clone_root blob, the working-tree file, the remote blob) and the metadata, and calls one write entry point that clears the path's previous artifacts, writes the helpers for the sides that have content, and writes the sidecar with the matching `sides`. `accept-*` obtains each path's accepted content through one resolver that applies the rules above. `restore` and `conflict clean` use the shared removal primitive.
 
 ### Remote side is a symlink
 
@@ -751,6 +838,8 @@ apply_changes(base_tree, remote_tree, working_tree):
 No code may write, create, or unlink a working-tree path via a lexical `Path`. Every such operation goes through `src/fsguard.rs`, which resolves the path component-by-component from a `work_dir` directory fd using `openat(O_DIRECTORY|O_NOFOLLOW)` and then performs the operation `*at()`-relative to the resolved fd. A component strictly below `work_dir` that is a symlink is refused with `Error::SymlinkEscape`; `work_dir` itself and its ancestors are deliberately exempt (a legitimately symlinked or mounted `work_dir` must keep working). An unresolvable boundary is always an error, never a pass. Because the resolved fd *is* the fd the write uses, there is no check-then-use window.
 
 This replaces an earlier lexical guard (`fsmeta::reject_symlink_escape`, since removed) that re-derived the boundary via `Repo::discover` and then walked the path a second time with `symlink_metadata` before the real write happened. That shape had three independent fail-open holes: `Repo::discover` itself calls `.is_dir()` (which follows symlinks), so a symlinked directory whose target happened to contain its own `.omemfs/` marker was mistaken for the repository root itself, collapsing the walk to nothing to check; a `Repo::discover` or `strip_prefix` failure returned `Ok(())` (permissive) rather than an error; and the check-then-write shape was a TOCTOU regardless of the first two holes. `fsguard` closes all three by construction: there is no separate boundary-discovery step to spoof, no permissive fallback branch anywhere in the module, and the fd that passed the check is the fd the write uses, so there is nothing to race.
+
+The temporary sibling that `fsguard` writes before renaming into place is named `.omemfs-tmp-<pid>-<nanos>-<counter>`, in the reserved `.omemfs-` namespace (design/09 "`.omemfs-tmp-*`"), not with a generic `.tmp` prefix. A generic name left in the working tree by an interrupted write would be an ordinary untracked-looking file that the next `push` uploads as content; a reserved name is excluded from every scan, so an interrupted write can leave litter but never pollute the repository.
 
 Deletion and metadata mutation (chmod / mtime) go through the same primitive as content writes — `fsguard::remove_file_tolerant` and `GuardedDir::set_mode`/`set_mtime` — for the same reason: a lexically-planned delete or a path-based `chmod`/`utimes` follows a symlink exactly like a naive write would.
 

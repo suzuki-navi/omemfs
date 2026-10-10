@@ -1267,3 +1267,107 @@ teardown() {
 
     rm -rf "$outside"
 }
+
+# ---------------------------------------------------------------------------
+# Re-verifying right before the delete (review R4; design/08 "omemfs stub",
+# "Re-verifying immediately before the delete"). The hook only exists in debug
+# builds, like OMEMFS_TEST_SCAN_AFTER_LIST_DELAY_MS.
+# ---------------------------------------------------------------------------
+
+@test "stub: a file edited after verification is kept, and its stub record is removed again" {
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" repo
+    [ "$status" -eq 0 ]
+    cd repo
+    echo "pushed content" > file.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    (sleep 0.3; echo "an unsaved edit made while stub was running" > file.txt) &
+    editor=$!
+    run env OMEMFS_TEST_STUB_BEFORE_DELETE_DELAY_MS=1000 "$OMEMFS" stub file.txt
+    wait "$editor"
+
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"changed while being stubbed"* ]]
+    [ "$(cat file.txt)" = "an unsaved edit made while stub was running" ]
+    # No stub is left behind that would restore the OLD content over the edit.
+    [ ! -f file.txt.omemfs-stub ]
+}
+
+@test "stub: an unedited file is still stubbed normally with the hook active" {
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" repo
+    [ "$status" -eq 0 ]
+    cd repo
+    echo "pushed content" > file.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    run env OMEMFS_TEST_STUB_BEFORE_DELETE_DELAY_MS=300 "$OMEMFS" stub file.txt
+    [ "$status" -eq 0 ]
+    [ ! -f file.txt ]
+    [ -f file.txt.omemfs-stub ]
+}
+
+@test "stub: a directory with a file edited after verification is left untouched" {
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" repo
+    [ "$status" -eq 0 ]
+    cd repo
+    mkdir -p sub
+    echo "a" > sub/a.txt
+    echo "b" > sub/b.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    (sleep 0.3; echo "edited b, unsaved" > sub/b.txt) &
+    editor=$!
+    run env OMEMFS_TEST_STUB_BEFORE_DELETE_DELAY_MS=1000 "$OMEMFS" stub sub
+    wait "$editor"
+
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"changed while being stubbed"* ]]
+    [ "$(cat sub/a.txt)" = "a" ]
+    [ "$(cat sub/b.txt)" = "edited b, unsaved" ]
+    [ ! -f sub/.omemfs-stub ]
+}
+
+@test "stub: a file created inside a directory after verification keeps the directory" {
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" repo
+    [ "$status" -eq 0 ]
+    cd repo
+    mkdir -p sub
+    echo "a" > sub/a.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    (sleep 0.3; echo "brand new" > sub/new.txt) &
+    creator=$!
+    run env OMEMFS_TEST_STUB_BEFORE_DELETE_DELAY_MS=1000 "$OMEMFS" stub sub
+    wait "$creator"
+
+    [ "$status" -ne 0 ]
+    [ "$(cat sub/new.txt)" = "brand new" ]
+    [ "$(cat sub/a.txt)" = "a" ]
+    [ ! -f sub/.omemfs-stub ]
+}
+
+@test "stub: a failed re-check stubs nothing further but keeps targets already stubbed" {
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" repo
+    [ "$status" -eq 0 ]
+    cd repo
+    echo "one" > one.txt
+    echo "two" > two.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    # Targets are processed in argument order; two.txt is edited during the pause.
+    (sleep 0.3; echo "two, edited" > two.txt) &
+    editor=$!
+    run env OMEMFS_TEST_STUB_BEFORE_DELETE_DELAY_MS=1000 "$OMEMFS" stub one.txt two.txt
+    wait "$editor"
+
+    [ "$status" -ne 0 ]
+    [ ! -f one.txt ]
+    [ -f one.txt.omemfs-stub ]
+    [ "$(cat two.txt)" = "two, edited" ]
+    [ ! -f two.txt.omemfs-stub ]
+}

@@ -377,6 +377,10 @@ fn walk_dir_sizes(
         if crate::stub::is_stub_filename(&name) {
             continue;
         }
+        // Skip fsguard staging leftovers (design/09 "`.omemfs-tmp-*`").
+        if crate::object::is_working_tree_tmp(&name) {
+            continue;
+        }
         // Skip unknown reserved names (forward-compat, same as scan.rs).
         if crate::scan::is_unknown_reserved_name(&name) {
             continue;
@@ -1619,14 +1623,14 @@ fn print_recent_io(
 fn format_time(ts: &str) -> String {
     // Strip year, replace 'T' with space, strip 'Z'.
     // Expected format: YYYY-MM-DDTHH:MM:SSZ
-    if ts.len() >= 19 && ts.chars().nth(4) == Some('-') && ts.chars().nth(10) == Some('T') {
-        let month_day = &ts[5..10]; // "MM-DD"
-        let hms = &ts[11..19]; // "HH:MM:SS"
-        format!("{} {}", month_day, hms)
-    } else {
+    // `ts` comes from a plain file, so slice with `get` (a multi-byte character
+    // can straddle a fixed byte offset) and escape whatever is shown.
+    let formatted = match (ts.get(4..5), ts.get(10..11), ts.get(5..10), ts.get(11..19)) {
+        (Some("-"), Some("T"), Some(month_day), Some(hms)) => format!("{} {}", month_day, hms),
         // Fallback: just strip T and Z.
-        ts.replace('T', " ").trim_end_matches('Z').to_string()
-    }
+        _ => ts.replace('T', " ").trim_end_matches('Z').to_string(),
+    };
+    crate::term::escape_display(&formatted).into_owned()
 }
 
 /// Format writes or reads cell: "<ops> <compact_size>", or "<ops> —" when bytes == 0.
@@ -2128,6 +2132,20 @@ mod tests {
         assert_eq!(format_time("2026-06-13T02:05:11Z"), "06-13 02:05:11");
         assert_eq!(format_time("2025-12-31T23:59:59Z"), "12-31 23:59:59");
         assert_eq!(format_time("2026-01-01T00:00:00Z"), "01-01 00:00:00");
+    }
+
+    #[test]
+    fn format_time_does_not_panic_on_multibyte_timestamps() {
+        // ts comes from io_stats.jsonl, which is a plain file. The `-` and `T`
+        // checks use chars().nth, but the slices below them use byte offsets.
+        let evil = "2026-日本語T02:05:11Z_padding_to_make_it_long_enough";
+        let _ = format_time(evil);
+        let evil2 = "2026-0😀-13T02:05:11Z";
+        let _ = format_time(evil2);
+        let evil3 = "2026-06-13T0😀:05:11Z";
+        let _ = format_time(evil3);
+        let evil4 = "２０２６-06-13T02:05:11Z";
+        let _ = format_time(evil4);
     }
 
     #[test]

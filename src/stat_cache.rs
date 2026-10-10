@@ -100,6 +100,12 @@ pub struct StatCache {
     /// this scan never loaded. Never set by a read-only scan, which never
     /// calls `compute_seals_trusted` at all.
     seals_invalidated: bool,
+    /// Paths whose entry this scan changed (`update` that altered an entry, or
+    /// `mark_sealed` that flipped the bit). A read-only writeback overlays only
+    /// these onto a fresh copy of the file, so it never reverts what a
+    /// concurrent lock-holding `push` wrote (design/07 "Read-only writeback
+    /// without the lock").
+    changed: std::collections::HashSet<String>,
 }
 
 impl StatCache {
@@ -172,6 +178,30 @@ impl StatCache {
             return Ok(false);
         }
         self.write(omemfs_dir)?;
+        Ok(true)
+    }
+
+    /// Write back a **read-only** scan (`ls`, `pull`; no repository lock for
+    /// `ls`) by merging: re-read the file fresh and overlay only the entries
+    /// this scan changed, so a concurrent `push`'s epoch rotation, SEALED bits
+    /// and newer entries are never reverted (design/07 "Read-only writeback
+    /// without the lock"). Works for a full and a scope-limited load alike,
+    /// because only changed entries are overlaid. Returns `Ok(false)` without
+    /// touching the file when this scan changed nothing.
+    pub fn write_readonly_merge(&mut self, omemfs_dir: &Path) -> Result<bool, Error> {
+        if self.changed.is_empty() {
+            return Ok(false);
+        }
+        let mut fresh = Self::read(omemfs_dir);
+        for path in &self.changed {
+            if let Some(entry) = self.entries.get(path) {
+                fresh.entries.insert(path.clone(), entry.clone());
+            }
+        }
+        fresh.dirty = true;
+        fresh.write(omemfs_dir)?;
+        self.changed.clear();
+        self.dirty = false;
         Ok(true)
     }
 
@@ -273,12 +303,22 @@ impl StatCache {
     }
 
     /// Insert or replace an entry. Sets `is_unsafe = true` when the file's
-    /// mtime falls within the current second (racily clean). `sealed` is set
-    /// directly from the caller (design/07 "Update": `sealed = write_blobs`
-    /// for the scan that produced this entry).
-    pub fn update(&mut self, path: String, mtime: SystemTime, fs_size: u64, hash: Hash, sealed: bool) {
+    /// mtime is within `RACY_THRESHOLD_SECS` of `observed_at` (racily clean).
+    /// `observed_at` is when the scan looked at the file, NOT the current
+    /// clock: a long scan must not launder a racy entry (design/07 "Racily
+    /// clean detection"). `sealed` is set directly from the caller (design/07
+    /// "Update": `sealed = write_blobs` for the scan that produced this entry).
+    pub fn update(
+        &mut self,
+        path: String,
+        mtime: SystemTime,
+        fs_size: u64,
+        hash: Hash,
+        sealed: bool,
+        observed_at: SystemTime,
+    ) {
         let (mtime_secs, mtime_nanos) = systemtime_to_parts(mtime);
-        let is_unsafe = is_racily_clean(mtime_secs, SystemTime::now());
+        let is_unsafe = is_racily_clean(mtime_secs, observed_at);
         let new_entry = StatCacheEntry {
             mtime_secs,
             mtime_nanos,
@@ -295,6 +335,7 @@ impl StatCache {
         };
         if changed {
             self.dirty = true;
+            self.changed.insert(path.clone());
         }
         self.entries.insert(path, new_entry);
     }
@@ -309,6 +350,7 @@ impl StatCache {
             Some(entry) if !entry.sealed => {
                 entry.sealed = true;
                 self.dirty = true;
+                self.changed.insert(path.to_string());
                 true
             }
             _ => false,
@@ -762,6 +804,7 @@ fn parse_v1(bytes: &[u8]) -> Option<StatCache> {
         seals_trusted: false,
         needs_new_epoch: false,
         seals_invalidated: false,
+        changed: std::collections::HashSet::new(),
     })
 }
 
@@ -907,6 +950,7 @@ fn parse_v1_scoped(bytes: &[u8], scope_prefix: &str) -> Option<StatCache> {
         seals_trusted: false,
         needs_new_epoch: false,
         seals_invalidated: false,
+        changed: std::collections::HashSet::new(),
     })
 }
 
@@ -1020,7 +1064,7 @@ mod tests {
         let mut cache = StatCache::default();
         let hash = fake_hash(0x01);
         let mtime = mtime_at(1_700_000_000, 0);
-        cache.update("a.txt".to_string(), mtime, 100, hash.clone(), false);
+        cache.update("a.txt".to_string(), mtime, 100, hash.clone(), false, SystemTime::now());
         // Force is_unsafe=false (mtime is old enough).
         cache.entries.get_mut("a.txt").unwrap().is_unsafe = false;
         assert_eq!(cache.lookup_current("a.txt", mtime, 100), Some(&hash));
@@ -1031,7 +1075,7 @@ mod tests {
         let mut cache = StatCache::default();
         let hash = fake_hash(0x01);
         let mtime = mtime_at(1_700_000_000, 0);
-        cache.update("a.txt".to_string(), mtime, 100, hash.clone(), false);
+        cache.update("a.txt".to_string(), mtime, 100, hash.clone(), false, SystemTime::now());
         cache.entries.get_mut("a.txt").unwrap().is_unsafe = false;
         assert_eq!(cache.lookup_current("a.txt", mtime, 99), None);
     }
@@ -1041,7 +1085,7 @@ mod tests {
         let mut cache = StatCache::default();
         let hash = fake_hash(0x01);
         let mtime = mtime_at(1_700_000_000, 0);
-        cache.update("a.txt".to_string(), mtime, 100, hash.clone(), false);
+        cache.update("a.txt".to_string(), mtime, 100, hash.clone(), false, SystemTime::now());
         cache.entries.get_mut("a.txt").unwrap().is_unsafe = false;
         assert_eq!(
             cache.lookup_current("a.txt", mtime_at(1_700_000_001, 0), 100),
@@ -1109,6 +1153,157 @@ mod tests {
     }
 
     #[test]
+    fn update_judges_racy_by_observation_time_not_by_the_clock_at_writeback() {
+        // The file was hashed at t=1000.0 and its mtime was 1000.0 (racy). The
+        // writeback happens "much later"; only the observation time matters.
+        let mtime = mtime_at(1_000, 0);
+        let observed = mtime_at(1_000, 500_000_000);
+        let mut cache = StatCache::default();
+        cache.update("a.txt".to_string(), mtime, 1, fake_hash(1), false, observed);
+        assert!(
+            cache.entries["a.txt"].is_unsafe,
+            "hashed within 3s of the mtime -> racily clean, however late it is written back"
+        );
+        assert!(cache.lookup_current("a.txt", mtime, 1).is_none());
+    }
+
+    #[test]
+    fn update_marks_safe_only_when_observed_three_or_more_seconds_after_mtime() {
+        let mtime = mtime_at(1_000, 0);
+        let mut cache = StatCache::default();
+        cache.update("a".to_string(), mtime, 1, fake_hash(1), false, mtime_at(1_002, 999_000_000));
+        assert!(cache.entries["a"].is_unsafe, "2.999s after mtime is still racy");
+        cache.update("a".to_string(), mtime, 1, fake_hash(1), false, mtime_at(1_003, 0));
+        assert!(!cache.entries["a"].is_unsafe, "3s after mtime is safe");
+        assert!(cache.lookup_current("a.txt", mtime, 1).is_none());
+        assert!(cache.lookup_current("a", mtime, 1).is_some());
+    }
+
+    #[test]
+    fn a_long_scan_does_not_launder_a_racy_entry() {
+        // Regression (review R2): with the writeback-time clock, a scan that
+        // hashed a file at t=mtime and finished 10 minutes later would have
+        // recorded the entry as safe.
+        let mtime = mtime_at(5_000, 0);
+        let observed_at_scan_start = mtime_at(5_000, 100_000_000);
+        let mut cache = StatCache::default();
+        cache.update("f".to_string(), mtime, 9, fake_hash(9), true, observed_at_scan_start);
+        assert!(cache.entries["f"].is_unsafe);
+    }
+
+    // ---- Read-only writeback without the lock (design/07) ------------------
+
+    fn write_two_sealed(dir: &Path, epoch: [u8; SEAL_EPOCH_LEN]) {
+        let mut c = StatCache::default();
+        c.seal_epoch = epoch;
+        let m = mtime_at(1_000_000_000, 0);
+        c.update("a.txt".to_string(), m, 1, fake_hash(1), true, mtime_at(2_000_000_000, 0));
+        c.update("b.txt".to_string(), m, 2, fake_hash(2), true, mtime_at(2_000_000_000, 0));
+        c.write(dir).unwrap();
+    }
+
+    #[test]
+    fn readonly_merge_does_not_revert_a_concurrent_push() {
+        // ls loads the cache, then a push rotates the epoch, seals c.txt and
+        // updates b.txt, then ls writes back one new entry (d.txt).
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_two_sealed(tmp.path(), [1; SEAL_EPOCH_LEN]);
+        let mut ls_cache = StatCache::read(tmp.path());
+
+        let m = mtime_at(1_000_000_000, 0);
+        let mut push_cache = StatCache::read(tmp.path());
+        push_cache.seal_epoch = [9; SEAL_EPOCH_LEN];
+        push_cache.update("b.txt".to_string(), m, 2, fake_hash(0xbb), true, mtime_at(2_000_000_000, 0));
+        push_cache.update("c.txt".to_string(), m, 3, fake_hash(3), true, mtime_at(2_000_000_000, 0));
+        push_cache.write(tmp.path()).unwrap();
+
+        ls_cache.update("d.txt".to_string(), m, 4, fake_hash(4), false, mtime_at(2_000_000_000, 0));
+        assert!(ls_cache.write_readonly_merge(tmp.path()).unwrap());
+
+        let after = StatCache::read(tmp.path());
+        assert_eq!(after.seal_epoch, [9; SEAL_EPOCH_LEN], "epoch must not revert");
+        assert_eq!(after.entries["b.txt"].hash, fake_hash(0xbb), "push's b.txt must survive");
+        assert!(after.entries["b.txt"].sealed);
+        assert!(after.entries.contains_key("c.txt"), "push's new entry must survive");
+        assert!(after.entries["c.txt"].sealed);
+        assert_eq!(after.entries["d.txt"].hash, fake_hash(4), "ls's own entry is added");
+    }
+
+    #[test]
+    fn readonly_merge_of_a_changed_entry_wins_over_the_fresh_copy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_two_sealed(tmp.path(), [1; SEAL_EPOCH_LEN]);
+        let mut ls_cache = StatCache::read(tmp.path());
+        let m = mtime_at(1_000_000_000, 5);
+        ls_cache.update("a.txt".to_string(), m, 10, fake_hash(0xaa), false, mtime_at(2_000_000_000, 0));
+        assert!(ls_cache.write_readonly_merge(tmp.path()).unwrap());
+        let after = StatCache::read(tmp.path());
+        assert_eq!(after.entries["a.txt"].hash, fake_hash(0xaa));
+        assert_eq!(after.entries["a.txt"].fs_size, 10);
+        assert_eq!(after.entries["b.txt"].hash, fake_hash(2), "untouched entry unchanged");
+        assert!(after.entries["b.txt"].sealed, "untouched SEALED bit unchanged");
+    }
+
+    #[test]
+    fn readonly_merge_with_no_change_does_not_write() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_two_sealed(tmp.path(), [1; SEAL_EPOCH_LEN]);
+        let path = tmp.path().join("STAT_CACHE");
+        let before = fs::read(&path).unwrap();
+        let mut ls_cache = StatCache::read(tmp.path());
+        let m = mtime_at(1_000_000_000, 0);
+        // Same values as on disk: not a change.
+        ls_cache.update("a.txt".to_string(), m, 1, fake_hash(1), true, mtime_at(2_000_000_000, 0));
+        assert!(!ls_cache.write_readonly_merge(tmp.path()).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn readonly_merge_records_mark_sealed_as_a_change() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut c = StatCache::default();
+        c.seal_epoch = [1; SEAL_EPOCH_LEN];
+        c.update("a.txt".to_string(), mtime_at(1_000_000_000, 0), 1, fake_hash(1), false, mtime_at(2_000_000_000, 0));
+        c.write(tmp.path()).unwrap();
+
+        let mut ls_cache = StatCache::read(tmp.path());
+        assert!(ls_cache.mark_sealed("a.txt"));
+        assert!(ls_cache.write_readonly_merge(tmp.path()).unwrap());
+        assert!(StatCache::read(tmp.path()).entries["a.txt"].sealed);
+    }
+
+    #[test]
+    fn readonly_merge_starts_from_an_absent_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut c = StatCache::default();
+        c.update("a.txt".to_string(), mtime_at(1_000_000_000, 0), 1, fake_hash(1), false, mtime_at(2_000_000_000, 0));
+        assert!(c.write_readonly_merge(tmp.path()).unwrap());
+        assert!(StatCache::read(tmp.path()).entries.contains_key("a.txt"));
+    }
+
+    #[test]
+    fn scoped_merge_overlays_only_changed_entries() {
+        // A scoped read-only scan loaded dirA/*; a push then rewrote dirA/b.rs.
+        // The scoped writeback must not restore its stale dirA/b.rs.
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_cache_with_paths(tmp.path(), &["dirA/a.rs", "dirA/b.rs", "dirB/c.rs"]);
+        let mut scoped = StatCache::read_scoped(tmp.path(), "dirA");
+
+        let m = mtime_at(1_000_000_000, 0);
+        let mut push_cache = StatCache::read(tmp.path());
+        push_cache.update("dirA/b.rs".to_string(), m, 777, fake_hash(0xcc), true, mtime_at(2_000_000_000, 0));
+        push_cache.write(tmp.path()).unwrap();
+
+        scoped.update("dirA/a.rs".to_string(), m, 55, fake_hash(0x55), false, mtime_at(2_000_000_000, 0));
+        assert!(scoped.write_readonly_merge(tmp.path()).unwrap());
+
+        let after = StatCache::read(tmp.path());
+        assert_eq!(after.entries["dirA/a.rs"].fs_size, 55);
+        assert_eq!(after.entries["dirA/b.rs"].fs_size, 777, "push's newer entry must survive");
+        assert!(after.entries["dirA/b.rs"].sealed);
+    }
+
+    #[test]
     fn unsafe_flag_preserved_in_roundtrip() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut cache = StatCache::default();
@@ -1138,7 +1333,7 @@ mod tests {
     fn update_with_new_entry_marks_dirty() {
         let mut cache = StatCache::default();
         let mtime = mtime_at(1_700_000_000, 0);
-        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), false);
+        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), false, SystemTime::now());
         assert!(
             cache.is_dirty(),
             "inserting a new entry must mark the cache dirty"
@@ -1151,11 +1346,11 @@ mod tests {
         let mut cache = StatCache::default();
         // Use an old mtime so is_unsafe is stable (false) across both updates.
         let mtime = mtime_at(1_000_000_000, 0);
-        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), false);
+        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), false, SystemTime::now());
         cache.write(tmp.path()).unwrap();
         assert!(!cache.is_dirty(), "write must clear the dirty flag");
         // Re-apply the exact same (mtime, size, hash): no change → stays clean.
-        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), false);
+        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), false, SystemTime::now());
         assert!(
             !cache.is_dirty(),
             "a no-op update must not mark the cache dirty"
@@ -1167,10 +1362,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut cache = StatCache::default();
         let mtime = mtime_at(1_000_000_000, 0);
-        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), false);
+        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), false, SystemTime::now());
         cache.write(tmp.path()).unwrap();
         assert!(!cache.is_dirty());
-        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x02), false);
+        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x02), false, SystemTime::now());
         assert!(cache.is_dirty(), "changed hash must mark the cache dirty");
     }
 
@@ -1179,13 +1374,13 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut cache = StatCache::default();
         let mtime = mtime_at(1_000_000_000, 0);
-        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), false);
+        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), false, SystemTime::now());
         // First write: cache is dirty, so it writes and the file appears.
         assert!(cache.write_if_dirty(tmp.path()).unwrap());
         let path = tmp.path().join("STAT_CACHE");
         let mtime1 = fs::metadata(&path).unwrap().modified().unwrap();
         // Re-apply the same entry (no change), then write_if_dirty must skip.
-        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), false);
+        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), false, SystemTime::now());
         assert!(
             !cache.write_if_dirty(tmp.path()).unwrap(),
             "clean cache must skip write"
@@ -1199,7 +1394,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut cache = StatCache::default();
         let mtime = mtime_at(1_000_000_000, 0);
-        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), false);
+        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), false, SystemTime::now());
         cache.write(tmp.path()).unwrap();
         assert!(!cache.is_dirty());
         // Removing a missing key is a no-op.
@@ -1234,7 +1429,7 @@ mod tests {
         let mut cache = StatCache::default();
         let mtime = mtime_at(1_000_000_000, 0);
         for (i, p) in paths.iter().enumerate() {
-            cache.update(p.to_string(), mtime, 100 + i as u64, fake_hash(i as u8), false);
+            cache.update(p.to_string(), mtime, 100 + i as u64, fake_hash(i as u8), false, SystemTime::now());
         }
         cache.write(dir).unwrap();
     }
@@ -1344,7 +1539,7 @@ mod tests {
         let mut scoped = StatCache::read_scoped(tmp.path(), "dirA");
         assert_eq!(sorted_keys(&scoped), vec!["dirA/a.rs"]);
         let mtime = mtime_at(1_000_000_000, 0);
-        scoped.update("dirA/a.rs".to_string(), mtime, 999, fake_hash(0x77), false);
+        scoped.update("dirA/a.rs".to_string(), mtime, 999, fake_hash(0x77), false, SystemTime::now());
         assert!(scoped.write_scoped_merge(tmp.path(), "dirA").unwrap());
 
         // dirB/b.rs must survive untouched; dirA/a.rs must reflect the update.
@@ -1367,7 +1562,7 @@ mod tests {
         let mut scoped = StatCache::read_scoped(tmp.path(), "dirA");
         // Re-apply the identical entry: no in-scope change.
         let mtime = mtime_at(1_000_000_000, 0);
-        scoped.update("dirA/a.rs".to_string(), mtime, 100, fake_hash(0x00), false);
+        scoped.update("dirA/a.rs".to_string(), mtime, 100, fake_hash(0x00), false, SystemTime::now());
         assert!(!scoped.is_dirty(), "no-op scoped update must stay clean");
         assert!(
             !scoped.write_scoped_merge(tmp.path(), "dirA").unwrap(),
@@ -1387,7 +1582,7 @@ mod tests {
         write_cache_with_paths(tmp.path(), &["dirA/a.rs", "dirB/b.rs"]);
         let mut scoped = StatCache::read_scoped(tmp.path(), "dirA");
         let mtime = mtime_at(1_000_000_000, 0);
-        scoped.update("dirA/new.rs".to_string(), mtime, 42, fake_hash(0x55), false);
+        scoped.update("dirA/new.rs".to_string(), mtime, 42, fake_hash(0x55), false, SystemTime::now());
         assert!(scoped.write_scoped_merge(tmp.path(), "dirA").unwrap());
 
         let after = StatCache::read(tmp.path());
@@ -1418,8 +1613,8 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut cache = StatCache::default();
         let mtime = mtime_at(1_000_000_000, 0);
-        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), true);
-        cache.update("b.txt".to_string(), mtime, 100, fake_hash(0x02), false);
+        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), true, SystemTime::now());
+        cache.update("b.txt".to_string(), mtime, 100, fake_hash(0x02), false, SystemTime::now());
         cache.write(tmp.path()).unwrap();
 
         let loaded = StatCache::read(tmp.path());
@@ -1440,7 +1635,7 @@ mod tests {
         let mtime = mtime_at(1_000_000_000, 0);
         // sealed=false already produces flags bit 1 = 0; this simulates the
         // pre-existing v1 on-disk format exactly.
-        cache.update("old.txt".to_string(), mtime, 100, fake_hash(0x09), false);
+        cache.update("old.txt".to_string(), mtime, 100, fake_hash(0x09), false, SystemTime::now());
         cache.write(tmp.path()).unwrap();
 
         let loaded = StatCache::read(tmp.path());
@@ -1452,7 +1647,7 @@ mod tests {
     fn mark_sealed_on_unsealed_entry_sets_bit_and_dirties() {
         let mut cache = StatCache::default();
         let mtime = mtime_at(1_000_000_000, 0);
-        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), false);
+        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), false, SystemTime::now());
         cache.dirty = false; // isolate mark_sealed's own effect
         assert!(cache.mark_sealed("a.txt"), "unsealed -> sealed must return true");
         assert!(cache.entries["a.txt"].sealed);
@@ -1463,7 +1658,7 @@ mod tests {
     fn mark_sealed_on_already_sealed_entry_is_a_noop() {
         let mut cache = StatCache::default();
         let mtime = mtime_at(1_000_000_000, 0);
-        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), true);
+        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), true, SystemTime::now());
         cache.dirty = false;
         assert!(
             !cache.mark_sealed("a.txt"),
@@ -1484,12 +1679,12 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut cache = StatCache::default();
         let mtime = mtime_at(1_000_000_000, 0);
-        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), false);
+        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), false, SystemTime::now());
         cache.write(tmp.path()).unwrap();
         assert!(!cache.is_dirty());
         // Same (mtime, size, hash), only `sealed` flips: entry_eq must catch
         // this so update()'s no-op detection includes `sealed`.
-        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), true);
+        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), true, SystemTime::now());
         assert!(
             cache.is_dirty(),
             "a sealed-only change must still mark the cache dirty"
@@ -1500,9 +1695,9 @@ mod tests {
     fn clear_all_sealed_clears_every_bit_and_dirties() {
         let mut cache = StatCache::default();
         let mtime = mtime_at(1_000_000_000, 0);
-        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), true);
-        cache.update("b.txt".to_string(), mtime, 100, fake_hash(0x02), true);
-        cache.update("c.txt".to_string(), mtime, 100, fake_hash(0x03), false);
+        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), true, SystemTime::now());
+        cache.update("b.txt".to_string(), mtime, 100, fake_hash(0x02), true, SystemTime::now());
+        cache.update("c.txt".to_string(), mtime, 100, fake_hash(0x03), false, SystemTime::now());
         cache.dirty = false;
 
         assert!(cache.clear_all_sealed());
@@ -1516,7 +1711,7 @@ mod tests {
     fn clear_all_sealed_on_already_clear_cache_is_a_noop() {
         let mut cache = StatCache::default();
         let mtime = mtime_at(1_000_000_000, 0);
-        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), false);
+        cache.update("a.txt".to_string(), mtime, 100, fake_hash(0x01), false, SystemTime::now());
         cache.dirty = false;
         assert!(!cache.clear_all_sealed());
         assert!(!cache.is_dirty());
@@ -1581,8 +1776,8 @@ mod tests {
         // whole-epoch mismatch, e.g. `.seal_epoch` was deleted).
         let mut full = StatCache::default();
         full.seal_epoch = [0x11; SEAL_EPOCH_LEN];
-        full.update("dirA/a.rs".to_string(), mtime, 100, fake_hash(0x01), true);
-        full.update("dirB/b.rs".to_string(), mtime, 100, fake_hash(0x02), true);
+        full.update("dirA/a.rs".to_string(), mtime, 100, fake_hash(0x01), true, SystemTime::now());
+        full.update("dirB/b.rs".to_string(), mtime, 100, fake_hash(0x02), true, SystemTime::now());
         full.write(tmp.path()).unwrap();
 
         let store = LocalStore::for_cache(tmp.path().join("objects"));
@@ -1635,8 +1830,8 @@ mod tests {
         let mtime = mtime_at(1_000_000_000, 0);
         let mut cache = StatCache::default();
         cache.seal_epoch = [0x22; SEAL_EPOCH_LEN];
-        cache.update("dirA/a.rs".to_string(), mtime, 100, fake_hash(0x01), true);
-        cache.update("dirB/b.rs".to_string(), mtime, 100, fake_hash(0x02), true);
+        cache.update("dirA/a.rs".to_string(), mtime, 100, fake_hash(0x01), true, SystemTime::now());
+        cache.update("dirB/b.rs".to_string(), mtime, 100, fake_hash(0x02), true, SystemTime::now());
         // No marker on disk: epoch mismatch.
         let store = LocalStore::for_cache(tmp.path().join("objects"));
         cache.compute_seals_trusted(tmp.path(), &store);
@@ -1659,8 +1854,8 @@ mod tests {
         let mtime = mtime_at(1_000_000_000, 0);
         let mut full = StatCache::default();
         full.seal_epoch = [0x33; SEAL_EPOCH_LEN];
-        full.update("dirA/a.rs".to_string(), mtime, 100, fake_hash(0x01), true);
-        full.update("dirB/b.rs".to_string(), mtime, 100, fake_hash(0x02), true);
+        full.update("dirA/a.rs".to_string(), mtime, 100, fake_hash(0x01), true, SystemTime::now());
+        full.update("dirB/b.rs".to_string(), mtime, 100, fake_hash(0x02), true, SystemTime::now());
         full.write(tmp.path()).unwrap();
 
         let mut scoped = StatCache::read_scoped(tmp.path(), "dirA");
@@ -1768,7 +1963,7 @@ mod tests {
             let hash = crate::object::blob_hash(&content);
             let serialised = crate::object::serialise_blob(&content);
             crate::codec::chunk::store_chunked(&store, &hash, &serialised, None).unwrap();
-            cache.update(format!("f{i}.txt"), mtime, 100, hash, true);
+            cache.update(format!("f{i}.txt"), mtime, 100, hash, true, SystemTime::now());
         }
         cache.compute_seals_trusted(tmp.path(), &store);
         assert!(cache.seals_trusted());
@@ -1798,6 +1993,7 @@ mod tests {
             100,
             fake_hash(0x01),
             true,
+            SystemTime::now(),
         );
         cache.compute_seals_trusted(tmp.path(), &store);
         assert!(
@@ -1894,6 +2090,7 @@ mod tests {
             content.len() as u64,
             hash,
             true,
+            SystemTime::now(),
         );
 
         with_seal_sample_size(8, || {
@@ -1937,7 +2134,7 @@ mod tests {
                 let hash = crate::object::blob_hash(&content);
                 let serialised = crate::object::serialise_blob(&content);
                 crate::codec::chunk::store_chunked(&store, &hash, &serialised, None).unwrap();
-                cache.update(format!("f{i:02}.txt"), mtime, 100, hash.clone(), true);
+                cache.update(format!("f{i:02}.txt"), mtime, 100, hash.clone(), true, SystemTime::now());
                 hashes.push(hash);
             }
             // Delete ONLY the last (sorted-last) entry's object.
@@ -1994,6 +2191,7 @@ mod tests {
                             100,
                             hash.clone(),
                             true,
+                            SystemTime::now(),
                         );
                         hashes.push(hash);
                     }
@@ -2044,6 +2242,7 @@ mod tests {
                     content.len() as u64,
                     hash,
                     true,
+                    SystemTime::now(),
                 );
             }
             cache.compute_seals_trusted(tmp.path(), &store);
@@ -2068,6 +2267,7 @@ mod tests {
             100,
             fake_hash(0x01),
             true,
+            SystemTime::now(),
         );
 
         // SAFETY (test-only): OMEMFS_SEAL_SAMPLE is read by seal_sample_size()

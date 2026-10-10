@@ -35,10 +35,21 @@ impl LogFile {
     ///
     /// `command` is the subcommand name (e.g. `"push"`, `"pull"`).
     pub fn new(command: &str) -> std::io::Result<Self> {
-        let tmp_dir = std::env::temp_dir();
-        let stem = build_stem(command);
-        let tmp_path = tmp_dir.join(format!("omemfs-{}.log", stem));
-        let file = File::create(&tmp_path)?;
+        Self::start(&std::env::temp_dir(), build_stem(command))
+    }
+
+    /// Create the temporary log in `tmp_dir` and start the writer thread.
+    ///
+    /// The file gets a random name and is created `O_EXCL` with mode `0600`
+    /// (design/06 "Before the repository is located"), so concurrent runs
+    /// cannot collide and no one can pre-create the name to block logging.
+    fn start(tmp_dir: &Path, stem: String) -> std::io::Result<Self> {
+        let (file, tmp_path) = tempfile::Builder::new()
+            .prefix("omemfs-")
+            .suffix(".log")
+            .tempfile_in(tmp_dir)?
+            .keep()
+            .map_err(|e| e.error)?;
 
         let (tx, rx) = mpsc::channel::<LogCommand>();
         let handle = std::thread::spawn(move || {
@@ -57,8 +68,11 @@ impl LogFile {
     /// calling thread); the actual file move is enqueued and executed by the
     /// background thread, preserving ordering with respect to pending log lines.
     pub fn set_repo_dir(&self, repo_dir: &Path) {
-        let logs_dir = repo_dir.join(".omemfs").join("logs");
-        if let Err(e) = fs::create_dir_all(&logs_dir) {
+        let omemfs_dir = repo_dir.join(".omemfs");
+        let logs_dir = omemfs_dir.join("logs");
+        // `.omemfs/` normally exists already; create it and `logs/` private
+        // (0700) in case a fresh directory is what we make here.
+        if let Err(e) = create_private_dir_all(&logs_dir) {
             let _ = writeln!(
                 std::io::stderr(),
                 "omemfs: could not create logs directory: {}",
@@ -129,12 +143,26 @@ fn relocate_log(
     stem: &str,
     logs_dir: &Path,
 ) {
-    let final_path = logs_dir.join(format!("{}.log", stem));
     let _ = writer.flush();
 
+    // Claim a free final name by creating the file (O_EXCL), so a same-second
+    // run of the same command never overwrites an earlier log.
+    let final_path = match claim_final_path(logs_dir, stem) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "omemfs: could not create log file: {}",
+                e
+            );
+            return;
+        }
+    };
+
+    // `rename` replaces the placeholder we just created. It fails across
+    // filesystems (e.g. WSL /tmp -> NTFS /mnt/c); fall back to copying contents
+    // only to avoid fchmod on NTFS.
     if let Err(e) = fs::rename(&*current_path, &final_path) {
-        // rename across filesystems fails (e.g. WSL /tmp -> NTFS /mnt/c);
-        // fall back to copying contents only to avoid fchmod on NTFS.
         if let Err(e2) = copy_file_contents(&*current_path, &final_path) {
             let _ = writeln!(
                 std::io::stderr(),
@@ -142,6 +170,7 @@ fn relocate_log(
                 e,
                 e2
             );
+            let _ = fs::remove_file(&final_path);
             return;
         }
         let _ = fs::remove_file(&*current_path);
@@ -211,6 +240,49 @@ fn copy_file_contents(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Create `<stem>.log` in `logs_dir` (mode `0600`, `O_EXCL`), or the first free
+/// `<stem>-2.log`, `<stem>-3.log`, ... if the name is taken (design/06 "Final
+/// name collisions"). Returns the path of the file it created.
+fn claim_final_path(logs_dir: &Path, stem: &str) -> std::io::Result<PathBuf> {
+    for n in 1u32..=10_000 {
+        let name = if n == 1 {
+            format!("{stem}.log")
+        } else {
+            format!("{stem}-{n}.log")
+        };
+        let path = logs_dir.join(name);
+        match private_file_options().create_new(true).open(&path) {
+            Ok(_) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other("no free log file name"))
+}
+
+fn private_file_options() -> fs::OpenOptions {
+    let mut o = fs::OpenOptions::new();
+    o.write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    o
+}
+
+/// `create_dir_all` that creates any missing directory with mode `0700`.
+fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
+    let mut b = fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        b.mode(0o700);
+    }
+    b.create(path)
+}
+
 fn build_stem(command: &str) -> String {
     let now = chrono::Local::now();
     format!("{}-{}", now.format("%Y%m%d-%H%M%S"), command)
@@ -240,6 +312,136 @@ mod tests {
 
     fn touch(dir: &Path, name: &str) {
         fs::write(dir.join(name), b"x").unwrap();
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn temp_log_gets_a_random_name_not_derived_from_the_stem() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let a = LogFile::start(tmp.path(), "20260930-120000-push".to_string()).unwrap();
+        let b = LogFile::start(tmp.path(), "20260930-120000-push".to_string()).unwrap();
+        let names = names_in(tmp.path());
+        assert_eq!(names.len(), 2, "same stem must not collide: {names:?}");
+        for n in &names {
+            assert!(n.starts_with("omemfs-") && n.ends_with(".log"), "{n}");
+            assert!(!n.contains("20260930"), "name must not be predictable: {n}");
+        }
+        a.finish();
+        b.finish();
+        assert!(names_in(tmp.path()).is_empty(), "unlocated logs are discarded");
+    }
+
+    #[test]
+    fn a_pre_created_predictable_name_cannot_block_logging() {
+        // The old fixed name `omemfs-<stem>.log` could be pre-created (as a
+        // directory, say) by another user to make every command fail.
+        let tmp = tempfile::TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("omemfs-20260930-120000-push.log")).unwrap();
+        let lf = LogFile::start(tmp.path(), "20260930-120000-push".to_string());
+        assert!(lf.is_ok(), "{:?}", lf.err());
+        lf.unwrap().finish();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temp_log_is_mode_0600_regardless_of_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lf = crate::test_umask::with_umask(0o000, || {
+            LogFile::start(tmp.path(), "20260930-120000-push".to_string()).unwrap()
+        });
+        let name = names_in(tmp.path()).remove(0);
+        let mode = fs::metadata(tmp.path().join(name)).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        lf.finish();
+    }
+
+    #[test]
+    fn relocation_moves_the_log_into_the_repository() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tempfile::TempDir::new().unwrap();
+        let lf = LogFile::start(tmp.path(), "20260930-120000-push".to_string()).unwrap();
+        lf.write_line("hello");
+        lf.set_repo_dir(repo.path());
+        lf.write_line("after");
+        lf.finish();
+        let logs = repo.path().join(".omemfs/logs");
+        let body = fs::read_to_string(logs.join("20260930-120000-push.log")).unwrap();
+        assert_eq!(body, "hello\nafter\n");
+        assert!(names_in(tmp.path()).is_empty(), "temp file must be gone");
+    }
+
+    #[test]
+    fn relocation_never_overwrites_an_existing_log_of_the_same_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tempfile::TempDir::new().unwrap();
+        let logs = repo.path().join(".omemfs/logs");
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(logs.join("20260930-120000-ls.log"), "first\n").unwrap();
+
+        let lf = LogFile::start(tmp.path(), "20260930-120000-ls".to_string()).unwrap();
+        lf.write_line("second");
+        lf.set_repo_dir(repo.path());
+        lf.finish();
+
+        assert_eq!(
+            fs::read_to_string(logs.join("20260930-120000-ls.log")).unwrap(),
+            "first\n",
+            "the earlier log must be untouched"
+        );
+        assert_eq!(
+            fs::read_to_string(logs.join("20260930-120000-ls-2.log")).unwrap(),
+            "second\n"
+        );
+    }
+
+    #[test]
+    fn repeated_collisions_get_increasing_suffixes() {
+        let logs = tempfile::TempDir::new().unwrap();
+        touch(logs.path(), "s-cmd.log");
+        touch(logs.path(), "s-cmd-2.log");
+        let p = claim_final_path(logs.path(), "s-cmd").unwrap();
+        assert_eq!(p.file_name().unwrap(), "s-cmd-3.log");
+        assert!(p.exists(), "the name is claimed by creating the file");
+        let q = claim_final_path(logs.path(), "s-cmd").unwrap();
+        assert_eq!(q.file_name().unwrap(), "s-cmd-4.log");
+    }
+
+    #[test]
+    fn a_free_name_is_used_as_is() {
+        let logs = tempfile::TempDir::new().unwrap();
+        let p = claim_final_path(logs.path(), "s-cmd").unwrap();
+        assert_eq!(p.file_name().unwrap(), "s-cmd.log");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn logs_directory_is_0700_and_log_file_is_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tempfile::TempDir::new().unwrap();
+        crate::test_umask::with_umask(0o000, || {
+            let lf = LogFile::start(tmp.path(), "20260930-120000-push".to_string()).unwrap();
+            lf.write_line("x");
+            lf.set_repo_dir(repo.path());
+            lf.finish();
+        });
+        let mode_of = |p: std::path::PathBuf| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode_of(repo.path().join(".omemfs")), 0o700);
+        assert_eq!(mode_of(repo.path().join(".omemfs/logs")), 0o700);
+        assert_eq!(
+            mode_of(repo.path().join(".omemfs/logs/20260930-120000-push.log")),
+            0o600
+        );
     }
 
     #[test]

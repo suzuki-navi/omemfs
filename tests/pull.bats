@@ -2414,3 +2414,111 @@ PY
     [[ "$output" == *"a/f"* ]]
     [[ "$output" == *"b/f"* ]]
 }
+
+# ---------------------------------------------------------------------------
+# Re-verifying a path right before pull overwrites it (review R1;
+# design/03 "Re-verifying a path immediately before it is overwritten").
+# The hook only exists in debug builds, like OMEMFS_TEST_SCAN_AFTER_LIST_DELAY_MS.
+# ---------------------------------------------------------------------------
+
+@test "pull: a file edited after the scan is not overwritten, and clone_root is not advanced" {
+    setup_two_clones
+    cd clone2
+    run "$OMEMFS" pull
+    [ "$status" -eq 0 ]
+    cd ../clone1
+    echo "remote change" > file.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    cd ../clone2
+    before="$(cat .omemfs/clone_root)"
+    # The scan sees an unmodified file.txt; during the 1s pause before apply the
+    # user edits it.
+    (sleep 0.3; echo "edited while the pull was waiting" > file.txt) &
+    editor=$!
+    run env OMEMFS_TEST_PULL_BEFORE_APPLY_DELAY_MS=1000 "$OMEMFS" pull
+    wait "$editor"
+
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"changed while the pull was in progress"* ]]
+    [[ "$output" == *"file.txt"* ]]
+    [ "$(cat file.txt)" = "edited while the pull was waiting" ]
+    [ "$(cat .omemfs/clone_root)" = "$before" ]
+
+    # The next pull sees the edit as an ordinary conflict, and nothing is lost.
+    run "$OMEMFS" pull
+    [ "$status" -ne 0 ]
+    [ "$(cat file.txt)" = "edited while the pull was waiting" ]
+    [ "$(cat file.txt.omemfs-conflict-local)" = "edited while the pull was waiting" ]
+    [ "$(cat file.txt.omemfs-conflict-remote)" = "remote change" ]
+}
+
+@test "pull: a file created where the pull will add one, after the scan, is not overwritten" {
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone1
+    [ "$status" -eq 0 ]
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone2
+    [ "$status" -eq 0 ]
+    cd clone1
+    echo "from remote" > new.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    remote_root="$(cat .omemfs/clone_root)"
+
+    cd ../clone2
+    (sleep 0.3; echo "my own new.txt" > new.txt) &
+    creator=$!
+    run env OMEMFS_TEST_PULL_BEFORE_APPLY_DELAY_MS=1000 "$OMEMFS" pull
+    wait "$creator"
+
+    [ "$status" -ne 0 ]
+    [ "$(cat new.txt)" = "my own new.txt" ]
+    [ "$(cat .omemfs/clone_root)" != "$remote_root" ]
+}
+
+@test "pull: an unrelated edit made after the scan does not abort the pull" {
+    setup_two_clones
+    cd clone2
+    run "$OMEMFS" pull
+    [ "$status" -eq 0 ]
+    echo "mine" > other.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ../clone1
+    run "$OMEMFS" pull
+    [ "$status" -eq 0 ]
+    echo "remote change" > file.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    cd ../clone2
+    # other.txt is not part of the pull's diff, so editing it mid-pull is fine.
+    (sleep 0.3; echo "mine, edited" > other.txt) &
+    editor=$!
+    run env OMEMFS_TEST_PULL_BEFORE_APPLY_DELAY_MS=1000 "$OMEMFS" pull
+    wait "$editor"
+
+    [ "$status" -eq 0 ]
+    [ "$(cat file.txt)" = "remote change" ]
+    [ "$(cat other.txt)" = "mine, edited" ]
+}
+
+@test "pull: a scoped pull re-verifies the path it is about to overwrite" {
+    setup_two_clones
+    cd clone2
+    run "$OMEMFS" pull
+    [ "$status" -eq 0 ]
+    cd ../clone1
+    echo "remote change" > file.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    cd ../clone2
+    (sleep 0.3; echo "edited during scoped pull" > file.txt) &
+    editor=$!
+    run env OMEMFS_TEST_PULL_BEFORE_APPLY_DELAY_MS=1000 "$OMEMFS" pull file.txt
+    wait "$editor"
+
+    [ "$status" -ne 0 ]
+    [ "$(cat file.txt)" = "edited during scoped pull" ]
+}

@@ -288,6 +288,10 @@ fn run_refresh_thread(view: Arc<Mutex<PhaseView>>, stop: std::sync::mpsc::Receiv
 // ---------------------------------------------------------------------------
 
 /// Format a single log line without ANSI color (used for the log file).
+///
+/// The message is escaped for display (design/06 "Log content is single-line"):
+/// it routinely embeds file names, and a raw newline there would forge a second
+/// record.
 pub fn format_line(layer: Layer, elapsed_secs: f64, depth: usize, text: &str) -> String {
     let indent = "  ".repeat(depth);
     format!(
@@ -295,7 +299,7 @@ pub fn format_line(layer: Layer, elapsed_secs: f64, depth: usize, text: &str) ->
         layer.tag(),
         elapsed_secs,
         indent,
-        text
+        crate::term::escape_display(text)
     )
 }
 
@@ -309,7 +313,7 @@ fn format_colored_line(layer: Layer, elapsed_secs: f64, depth: usize, text: &str
         layer.tag(),
         elapsed_secs,
         indent,
-        text
+        crate::term::escape_display(text)
     )
 }
 
@@ -449,4 +453,49 @@ pub fn freeze_phase_view() {
             ctx.freeze_phase_view();
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_newline_in_the_message_cannot_forge_a_second_record() {
+        let line = format_line(
+            Layer::L1,
+            1.0,
+            0,
+            "scan: evil\n[omemfs L1 cmd ]    +9.999s   push: end (0ms)",
+        );
+        assert_eq!(
+            line.lines().count(),
+            1,
+            "one record must stay one line: {line:?}"
+        );
+        assert!(!line.contains('\n') && !line.contains('\r'));
+    }
+
+    #[test]
+    fn ansi_escapes_in_the_message_are_not_written_to_the_log() {
+        let line = format_line(Layer::L1, 1.0, 0, "scan: \u{1b}[2J\u{1b}]0;pwned\u{7}");
+        assert!(!line.contains('\u{1b}'), "{line:?}");
+        assert!(!line.contains('\u{7}'), "{line:?}");
+    }
+
+    #[test]
+    fn the_colored_line_only_contains_omemfs_own_escapes() {
+        let line = format_colored_line(Layer::L1, 1.0, 0, "scan: \u{1b}[2Jx\ny");
+        // omemfs adds exactly two SGR sequences (colour + reset) around the tag.
+        assert_eq!(line.matches('\u{1b}').count(), 2, "{line:?}");
+        assert!(!line.contains('\n'));
+    }
+
+    #[test]
+    fn plain_messages_are_unchanged() {
+        let line = format_line(Layer::L7, 0.5, 2, "s3 put_object(日本語): end (3ms)");
+        assert!(
+            line.ends_with("    s3 put_object(日本語): end (3ms)"),
+            "{line:?}"
+        );
+    }
 }

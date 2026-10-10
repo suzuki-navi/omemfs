@@ -144,20 +144,14 @@ pub fn run(mut opts: LsOptions) -> Result<(), Error> {
             &local,
             &stat_cache_dirty,
         )?;
-        match stat_scope_dirty.as_deref() {
-            Some(prefix) => crate::scan::refresh_stat_cache_scoped(
-                stat_cache_dirty,
-                &scan_result_dirty.files,
-                &omemfs_dir_dirty,
-                prefix,
-            ),
-            None => refresh_stat_cache(
-                stat_cache_dirty,
-                &scan_result_dirty.files,
-                &omemfs_dir_dirty,
-                false, // ls is always a read-only, write_blobs = false scan
-            ),
-        }
+        // ls is always a read-only (write_blobs = false) scan; its writeback
+        // merges only the entries it changed, for any scope (design/07).
+        refresh_stat_cache(
+            stat_cache_dirty,
+            &scan_result_dirty.files,
+            &omemfs_dir_dirty,
+            false,
+        );
         let working_hash = scan_result_dirty.root_hash;
         if clone_root.as_ref() == Some(&working_hash) {
             phase.complete("0 entries");
@@ -304,22 +298,10 @@ pub fn run(mut opts: LsOptions) -> Result<(), Error> {
     )?;
     let working_hash = scan_result.root_hash.clone();
     // Refresh STAT_CACHE with newly-hashed files (best-effort; ignore write errors).
-    // A scoped load must write back via the scoped merge so out-of-scope entries
-    // survive byte-for-byte (design/07).
-    match stat_scope.as_deref() {
-        Some(prefix) => crate::scan::refresh_stat_cache_scoped(
-            stat_cache,
-            &scan_result.files,
-            &omemfs_dir,
-            prefix,
-        ),
-        None => refresh_stat_cache(
-            stat_cache,
-            &scan_result.files,
-            &omemfs_dir,
-            false, // ls is always a read-only, write_blobs = false scan
-        ),
-    }
+    // The writeback merges only the entries this scan changed into a fresh copy,
+    // so out-of-scope entries and a concurrent push's changes survive for any
+    // load scope (design/07 "Read-only writeback without the lock").
+    refresh_stat_cache(stat_cache, &scan_result.files, &omemfs_dir, false);
 
     let target_paths: Vec<PathBuf> = if opts.paths.is_empty() {
         vec![opts.work_dir.clone()]
@@ -1202,6 +1184,11 @@ fn scan_scoped_for_ls(
     // blob-write mode"). Tree objects are still written so diffing can read them.
     const WRITE_BLOBS: bool = false;
 
+    // Observation time for every file this scan hashes (design/07 "Racily clean
+    // detection"): taken up front, so it can only be earlier than the actual
+    // read and therefore only errs towards "racy".
+    let observed_at = std::time::SystemTime::now();
+
     // Unscoped: scan the whole working tree exactly as before.
     if paths.is_empty() {
         return scan_and_store_with_cache(
@@ -1351,6 +1338,7 @@ fn scan_scoped_for_ls(
                         cache_hit,
                         fallback_hit: false,
                         blob_sealed,
+                        observed_at,
                     },
                 );
             }
@@ -1512,10 +1500,13 @@ fn print_rows(rows: &[Row]) -> Result<(), Error> {
         let size_str = render_size_cell(r.size, size_w, colored, &styles);
         let count_str = render_count_cell(r.blob_count, count_w, colored, &styles);
         let mtime_str = render_mtime_cell(r.mtime.as_ref(), mtime_w, colored, &styles);
+        // Names are untrusted (design/04 "Terminal output safety"): escape
+        // before adding our own colour codes.
+        let safe_path = crate::term::escape_display(&r.path);
         let path_str = if colored && r.path.ends_with('/') {
-            paint(true, styles.directory, &r.path)
+            paint(true, styles.directory, &safe_path)
         } else {
-            r.path.clone()
+            safe_path.into_owned()
         };
         let line = format!(
             "{}{}{}{} {} {} {} {}",
@@ -2632,6 +2623,7 @@ mod tests {
             content.len() as u64,
             hash.clone(),
             true, // sealed
+            SystemTime::now(),
         );
 
         let result = scan_scoped_for_ls(

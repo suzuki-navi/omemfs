@@ -583,10 +583,10 @@ fn push_scoped(
         let styles = out.styles;
         for sr in &scoped_results {
             if sr.is_delete {
-                let path_str = paint(colored, styles.deleted, &sr.rel);
+                let path_str = paint(colored, styles.deleted, &crate::term::escape_display(&sr.rel));
                 out.writeln(&format!("Would delete {}", path_str))?;
             } else {
-                let path_str = paint(colored, styles.added, &sr.rel);
+                let path_str = paint(colored, styles.added, &crate::term::escape_display(&sr.rel));
                 let hash_str = paint(colored, styles.hash, &sr.scoped_hash.as_str()[..8]);
                 out.writeln(&format!("Would push {} → {}", path_str, hash_str))?;
             }
@@ -843,11 +843,11 @@ fn push_scoped(
         // Phase 8 E7 merge).
         match scoped_results.as_slice() {
             [only] if only.is_delete => {
-                let path_str = paint(colored, styles.deleted, &only.rel);
+                let path_str = paint(colored, styles.deleted, &crate::term::escape_display(&only.rel));
                 out.writeln(&format!("Deleted {} from {}.", path_str, remote_name))?;
             }
             [only] => {
-                let path_str = paint(colored, styles.added, &only.rel);
+                let path_str = paint(colored, styles.added, &crate::term::escape_display(&only.rel));
                 out.writeln(&format!("Pushed {} to {}.", path_str, remote_name))?;
             }
             _ => out.writeln(&format!("Pushed to {}.", remote_name))?,
@@ -888,7 +888,7 @@ fn report_unresolved_conflicts<'a>(paths: impl IntoIterator<Item = &'a String>) 
     eprintln!("{}", err_msg);
     eprintln!("The following conflict helper files were found:");
     for p in paths {
-        eprintln!("  {}", p);
+        eprintln!("  {}", crate::term::escape_display(&p.to_string()));
     }
     Error::Other("unresolved conflicts".to_string())
 }
@@ -952,7 +952,7 @@ fn report_unstable_paths(paths: &std::collections::HashSet<String>) {
         if sorted.len() == 1 { " was" } else { "s were" }
     );
     for path in sorted {
-        eprintln!("  {}", path);
+        eprintln!("  {}", crate::term::escape_display(&path.to_string()));
     }
 }
 
@@ -1538,6 +1538,7 @@ mod tests {
             10,
             crate::object::blob_hash(b"a"),
             true,
+            SystemTime::now(),
         );
         cache.write(&omemfs_dir).unwrap();
         let before = fs::read(omemfs_dir.join("STAT_CACHE")).unwrap();

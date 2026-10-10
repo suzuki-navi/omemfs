@@ -1,5 +1,6 @@
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
@@ -34,6 +35,7 @@ impl RepoLock {
             .write(true)
             .create(true)
             .truncate(false)
+            .mode(0o600) // design/12 "Lock acquisition"
             .open(&lock_path)
             .map_err(Error::Io)?;
 
@@ -117,6 +119,20 @@ fn lock_contention_error(lock_path: &Path, holder: Option<(u32, Option<String>)>
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_file_is_created_0600_regardless_of_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let _lock =
+            crate::test_umask::with_umask(0o000, || RepoLock::acquire(dir.path())).unwrap();
+        let mode = std::fs::metadata(dir.path().join("clone_root.lock"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
 
     #[test]
     fn second_acquire_in_same_process_fails() {

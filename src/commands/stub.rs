@@ -25,6 +25,8 @@ enum StubTarget {
         abs: PathBuf,
         rel: String,
         entry: TreeEntry,
+        /// `(mtime, size)` seen when the file's hash was verified.
+        seen: Snapshot,
     },
     Dir {
         abs: PathBuf,
@@ -33,7 +35,140 @@ enum StubTarget {
         size: u64,
         blob_count: u64,
         mtime: Option<chrono::DateTime<chrono::Utc>>,
+        /// Every regular file present when the directory was verified.
+        seen: DirSnapshot,
     },
+}
+
+/// A regular file's `(mtime, size)` at the moment its content was verified
+/// (design/08, "omemfs stub", "Re-verifying immediately before the delete").
+#[derive(Debug, Clone, Copy)]
+struct Snapshot {
+    mtime: SystemTime,
+    size: u64,
+}
+
+impl Snapshot {
+    fn of_file(path: &std::path::Path) -> std::io::Result<Self> {
+        let md = fs::symlink_metadata(path)?;
+        Ok(Snapshot {
+            mtime: md.modified()?,
+            size: md.len(),
+        })
+    }
+
+    /// `Ok` when `path` is still a regular file with the recorded `(mtime, size)`.
+    fn check_file(&self, path: &std::path::Path) -> Result<(), ()> {
+        match fs::symlink_metadata(path) {
+            Ok(md) if md.is_file() && md.len() == self.size && md.modified().ok() == Some(self.mtime) => {
+                Ok(())
+            }
+            _ => Err(()),
+        }
+    }
+}
+
+/// The `(mtime, size)` of every regular file under a directory, keyed by path
+/// relative to it. Symlinks are recorded as present (never followed) so a
+/// symlink that appears later counts as a change. The stub marker is excluded:
+/// it is written by this command between the snapshot and the check.
+#[derive(Debug, Default)]
+struct DirSnapshot {
+    files: std::collections::HashMap<String, Snapshot>,
+    others: std::collections::HashSet<String>,
+}
+
+impl DirSnapshot {
+    fn of(dir: &std::path::Path) -> std::io::Result<Self> {
+        let mut snap = DirSnapshot::default();
+        snap.walk(dir, "")?;
+        Ok(snap)
+    }
+
+    fn walk(&mut self, dir: &std::path::Path, prefix: &str) -> std::io::Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if prefix.is_empty() && name == stub::DIR_STUB_NAME {
+                continue;
+            }
+            let rel = if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}/{name}")
+            };
+            let path = entry.path();
+            let md = fs::symlink_metadata(&path)?;
+            if md.is_dir() {
+                self.walk(&path, &rel)?;
+            } else if md.is_file() {
+                self.files.insert(
+                    rel,
+                    Snapshot {
+                        mtime: md.modified()?,
+                        size: md.len(),
+                    },
+                );
+            } else {
+                self.others.insert(rel);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn contains(&self, rel: &str) -> bool {
+        self.files.contains_key(rel) || self.others.contains(rel)
+    }
+
+    /// `Ok` when the directory holds exactly the recorded files, unchanged.
+    /// `Err(path)` names the first difference found (sorted, so it is stable).
+    fn check(&self, dir: &std::path::Path) -> Result<(), String> {
+        let now = DirSnapshot::of(dir).map_err(|_| String::new())?;
+        let mut diffs: Vec<&String> = Vec::new();
+        for (rel, snap) in &self.files {
+            match now.files.get(rel) {
+                Some(cur) if cur.size == snap.size && cur.mtime == snap.mtime => {}
+                _ => diffs.push(rel),
+            }
+        }
+        for rel in now.files.keys().chain(now.others.iter()) {
+            if !self.files.contains_key(rel) && !self.others.contains(rel) {
+                diffs.push(rel);
+            }
+        }
+        for rel in &self.others {
+            if !now.others.contains(rel) {
+                diffs.push(rel);
+            }
+        }
+        diffs.sort();
+        match diffs.first() {
+            Some(rel) => Err((*rel).clone()),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Deterministic integration-test hook for the verify-to-delete window (design/08,
+/// "Re-verifying immediately before the delete"). Compiled only in debug builds
+/// and inert unless the variable is set, like `OMEMFS_TEST_SCAN_AFTER_LIST_DELAY_MS`.
+fn test_hook_before_delete() {
+    #[cfg(debug_assertions)]
+    if let Ok(ms) = std::env::var("OMEMFS_TEST_STUB_BEFORE_DELETE_DELAY_MS")
+        && let Ok(ms) = ms.parse::<u64>()
+    {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+}
+
+/// The error for a target that changed after it was verified.
+fn changed_while_stubbing(rel: &str) -> Error {
+    Error::Other(format!(
+        "cannot stub '{}': '{}' changed while being stubbed; nothing was deleted for it",
+        crate::term::escape_display(rel),
+        crate::term::escape_display(rel),
+    ))
 }
 
 pub fn run(opts: StubOptions) -> Result<(), Error> {
@@ -123,6 +258,12 @@ pub fn run(opts: StubOptions) -> Result<(), Error> {
                 }
             };
 
+            // Snapshot BEFORE the verifying scan: a file edited while the scan
+            // is reading it then differs from the snapshot at the re-check,
+            // whereas a snapshot taken after the scan would record the edited
+            // state and let it through (design/08).
+            let seen = DirSnapshot::of(&abs)?;
+
             // Check that working tree matches clone_root for this directory.
             // We do this by scanning just the directory and comparing the tree hash.
             let scan_result = crate::scan::scan_and_store_with_cache(
@@ -139,7 +280,6 @@ pub fn run(opts: StubOptions) -> Result<(), Error> {
                     rel
                 )));
             }
-
             validated.push(StubTarget::Dir {
                 abs,
                 rel,
@@ -147,6 +287,7 @@ pub fn run(opts: StubOptions) -> Result<(), Error> {
                 size,
                 blob_count,
                 mtime,
+                seen,
             });
         } else if abs.is_file() {
             // --- File stub ---
@@ -186,6 +327,9 @@ pub fn run(opts: StubOptions) -> Result<(), Error> {
             // Fast path: if StatCache has a safe entry for this file with the
             // correct size and mtime, the cached hash is trustworthy — skip the
             // full read. Fall back to a full read on any cache miss.
+            // (mtime, size) is captured BEFORE the content is read: an edit
+            // made during the read then fails the re-check before the delete.
+            let seen = Snapshot::of_file(&abs)?;
             let verified = if let Ok(meta) = fs::metadata(&abs) {
                 let fs_size = meta.len();
                 let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
@@ -206,7 +350,7 @@ pub fn run(opts: StubOptions) -> Result<(), Error> {
                 )));
             }
 
-            validated.push(StubTarget::File { abs, rel, entry });
+            validated.push(StubTarget::File { abs, rel, entry, seen });
         } else if stub::exists(&repo.work_dir, &rel) || stub::dir_exists(&repo.work_dir, &rel) {
             to_skip.push(rel.clone());
         } else {
@@ -218,7 +362,7 @@ pub fn run(opts: StubOptions) -> Result<(), Error> {
     }
 
     for rel in &to_skip {
-        eprintln!("warning: '{}' is already stubbed, skipping", rel);
+        eprintln!("warning: '{}' is already stubbed, skipping", crate::term::escape_display(rel));
     }
 
     if validated.is_empty() {
@@ -238,7 +382,7 @@ pub fn run(opts: StubOptions) -> Result<(), Error> {
             let rel = match target {
                 StubTarget::File { rel, .. } | StubTarget::Dir { rel, .. } => rel,
             };
-            out.writeln(&format!("  would stub: {}", rel))?;
+            out.writeln(&format!("  would stub: {}", crate::term::escape_display(rel)))?;
         }
         let count = validated.len();
         out.writeln(&format!("{} file(s) would be stubbed.", count))?;
@@ -248,9 +392,10 @@ pub fn run(opts: StubOptions) -> Result<(), Error> {
     }
 
     let count = validated.len();
+    test_hook_before_delete();
     for target in validated {
         match target {
-            StubTarget::File { abs, rel, entry } => {
+            StubTarget::File { abs, rel, entry, seen } => {
                 let (hash, size, mtime, mode) = match entry {
                     TreeEntry::Blob {
                         hash,
@@ -273,6 +418,13 @@ pub fn run(opts: StubOptions) -> Result<(), Error> {
                         blob_count: 0,
                     },
                 )?;
+                // Re-check right before the delete (design/08). On a change the
+                // file is kept and the stub record written above is removed
+                // again, so the unsaved edit is never lost.
+                if seen.check_file(&abs).is_err() {
+                    stub::remove(&repo.work_dir, &rel)?;
+                    return Err(changed_while_stubbing(&rel));
+                }
                 fs::remove_file(&abs)?;
             }
             StubTarget::Dir {
@@ -282,6 +434,7 @@ pub fn run(opts: StubOptions) -> Result<(), Error> {
                 size,
                 blob_count,
                 mtime,
+                seen,
             } => {
                 // design/08_stub_system.md, "omemfs stub": write the stub
                 // record BEFORE deleting anything, so an interruption
@@ -302,6 +455,17 @@ pub fn run(opts: StubOptions) -> Result<(), Error> {
                         mode: None,
                     },
                 )?;
+                // Re-check right before deleting (design/08): a directory edited
+                // since it was verified is left untouched and the marker written
+                // above is removed again.
+                if let Err(changed) = seen.check(&abs) {
+                    stub::remove_dir_stub(&repo.work_dir, &rel)?;
+                    return Err(changed_while_stubbing(&if changed.is_empty() {
+                        rel.clone()
+                    } else {
+                        format!("{rel}/{changed}")
+                    }));
+                }
                 // Now remove every other entry, leaving only the just-written
                 // `.omemfs-stub` marker behind. Routed through
                 // `fsguard::remove_dir_all` (design/03_sync_model.md, "Write
@@ -326,5 +490,130 @@ pub fn run(opts: StubOptions) -> Result<(), Error> {
     out.finish()?;
     phase.complete(format!("{} files", count));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn set_mtime(path: &std::path::Path, secs_from_now: i64) {
+        let t = if secs_from_now >= 0 {
+            SystemTime::now() + std::time::Duration::from_secs(secs_from_now as u64)
+        } else {
+            SystemTime::now() - std::time::Duration::from_secs((-secs_from_now) as u64)
+        };
+        filetime::set_file_mtime(path, filetime::FileTime::from_system_time(t)).unwrap();
+    }
+
+    #[test]
+    fn snapshot_of_an_unchanged_file_matches() {
+        let d = TempDir::new().unwrap();
+        let f = d.path().join("a.bin");
+        fs::write(&f, b"content").unwrap();
+        let snap = Snapshot::of_file(&f).unwrap();
+        assert!(snap.check_file(&f).is_ok());
+    }
+
+    #[test]
+    fn a_file_edited_after_the_snapshot_is_detected_by_size() {
+        let d = TempDir::new().unwrap();
+        let f = d.path().join("a.bin");
+        fs::write(&f, b"content").unwrap();
+        let snap = Snapshot::of_file(&f).unwrap();
+        fs::write(&f, b"content, and an unsaved edit").unwrap();
+        assert!(snap.check_file(&f).is_err());
+    }
+
+    #[test]
+    fn a_same_size_edit_is_detected_by_mtime() {
+        let d = TempDir::new().unwrap();
+        let f = d.path().join("a.bin");
+        fs::write(&f, b"content").unwrap();
+        let snap = Snapshot::of_file(&f).unwrap();
+        fs::write(&f, b"CONTENT").unwrap();
+        set_mtime(&f, 120);
+        assert!(snap.check_file(&f).is_err());
+    }
+
+    #[test]
+    fn a_file_deleted_after_the_snapshot_is_detected() {
+        let d = TempDir::new().unwrap();
+        let f = d.path().join("a.bin");
+        fs::write(&f, b"content").unwrap();
+        let snap = Snapshot::of_file(&f).unwrap();
+        fs::remove_file(&f).unwrap();
+        assert!(snap.check_file(&f).is_err());
+    }
+
+    #[test]
+    fn a_directory_snapshot_records_every_regular_file() {
+        let d = TempDir::new().unwrap();
+        fs::create_dir(d.path().join("sub")).unwrap();
+        fs::write(d.path().join("a.txt"), b"1").unwrap();
+        fs::write(d.path().join("sub/b.txt"), b"22").unwrap();
+        let snap = DirSnapshot::of(d.path()).unwrap();
+        assert!(snap.check(d.path()).is_ok());
+    }
+
+    #[test]
+    fn a_directory_snapshot_detects_an_edited_file() {
+        let d = TempDir::new().unwrap();
+        fs::create_dir(d.path().join("sub")).unwrap();
+        fs::write(d.path().join("sub/b.txt"), b"22").unwrap();
+        let snap = DirSnapshot::of(d.path()).unwrap();
+        fs::write(d.path().join("sub/b.txt"), b"22 edited").unwrap();
+        let err = snap.check(d.path()).unwrap_err();
+        assert_eq!(err, "sub/b.txt");
+    }
+
+    #[test]
+    fn a_directory_snapshot_detects_a_new_file() {
+        let d = TempDir::new().unwrap();
+        fs::write(d.path().join("a.txt"), b"1").unwrap();
+        let snap = DirSnapshot::of(d.path()).unwrap();
+        fs::write(d.path().join("brand-new.txt"), b"created while stubbing").unwrap();
+        assert_eq!(snap.check(d.path()).unwrap_err(), "brand-new.txt");
+    }
+
+    #[test]
+    fn a_directory_snapshot_detects_a_deleted_file() {
+        let d = TempDir::new().unwrap();
+        fs::write(d.path().join("a.txt"), b"1").unwrap();
+        let snap = DirSnapshot::of(d.path()).unwrap();
+        fs::remove_file(d.path().join("a.txt")).unwrap();
+        assert_eq!(snap.check(d.path()).unwrap_err(), "a.txt");
+    }
+
+    #[test]
+    fn a_directory_snapshot_ignores_the_stub_marker() {
+        // The marker is written between the snapshot and the check (step b).
+        let d = TempDir::new().unwrap();
+        fs::write(d.path().join("a.txt"), b"1").unwrap();
+        let snap = DirSnapshot::of(d.path()).unwrap();
+        fs::write(d.path().join(stub::DIR_STUB_NAME), b"{}").unwrap();
+        assert!(snap.check(d.path()).is_ok());
+    }
+
+    #[test]
+    fn a_directory_snapshot_treats_a_new_symlink_as_a_change() {
+        let d = TempDir::new().unwrap();
+        fs::write(d.path().join("a.txt"), b"1").unwrap();
+        let snap = DirSnapshot::of(d.path()).unwrap();
+        std::os::unix::fs::symlink("a.txt", d.path().join("link")).unwrap();
+        assert_eq!(snap.check(d.path()).unwrap_err(), "link");
+    }
+
+    #[test]
+    fn a_directory_snapshot_of_a_symlink_is_not_followed() {
+        // A symlink to a directory outside must not be walked.
+        let d = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::write(outside.path().join("secret.txt"), b"x").unwrap();
+        std::os::unix::fs::symlink(outside.path(), d.path().join("out")).unwrap();
+        let snap = DirSnapshot::of(d.path()).unwrap();
+        assert!(snap.check(d.path()).is_ok());
+        assert!(!snap.contains("out/secret.txt"));
+    }
 }
 

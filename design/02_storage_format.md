@@ -148,6 +148,41 @@ Azure authenticates with **Entra ID (Azure AD) only** — via a `TokenCredential
 
 All credentials (access keys, DEKs) are stored directly in `config`. The file must have permissions `0600`. Do not commit `.omemfs/` to version control.
 
+Types that hold credentials (`EncryptionConfig`, `RemoteConfig`, and therefore
+`Config`) implement `Debug` by hand and print `<redacted>` in place of every
+secret field (`dek`, `access_key_id`, `secret_access_key`, `client_secret`,
+`credentials_json`). Non-secret fields (bucket, region, prefix, endpoint,
+`credentials_json_path`, ...) are printed normally, so `{:?}` stays useful for
+diagnostics without ever writing a credential to a log, panic message or
+terminal. Serialisation to `config` is unaffected.
+
+### Local directory permissions
+
+`.omemfs/` holds the DEK, the object cache and the logs, so it is private to
+the owner:
+
+- `.omemfs/` and `.omemfs/logs/` are created with mode `0700`. Because
+  `.omemfs/` itself is `0700`, everything beneath it (`objects/`, `tmp/`, ...)
+  is unreachable by other users whatever the modes of the inner directories;
+  those inner directories are deliberately left to the umask, since the same
+  object-store code also manages shared local-directory remotes, which must
+  stay group-accessible.
+- Files omemfs creates directly under `.omemfs/` (`config`, `clone_root`,
+  `clone_root.lock`, `io_stats.jsonl`, `stat_cache`) and log files are created
+  with mode `0600`.
+
+The mode is applied at creation, independent of the umask, and is not
+re-applied to an already existing directory or file (a repository created by an
+older version keeps its existing modes; the owner may `chmod` it).
+
+Files written through the atomic temp-file-and-rename helpers (`config`,
+`clone_root`, `stat_cache`, cached objects) get `0600` from `tempfile`; the lock
+file, `io_stats.jsonl` and log files, which are opened directly, request `0600`
+explicitly. A **local-directory remote** belongs to the remote, not to
+`.omemfs/`, and is not covered by this section. Files materialised into the
+**working tree** are likewise not covered; their permissions come from the
+recorded mode (see `03_sync_model.md`).
+
 To share a repository config with another machine, use `omemfs config export` to produce an `omemfs_repo_` connection string, and provide that string when prompted during `omemfs clone` on the target machine.
 
 ## clone_root

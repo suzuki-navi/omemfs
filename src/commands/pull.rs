@@ -131,7 +131,7 @@ fn pull_full(
         .and_then(|h| flatten_clone_root_present(h, &repo.work_dir, &lazy).ok());
     let omemfs_dir = repo.omemfs_dir();
     let stat_cache = StatCache::read(&omemfs_dir);
-    let working_hash = {
+    let (working_hash, observed) = {
         let phase = crate::progress::begin_phase("Scan working tree");
         let _t = dtimer_l1!("scan working tree");
         // `stub_store: &lazy`: a partial-expansion directory's `.omemfs-stub`
@@ -159,7 +159,15 @@ fn pull_full(
             &scan_result.root_hash.as_str()[..8]
         );
         phase.complete(format!("{} files", file_count));
-        scan_result.root_hash
+        let root_hash = scan_result.root_hash;
+        (
+            root_hash,
+            ScanObservation::with_stubs(
+                scan_result.files,
+                scan_result.side.seen_other,
+                scan_result.side.seen_stub,
+            ),
+        )
     };
     let local_diff = diff_trees(clone_root.as_ref(), Some(&working_hash), &lazy, 0)?;
 
@@ -241,6 +249,7 @@ fn pull_full(
         stub_threshold,
         &pack_reader,
         remote_key.as_ref(),
+        &observed,
     )?;
     // Every remaining conflict has already been ruled out above, so it is now
     // safe to write the resolved line-merges directly to the working tree.
@@ -280,7 +289,7 @@ fn pull_full(
         if !preserved.is_empty() {
             out.writeln("Your local modifications to the following paths were preserved:")?;
             for p in preserved {
-                let p_str = paint(colored, styles.modified, p);
+                let p_str = paint(colored, styles.modified, &crate::term::escape_display(&p.to_string()));
                 out.writeln(&format!("  modified: {}", p_str))?;
             }
         }
@@ -373,6 +382,9 @@ fn pull_scoped(
     // write_if_dirty" semantics -- only the *scan* becomes per-path here).
     let stat_cache = StatCache::read(&omemfs_dir);
     let mut scanned_files: HashMap<String, crate::scan::ScannedFile> = HashMap::new();
+    let mut seen_other: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_stub: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut leaf_files: HashMap<String, (std::time::SystemTime, u64)> = HashMap::new();
 
     let mut path_diffs: Vec<PathDiff> = Vec::new();
     for rel in &rels {
@@ -493,6 +505,21 @@ fn pull_scoped(
             .unwrap_or(false);
         let working_scoped_hash = if scoped_abs.exists() {
             if is_leaf && !scoped_is_dir {
+                // This path bypasses `scan_dir`, so record the leaf itself in
+                // the observation here (a regular file with its `(mtime, size)`,
+                // anything else as "seen, present"), or the apply-time check
+                // would read a scanned leaf as "nothing was here".
+                match fs::symlink_metadata(&scoped_abs) {
+                    Ok(md) if md.is_file() => {
+                        if let Ok(mtime) = md.modified() {
+                            leaf_files.insert(rel.clone(), (mtime, md.len()));
+                        }
+                    }
+                    Ok(_) => {
+                        seen_other.insert(rel.clone());
+                    }
+                    Err(_) => {}
+                }
                 Some(scan_file_as_tree(
                     &scoped_abs,
                     components.last().unwrap(),
@@ -521,8 +548,16 @@ fn pull_scoped(
                 )?;
                 let file_count = scan_result.files.len();
                 scanned_files.extend(scan_result.files);
+                seen_other.extend(scan_result.side.seen_other);
+                seen_stub.extend(scan_result.side.seen_stub);
+                // The scan walked this directory's contents, so it never
+                // recorded the directory itself. It is the path the pull will
+                // replace with a file, and the apply-time re-check must know
+                // the scan saw a directory here.
+                seen_other.insert(rel.clone());
                 phase.complete(format!("{} files", file_count));
-                let (mtime, size, blob_count) = tree_ops::tree_meta(&scan_result.root_hash, &local)?;
+                let (mtime, size, blob_count) =
+                    tree_ops::tree_meta(&scan_result.root_hash, &local)?;
                 let entry = TreeEntry::Tree {
                     name: components.last().unwrap().to_string(),
                     hash: scan_result.root_hash,
@@ -545,6 +580,8 @@ fn pull_scoped(
                 )?;
                 let file_count = scan_result.files.len();
                 scanned_files.extend(scan_result.files);
+                seen_other.extend(scan_result.side.seen_other);
+                seen_stub.extend(scan_result.side.seen_stub);
                 phase.complete(format!("{} files", file_count));
                 Some(scan_result.root_hash)
             }
@@ -565,6 +602,10 @@ fn pull_scoped(
             // practice this only ever resolves a file stub -- wrapped the
             // same way an ordinary is_leaf entry is, so it compares against
             // the already-wrapped `clone_scoped_hash`/`remote_scoped_hash`.
+            //
+            // This path also bypasses `scan_dir`, so record the stub for the
+            // apply-time re-check (the real file is expected to stay absent).
+            seen_stub.insert(rel.clone());
             Some(tree_ops::build_and_store(vec![entry], &local)?)
         } else {
             None
@@ -588,6 +629,8 @@ fn pull_scoped(
         });
     }
     refresh_stat_cache(stat_cache, &scanned_files, &omemfs_dir, false);
+    let mut observed = ScanObservation::with_stubs(scanned_files, seen_other, seen_stub);
+    observed.files.extend(leaf_files);
 
     if path_diffs.is_empty() {
         plain_println("Already up to date.");
@@ -769,6 +812,7 @@ fn pull_scoped(
                 stub_threshold,
                 &pack_reader,
                 remote_key.as_ref(),
+                &observed,
             )?;
             // Every remaining conflict has already been ruled out above (the
             // abort check returned early otherwise), so it is now safe to
@@ -862,23 +906,7 @@ fn pull_scoped(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// One side (base / local / remote) of a conflict, resolved to a streamable
-/// source instead of an in-memory byte buffer. Each variant is written to its
-/// helper file chunk-by-chunk so no whole-blob buffer is ever held — for a
-/// GB-class conflicted file this keeps peak memory bounded at roughly one chunk
-/// (≤ CDC_MAX ≈ 16 MiB) per side rather than the full file size.
-enum HelperSource {
-    /// A blob in the local object store, addressed by its logical hash. Streamed
-    /// to the helper file via `codec::chunk::materialise_to_file`.
-    Blob(Hash),
-    /// A working-tree file held open at construction time. Holding the `File`
-    /// rather than a path avoids re-opening and prevents TOCTOU races: if the
-    /// file is deleted after `working_file_source` opens it the fd remains valid
-    /// on Linux, matching the old in-memory-bytes outcome. The variant stores an
-    /// `Option` so `write_helper_file` can take the file out of a shared
-    /// reference via `std::mem::replace`.
-    WorkingFile(fs::File),
-}
+use crate::commands::conflict::HelperSource;
 
 /// Resolve the base side from a tree rooted at `root_hash` by relative `path`.
 /// Returns `None` if the path does not exist in the tree.
@@ -997,6 +1025,9 @@ fn build_conflict_meta(
         }
     });
     ConflictMeta {
+        // Filled in by `conflict::write_conflict_artifacts`, which knows
+        // which helpers it actually wrote.
+        sides: None,
         base,
         remote,
         remote_resolution,
@@ -1026,32 +1057,6 @@ fn entry_source(
     }
 }
 
-/// Write `.omemfs-conflict-{base,local,remote}` helper files alongside `path`.
-/// Skips a side when its source is None (the path did not exist on that side).
-/// Each side is streamed to its helper file, so no whole-blob buffer is held.
-fn write_conflict_helpers(
-    work_dir: &std::path::Path,
-    path: &std::path::Path,
-    base: Option<&HelperSource>,
-    local: Option<&HelperSource>,
-    remote: Option<&HelperSource>,
-    store: &dyn ObjectStore,
-) -> Result<(), Error> {
-    use crate::commands::conflict::{
-        CONFLICT_SUFFIX_BASE, CONFLICT_SUFFIX_LOCAL, CONFLICT_SUFFIX_REMOTE,
-    };
-    if let Some(src) = base {
-        write_helper_file(work_dir, path, CONFLICT_SUFFIX_BASE, src, store)?;
-    }
-    if let Some(src) = local {
-        write_helper_file(work_dir, path, CONFLICT_SUFFIX_LOCAL, src, store)?;
-    }
-    if let Some(src) = remote {
-        write_helper_file(work_dir, path, CONFLICT_SUFFIX_REMOTE, src, store)?;
-    }
-    Ok(())
-}
-
 /// Write the conflict-helper files and metadata sidecar for one conflicting
 /// path. `base_hash` is the base-side tree root to resolve `path` against
 /// (clone_root for a full pull, the scoped subtree's clone-side hash for a
@@ -1079,15 +1084,6 @@ fn write_conflict_for_path(
     pack_reader: &PackReader,
     remote_key: Option<&crate::codec::encrypt::EncryptKey>,
 ) -> Result<(), Error> {
-    // Clear any conflict artifact left over from an earlier, unresolved
-    // conflict on this exact path before writing the current one. A "missing
-    // side" below (no helper written because that side has no content in
-    // the conflict just detected) must never be shadowed by a stale helper
-    // from a previous conflict on the same path whose remote/base/local side
-    // had different content or a different shape -- see
-    // design/03_sync_model.md, "Missing sides", "Clearing stale residue
-    // before writing" (D8).
-    crate::commands::conflict::remove_all_conflict_artifacts(work_dir, abs)?;
     let base_src = base_root_source(base_hash, path, lazy)?;
     let local_src = working_file_source(abs);
     let remote_src = remote_diff
@@ -1095,14 +1091,6 @@ fn write_conflict_for_path(
         .map(|e| entry_source(e, local, pack_reader, remote_key))
         .transpose()?
         .flatten();
-    write_conflict_helpers(
-        work_dir,
-        abs,
-        base_src.as_ref(),
-        local_src.as_ref(),
-        remote_src.as_ref(),
-        lazy,
-    )?;
     // Record the base/remote tracked metadata so `accept` can restore it.
     let base_entry = match base_hash {
         Some(h) => {
@@ -1111,56 +1099,18 @@ fn write_conflict_for_path(
         }
         None => None,
     };
-    build_conflict_meta(base_entry.as_ref(), remote_diff.get(path)).write(work_dir, abs)?;
-    Ok(())
-}
-
-/// Stream `source` into the helper file `<base_path><suffix>`.
-///
-/// The helper path is built and the parent directory is ensured exactly as
-/// before; the only change is how bytes flow:
-///   - `Blob(hash)`: `materialise_to_file` streams the (possibly chunked) blob
-///     chunk-by-chunk into a temp file in the destination dir, then atomically
-///     renames it. This matches the old behaviour: the helper was a plain file
-///     overwrite with deserialised blob content (the `ED F0` blob-escape is
-///     stripped from the first chunk, exactly as `deserialise_blob` did).
-///   - `WorkingFile(path)`: `io::copy` streams the working-tree file into the
-///     same atomic temp+rename writer, never reading it whole.
-fn write_helper_file(
-    work_dir: &std::path::Path,
-    base_path: &std::path::Path,
-    suffix: &str,
-    source: &HelperSource,
-    store: &dyn ObjectStore,
-) -> Result<(), Error> {
-    let helper_path = {
-        let s = base_path.to_string_lossy();
-        std::path::PathBuf::from(format!("{}{}", s, suffix))
-    };
-    match source {
-        HelperSource::Blob(hash) => {
-            codec::chunk::materialise_to_file(work_dir, store, hash, None, &helper_path)?;
-        }
-        HelperSource::WorkingFile(file) => {
-            // Same working-tree write boundary as the `Blob` arm (which gets
-            // it via `codec::chunk::materialise_to_file`): `helper_path`
-            // shares its parent directory with `base_path`, so if that
-            // directory has been replaced by a symlink pointing outside
-            // `work_dir`, a plain `io::copy` would otherwise follow it and
-            // write the conflict-helper file outside the working tree. See
-            // design/03_sync_model.md, "Write safety: the working-tree write
-            // boundary". `work_dir` must be the true repository root, not a
-            // scoped subdirectory.
-            crate::fsguard::atomic_write_with(work_dir, &helper_path, |writer| {
-                // `&File` implements `Read`, so `io::copy` works without
-                // consuming or mutably borrowing through the enum reference.
-                std::io::copy(&mut &*file, writer)
-                    .map(|_| ())
-                    .map_err(Error::Io)
-            })?;
-        }
-    }
-    Ok(())
+    let meta = build_conflict_meta(base_entry.as_ref(), remote_diff.get(path));
+    // Clearing the path's earlier artifacts, writing the helpers and writing
+    // the sidecar (with the recorded sides) all happen in conflict.rs.
+    crate::commands::conflict::write_conflict_artifacts(
+        work_dir,
+        abs,
+        base_src.as_ref(),
+        local_src.as_ref(),
+        remote_src.as_ref(),
+        meta,
+        lazy,
+    )
 }
 
 /// Partition `remote_diff` entries into:
@@ -1424,8 +1374,203 @@ fn print_merged_block(
     }
     out.writeln("Line-merged the following paths:")?;
     for p in merged {
-        let p_str = paint(colored, styles.modified, p);
+        let p_str = paint(colored, styles.modified, &crate::term::escape_display(&p.to_string()));
         out.writeln(&format!("  merged: {}", p_str))?;
+    }
+    Ok(())
+}
+
+/// What the pre-apply working-tree scan saw: each regular file's `(mtime, size)`
+/// keyed by repo-relative path. `apply_diff` compares a path against this
+/// immediately before overwriting or deleting it (design/03, "Re-verifying a
+/// path immediately before it is overwritten"). A path missing from the map was
+/// absent, stubbed or ignored when the scan ran.
+struct ScanObservation {
+    files: HashMap<String, (std::time::SystemTime, u64)>,
+    /// Paths the scan saw that are not regular files (symlinks, directories,
+    /// stub markers): present, but with no `(mtime, size)` to compare.
+    other: std::collections::HashSet<String>,
+    /// Paths this pull removed itself while applying the diff (deleted files and
+    /// pruned directories). Their absence afterwards is the pull's own doing,
+    /// not a user edit (design/03). Interior-mutable: `apply_diff` holds the
+    /// observation by shared reference.
+    removed: std::cell::RefCell<std::collections::HashSet<String>>,
+    /// Logical paths that were file stubs with no real file at scan time; the
+    /// real file is expected to stay absent (design/03).
+    stubs: std::collections::HashSet<String>,
+}
+
+impl ScanObservation {
+    fn record_removed(&self, rel: &str) {
+        self.removed.borrow_mut().insert(rel.to_string());
+    }
+
+    /// Regular files only; no non-file paths were seen. Used where the scan
+    /// result's side data is not to hand (tests, and scopes that scan nothing).
+    fn new(files: HashMap<String, crate::scan::ScannedFile>) -> Self {
+        Self::with_other(files, std::iter::empty())
+    }
+
+    fn with_other(
+        files: HashMap<String, crate::scan::ScannedFile>,
+        other: impl IntoIterator<Item = String>,
+    ) -> Self {
+        Self::with_stubs(files, other, std::iter::empty())
+    }
+
+    fn with_stubs(
+        files: HashMap<String, crate::scan::ScannedFile>,
+        other: impl IntoIterator<Item = String>,
+        stubs: impl IntoIterator<Item = String>,
+    ) -> Self {
+        ScanObservation {
+            files: files
+                .into_iter()
+                .map(|(path, f)| (path, (f.fs_mtime, f.fs_size)))
+                .collect(),
+            other: other.into_iter().collect(),
+            removed: std::cell::RefCell::new(std::collections::HashSet::new()),
+            stubs: stubs.into_iter().collect(),
+        }
+    }
+
+    #[cfg(test)]
+    fn files_for_test(&self) -> HashMap<String, crate::scan::ScannedFile> {
+        self.files
+            .iter()
+            .map(|(p, (mtime, size))| {
+                (
+                    p.clone(),
+                    crate::scan::ScannedFile {
+                        fs_mtime: *mtime,
+                        fs_size: *size,
+                        hash: crate::object::blob_hash(b""),
+                        cache_hit: false,
+                        fallback_hit: false,
+                        blob_sealed: false,
+                        observed_at: std::time::SystemTime::now(),
+                    },
+                )
+            })
+            .collect()
+    }
+}
+
+/// True when `abs` no longer matches what the scan observed at `rel`.
+///
+/// - Observed as a regular file: it must still be a regular file with the same
+///   `(mtime, size)`.
+/// - Observed as something else (symlink, directory, stub marker): it must
+///   still exist. Its old kind may legitimately differ from the incoming one
+///   (a type change), so only presence is checked, and a symlink or directory
+///   that has been replaced by a regular file is a change.
+/// - Not observed: nothing may exist there now. (`symlink_metadata`, so a
+///   dangling symlink or a directory still counts as something appearing.)
+fn changed_since_scan(obs: &ScanObservation, rel: &str, abs: &std::path::Path) -> bool {
+    // A path this pull removed itself is expected to be gone; only something
+    // that has appeared there since is a change.
+    if obs.removed.borrow().contains(rel) {
+        return fs::symlink_metadata(abs).is_ok();
+    }
+    if let Some((mtime, size)) = obs.files.get(rel) {
+        return match fs::symlink_metadata(abs) {
+            Ok(md) => !md.is_file() || md.len() != *size || md.modified().ok() != Some(*mtime),
+            Err(_) => true,
+        };
+    }
+    if obs.other.contains(rel) {
+        return match fs::symlink_metadata(abs) {
+            Ok(md) => md.is_file(),
+            Err(_) => true,
+        };
+    }
+    // A file stub stands for a real file that is absent by design: the pull
+    // updates or removes the stub record and never materialises it, so the real
+    // file must simply still be absent.
+    if obs.stubs.contains(rel) {
+        return fs::symlink_metadata(abs).is_ok();
+    }
+    fs::symlink_metadata(abs).is_ok()
+}
+
+/// The entries of `diff` whose working-tree path would lose data if written now
+/// (overwritten, deleted or replaced) but has changed since the scan. Returns
+/// repo-relative paths, sorted. Entries that cannot destroy a file the scan
+/// could have observed (`AddedEmptyDir`, `AddedTree`, `Symlink` over an absent
+/// path) are not regular-file writes and are checked only for "still absent".
+fn verify_unchanged_since_scan(
+    diff: &HashMap<String, DiffEntry>,
+    base_dir: &std::path::Path,
+    work_dir: &std::path::Path,
+    obs: &ScanObservation,
+) -> Vec<String> {
+    let mut offenders: Vec<String> = Vec::new();
+    for (key, change) in diff {
+        let abs = base_dir.join(key);
+        let Ok(rel_path) = abs.strip_prefix(work_dir) else {
+            continue;
+        };
+        let rel = rel_path.to_string_lossy().into_owned();
+        let touches_a_file = matches!(
+            change,
+            DiffEntry::Added { .. }
+                | DiffEntry::Modified { .. }
+                | DiffEntry::Deleted
+                | DiffEntry::Symlink { .. }
+        );
+        if touches_a_file && changed_since_scan(obs, &rel, &abs) {
+            // A deletion of a path that was absent at scan time and is still
+            // absent is a no-op, not a change: `changed_since_scan` already
+            // reports "absent, still absent" as unchanged.
+            offenders.push(rel);
+        }
+    }
+    offenders.sort();
+    offenders
+}
+
+/// Deterministic integration-test hook for the scan-to-apply window (design/03,
+/// "Re-verifying a path immediately before it is overwritten"). Compiled only in
+/// debug builds and inert unless the variable is set, like the scan hook
+/// `OMEMFS_TEST_SCAN_AFTER_LIST_DELAY_MS`.
+fn test_hook_before_apply() {
+    #[cfg(debug_assertions)]
+    if let Ok(ms) = std::env::var("OMEMFS_TEST_PULL_BEFORE_APPLY_DELAY_MS")
+        && let Ok(ms) = ms.parse::<u64>()
+    {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+}
+
+/// Report the paths that changed underneath the pull and return the error that
+/// aborts it. `Error::Conflict`, because that is what it is: the working tree
+/// now holds a local change to a path the remote also changed. Nothing is
+/// written for the paths: `clone_root` stays where it was, so the next
+/// `omemfs pull` re-scans and reports the edit as an ordinary conflict (with
+/// helper files), which is the resolution path users already know.
+fn changed_since_scan_error(offenders: &[String]) -> Error {
+    eprintln!("error: these paths changed while the pull was in progress; nothing more was written:");
+    for p in offenders {
+        eprintln!("  {}", crate::term::escape_display(p));
+    }
+    eprintln!("Run 'omemfs pull' again to review them as conflicts.");
+    Error::Conflict
+}
+
+/// Re-check one path right before its own write (design/03). The up-front pass
+/// covers the whole diff at once; this narrows the remaining window to the
+/// distance between this check and the write itself.
+fn verify_one_before_write(
+    obs: &ScanObservation,
+    work_dir: &std::path::Path,
+    abs_path: &std::path::Path,
+) -> Result<(), Error> {
+    let rel = abs_path
+        .strip_prefix(work_dir)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if !rel.is_empty() && changed_since_scan(obs, &rel, abs_path) {
+        return Err(changed_since_scan_error(&[rel]));
     }
     Ok(())
 }
@@ -1439,6 +1584,7 @@ fn apply_diff(
     stub_threshold: u64,
     remote: &dyn ObjectStore,
     remote_key: Option<&crate::codec::encrypt::EncryptKey>,
+    observed: &ScanObservation,
 ) -> Result<usize, Error> {
     let mut changed = 0;
 
@@ -1501,7 +1647,20 @@ fn apply_diff(
                 DiffEntry::Deleted | DiffEntry::AddedEmptyDir | DiffEntry::Symlink { .. } => {}
             }
         }
-        crate::commands::transfer::transfer_objects_many(remote, local, &pending, remote_key, true)?;
+        crate::commands::transfer::transfer_objects_many(
+            remote, local, &pending, remote_key, true,
+        )?;
+    }
+
+    test_hook_before_apply();
+
+    // Re-verify every path against the scan, in one pass, after the (possibly
+    // minutes-long) download and before the FIRST write (design/03, "Re-verifying
+    // a path immediately before it is overwritten"): a path edited in the
+    // scan-to-apply window aborts the pull with nothing applied yet.
+    let offenders = verify_unchanged_since_scan(diff, base_dir, work_dir, observed);
+    if !offenders.is_empty() {
+        return Err(changed_since_scan_error(&offenders));
     }
 
     // Directories touched by deletions, for dir-stub / empty-parent cleanup.
@@ -1559,7 +1718,10 @@ fn apply_diff(
         // diff, not a fresh on-disk probe, but it is still a lexical
         // write-tree path that must not follow a symlinked parent.
         let existed = abs_path.exists();
+        verify_one_before_write(observed, work_dir, &abs_path)?;
         crate::fsguard::remove_file_tolerant(work_dir, &abs_path)?;
+        // The path is gone because of this pull, not a user edit (design/03).
+        observed.record_removed(&work_rel);
         if existed {
             changed += 1;
         }
@@ -1609,7 +1771,11 @@ fn apply_diff(
             .map(|mut rd| rd.next().is_none())
             .unwrap_or(false)
         {
-            fs::remove_dir(&dir).ok();
+            if fs::remove_dir(&dir).is_ok()
+                && let Ok(rel) = dir.strip_prefix(work_dir)
+            {
+                observed.record_removed(&rel.to_string_lossy());
+            }
         }
     }
 
@@ -1710,7 +1876,7 @@ fn apply_diff(
                 } else {
                     materialise_blob(
                         &abs_path, work_dir, &work_rel, hash, mtime, mode, store, remote,
-                        remote_key,
+                        remote_key, observed,
                     )?;
                 }
                 changed += 1;
@@ -1740,7 +1906,7 @@ fn apply_diff(
                 } else {
                     materialise_blob(
                         &abs_path, work_dir, &work_rel, hash, mtime, mode, store, remote,
-                        remote_key,
+                        remote_key, observed,
                     )?;
                 }
                 changed += 1;
@@ -1757,6 +1923,7 @@ fn apply_diff(
                 stub::remove(work_dir, &work_rel)?;
                 // write_symlink_atomic (via fsguard) ensures the parent
                 // directory exists.
+                verify_one_before_write(observed, work_dir, &abs_path)?;
                 crate::fsmeta::write_symlink_atomic(work_dir, &abs_path, target)?;
                 // Restore the link's own mtime (lutimes) so a subsequent scan
                 // recomputes the same tree and push stays a no-op.
@@ -2022,8 +2189,12 @@ fn materialise_blob(
     store: &dyn ObjectStore,
     remote: &dyn ObjectStore,
     remote_key: Option<&crate::codec::encrypt::EncryptKey>,
+    observed: &ScanObservation,
 ) -> Result<(), Error> {
     ensure_blob_local(remote, store, hash, remote_key)?;
+    // The fetch above can take a long time; re-check this path against the
+    // scan right before it is overwritten (design/03).
+    verify_one_before_write(observed, work_dir, abs_path)?;
     // `materialise_blob_at` (via fsguard) resolves and creates the parent
     // directory itself.
     crate::fsmeta::materialise_blob_at(work_dir, store, hash, abs_path, mtime, mode)?;
@@ -2042,7 +2213,7 @@ fn print_conflict_result(conflicts: &[String]) {
     );
     eprintln!("{}", heading);
     for p in conflicts {
-        let p_str = paint(colored, styles.modified, p);
+        let p_str = paint(colored, styles.modified, &crate::term::escape_display(&p.to_string()));
         eprintln!("  conflict: {}", p_str);
     }
     eprintln!("\nResolve conflicts and push:");
@@ -2716,22 +2887,6 @@ mod tests {
     use crate::store::local::LocalStore;
     use tempfile::TempDir;
 
-    /// Deterministic pseudo-random byte generator (xorshift64*), enough for
-    /// FastCDC to find multiple cut points. Not for crypto.
-    fn pseudo_random(seed: u64, len: usize) -> Vec<u8> {
-        let mut state = seed | 1;
-        let mut out = Vec::with_capacity(len);
-        while out.len() < len {
-            state ^= state >> 12;
-            state ^= state << 25;
-            state ^= state >> 27;
-            let v = state.wrapping_mul(0x2545F4914F6CDD1D);
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-        out.truncate(len);
-        out
-    }
-
     #[test]
     fn working_file_source_present_and_absent() {
         let dir = TempDir::new().unwrap();
@@ -2762,131 +2917,6 @@ mod tests {
         assert!(
             working_file_source(&sub).is_none(),
             "expected None for a directory path"
-        );
-    }
-
-    #[test]
-    fn write_helper_file_streams_blob_content() {
-        // A multi-chunk blob must be written to its helper file with byte-identical
-        // content (ED F0 escape stripped exactly once, no chunk tags leaking).
-        let content = pseudo_random(0x4242_1717, 10 * 1024 * 1024);
-        let store_dir = TempDir::new().unwrap();
-        let store = LocalStore::for_cache(store_dir.path());
-        let hash = crate::object::blob_hash(&content);
-        let serialised = crate::object::serialise_blob(&content);
-        codec::chunk::store_chunked(&store, &hash, &serialised, None).unwrap();
-        assert!(
-            codec::chunk::is_chunked(&store, &hash, None),
-            "expected multi-chunk blob"
-        );
-
-        let out_dir = TempDir::new().unwrap();
-        let base = out_dir.path().join("file.bin");
-        write_helper_file(
-            out_dir.path(),
-            &base,
-            ".omemfs-conflict-remote",
-            &HelperSource::Blob(hash),
-            &store,
-        )
-        .unwrap();
-
-        let helper = out_dir.path().join("file.bin.omemfs-conflict-remote");
-        assert_eq!(fs::read(&helper).unwrap(), content);
-    }
-
-    #[test]
-    fn write_helper_file_streams_working_file() {
-        // The local side stream-copies the working-tree file verbatim.
-        let content = pseudo_random(0x9999_0001, 3 * 1024 * 1024);
-        let dir = TempDir::new().unwrap();
-        let src = dir.path().join("file.bin");
-        fs::write(&src, &content).unwrap();
-
-        // The store argument is unused for a WorkingFile source.
-        let store_dir = TempDir::new().unwrap();
-        let store = LocalStore::for_cache(store_dir.path());
-        let file = fs::File::open(&src).unwrap();
-        write_helper_file(
-            dir.path(),
-            &src,
-            ".omemfs-conflict-local",
-            &HelperSource::WorkingFile(file),
-            &store,
-        )
-        .unwrap();
-
-        let helper = dir.path().join("file.bin.omemfs-conflict-local");
-        assert_eq!(fs::read(&helper).unwrap(), content);
-    }
-
-    #[test]
-    fn write_helper_file_overwrites_existing() {
-        // A pre-existing helper file is overwritten (atomic temp+rename), matching
-        // the old fs::write behaviour.
-        let dir = TempDir::new().unwrap();
-        let src = dir.path().join("file.bin");
-        fs::write(&src, b"new content").unwrap();
-        let helper = dir.path().join("file.bin.omemfs-conflict-local");
-        fs::write(&helper, b"stale helper content that is longer").unwrap();
-
-        let store_dir = TempDir::new().unwrap();
-        let store = LocalStore::for_cache(store_dir.path());
-        let file = fs::File::open(&src).unwrap();
-        write_helper_file(
-            dir.path(),
-            &src,
-            ".omemfs-conflict-local",
-            &HelperSource::WorkingFile(file),
-            &store,
-        )
-        .unwrap();
-        assert_eq!(fs::read(&helper).unwrap(), b"new content");
-    }
-
-    // `HelperSource::WorkingFile` must refuse to write a conflict-helper file
-    // through a directory that has been replaced by a symlink pointing
-    // outside `work_dir` -- the same guard the `Blob` arm already gets via
-    // `codec::chunk::materialise_to_file` (design/03_sync_model.md, "Write
-    // safety: the working-tree write boundary").
-    #[test]
-    #[cfg(unix)]
-    fn write_helper_file_refuses_working_file_through_symlinked_parent() {
-        let work_dir = TempDir::new().unwrap();
-        let outside = TempDir::new().unwrap();
-
-        // "sub" stands in for a directory the clone_root tree tracks, but on
-        // disk it has been swapped for a symlink pointing outside the
-        // working tree.
-        let sub = work_dir.path().join("sub");
-        std::os::unix::fs::symlink(outside.path(), &sub).unwrap();
-
-        // The "local" file being conflict-helper-copied lives elsewhere; only
-        // `base_path`'s parent -- i.e. `sub` -- matters for the guard.
-        let src_dir = TempDir::new().unwrap();
-        let src = src_dir.path().join("local.txt");
-        fs::write(&src, b"local content").unwrap();
-        let file = fs::File::open(&src).unwrap();
-
-        let store_dir = TempDir::new().unwrap();
-        let store = LocalStore::for_cache(store_dir.path());
-
-        let base_path = sub.join("file.txt");
-        let err = write_helper_file(
-            work_dir.path(),
-            &base_path,
-            ".omemfs-conflict-local",
-            &HelperSource::WorkingFile(file),
-            &store,
-        )
-        .unwrap_err();
-        assert!(
-            matches!(err, Error::SymlinkEscape(_)),
-            "expected SymlinkEscape, got {err:?}"
-        );
-        assert!(
-            !outside.path().join("file.txt.omemfs-conflict-local").exists(),
-            "conflict-helper content must never be written outside work_dir"
         );
     }
 
@@ -2990,6 +3020,547 @@ mod tests {
         (diff, files)
     }
 
+    // -----------------------------------------------------------------------
+    // Re-verification right before a write (review R1; design/03 "Re-verifying
+    // a path immediately before it is overwritten")
+    // -----------------------------------------------------------------------
+
+    fn scanned(path: &std::path::Path) -> crate::scan::ScannedFile {
+        let md = fs::metadata(path).unwrap();
+        crate::scan::ScannedFile {
+            fs_mtime: md.modified().unwrap(),
+            fs_size: md.len(),
+            hash: crate::object::blob_hash(&fs::read(path).unwrap()),
+            cache_hit: false,
+            fallback_hit: false,
+            blob_sealed: false,
+            observed_at: std::time::SystemTime::now(),
+        }
+    }
+
+    fn modified(content: &[u8]) -> DiffEntry {
+        DiffEntry::Modified {
+            hash: crate::object::blob_hash(content),
+            size: content.len() as u64,
+            mtime: None,
+            mode: None,
+        }
+    }
+
+    fn observed(dir: &std::path::Path, names: &[&str]) -> ScanObservation {
+        let mut files = HashMap::new();
+        for n in names {
+            files.insert((*n).to_string(), scanned(&dir.join(n)));
+        }
+        ScanObservation::new(files)
+    }
+
+    #[test]
+    fn a_stubbed_path_with_no_real_file_is_unchanged() {
+        // Regression: `big.bin.omemfs-stub` stands for a `big.bin` that is absent
+        // by design. A remote Modified/Deleted on it must not abort the pull.
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("big.bin.omemfs-stub"), b"{}").unwrap();
+        let obs = ScanObservation::with_stubs(HashMap::new(), [], ["big.bin".to_string()]);
+        assert!(!changed_since_scan(&obs, "big.bin", &dir.path().join("big.bin")));
+    }
+
+    #[test]
+    fn a_real_file_appearing_at_a_stubbed_path_is_a_change() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("big.bin.omemfs-stub"), b"{}").unwrap();
+        let obs = ScanObservation::with_stubs(HashMap::new(), [], ["big.bin".to_string()]);
+        fs::write(dir.path().join("big.bin"), b"user materialised it").unwrap();
+        assert!(changed_since_scan(&obs, "big.bin", &dir.path().join("big.bin")));
+    }
+
+    #[test]
+    fn verify_accepts_a_remote_modification_of_a_stubbed_file() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("big.bin.omemfs-stub"), b"{}").unwrap();
+        let obs = ScanObservation::with_stubs(HashMap::new(), [], ["big.bin".to_string()]);
+        let mut diff = HashMap::new();
+        diff.insert("big.bin".to_string(), modified(b"new"));
+        diff.insert("gone.bin".to_string(), DiffEntry::Deleted);
+        assert!(verify_unchanged_since_scan(&diff, dir.path(), dir.path(), &obs).is_empty());
+    }
+
+    #[test]
+    fn a_path_the_pull_removed_itself_is_not_reported_as_changed() {
+        // Regression: a directory replaced by a file. The pull deletes the
+        // children, prunes the directory, then writes the file at the same path.
+        let dir = TempDir::new().unwrap();
+        let obs = ScanObservation::with_other(HashMap::new(), ["d".to_string()]);
+        // The pull has pruned `d` (it is gone), and says so.
+        obs.record_removed("d");
+        assert!(!changed_since_scan(&obs, "d", &dir.path().join("d")));
+    }
+
+    #[test]
+    fn a_path_missing_but_not_removed_by_the_pull_is_still_a_change() {
+        let dir = TempDir::new().unwrap();
+        let obs = ScanObservation::with_other(HashMap::new(), ["d".to_string()]);
+        assert!(changed_since_scan(&obs, "d", &dir.path().join("d")));
+    }
+
+    #[test]
+    fn a_removed_path_that_a_user_recreated_afterwards_is_a_change() {
+        // The pull removed `f`, then the user created their own `f` before our
+        // write. Removal by us must not excuse what appeared after it.
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("f"), b"user").unwrap();
+        let obs = ScanObservation::with_other(HashMap::new(), ["f".to_string()]);
+        obs.record_removed("f");
+        assert!(changed_since_scan(&obs, "f", &dir.path().join("f")));
+    }
+
+    #[test]
+    fn apply_diff_replaces_a_directory_with_a_file_without_a_false_alarm() {
+        let remote_dir = TempDir::new().unwrap();
+        let remote = LocalStore::for_remote(remote_dir.path());
+        let store_dir = TempDir::new().unwrap();
+        let store = LocalStore::for_cache(store_dir.path());
+        let work = TempDir::new().unwrap();
+        fs::create_dir(work.path().join("d")).unwrap();
+        fs::write(work.path().join("d/child.txt"), b"1").unwrap();
+        let obs = ScanObservation::with_other(
+            observed(work.path(), &["d/child.txt"]).files_for_test(),
+            ["d".to_string()],
+        );
+        let content = b"now a file";
+        codec::chunk::store_chunked(
+            &remote,
+            &crate::object::blob_hash(content),
+            &crate::object::serialise_blob(content),
+            None,
+        )
+        .unwrap();
+        let mut diff = HashMap::new();
+        diff.insert("d/child.txt".to_string(), DiffEntry::Deleted);
+        diff.insert(
+            "d".to_string(),
+            DiffEntry::Added {
+                hash: crate::object::blob_hash(content),
+                size: content.len() as u64,
+                mtime: None,
+                mode: None,
+            },
+        );
+        apply_diff(&diff, work.path(), &store, &store, work.path(), 0, &remote, None, &obs)
+            .unwrap();
+        assert_eq!(fs::read(work.path().join("d")).unwrap(), content);
+    }
+
+    #[test]
+    fn verify_accepts_a_symlink_the_scan_saw_and_that_is_still_there() {
+        // Regression: a remote change to a symlink the working tree already has.
+        // The scan holds no (mtime, size) for it; "seen, still present" is fine.
+        let dir = TempDir::new().unwrap();
+        std::os::unix::fs::symlink("old-target", dir.path().join("link")).unwrap();
+        let obs = ScanObservation::with_other(HashMap::new(), ["link".to_string()]);
+        let mut diff = HashMap::new();
+        diff.insert(
+            "link".to_string(),
+            DiffEntry::Symlink {
+                target: "new-target".to_string(),
+                mtime: None,
+                was_present: true,
+            },
+        );
+        assert!(verify_unchanged_since_scan(&diff, dir.path(), dir.path(), &obs).is_empty());
+    }
+
+    #[test]
+    fn verify_accepts_a_directory_the_scan_saw_when_the_pull_replaces_it() {
+        // Type change: the working tree has a directory the remote replaced with
+        // a file. The diff carries Deleted for its children and Added for the path.
+        let dir = TempDir::new().unwrap();
+        fs::create_dir(dir.path().join("d")).unwrap();
+        fs::write(dir.path().join("d/child.txt"), b"1").unwrap();
+        let obs = ScanObservation::with_other(
+            observed(dir.path(), &["d/child.txt"]).files_for_test(),
+            ["d".to_string()],
+        );
+        let mut diff = HashMap::new();
+        diff.insert("d/child.txt".to_string(), DiffEntry::Deleted);
+        diff.insert("d".to_string(), added(b"now a file"));
+        assert!(verify_unchanged_since_scan(&diff, dir.path(), dir.path(), &obs).is_empty());
+    }
+
+    #[test]
+    fn verify_flags_a_seen_symlink_that_has_vanished() {
+        let dir = TempDir::new().unwrap();
+        let obs = ScanObservation::with_other(HashMap::new(), ["link".to_string()]);
+        let mut diff = HashMap::new();
+        diff.insert(
+            "link".to_string(),
+            DiffEntry::Symlink {
+                target: "t".to_string(),
+                mtime: None,
+                was_present: true,
+            },
+        );
+        assert_eq!(
+            verify_unchanged_since_scan(&diff, dir.path(), dir.path(), &obs),
+            vec!["link".to_string()]
+        );
+    }
+
+    #[test]
+    fn verify_flags_a_seen_symlink_replaced_by_a_regular_file() {
+        // Not a benign type change: the user swapped the symlink for their own file.
+        let dir = TempDir::new().unwrap();
+        std::os::unix::fs::symlink("t", dir.path().join("link")).unwrap();
+        let obs = ScanObservation::with_other(HashMap::new(), ["link".to_string()]);
+        fs::remove_file(dir.path().join("link")).unwrap();
+        fs::write(dir.path().join("link"), b"user data").unwrap();
+        let mut diff = HashMap::new();
+        diff.insert(
+            "link".to_string(),
+            DiffEntry::Symlink {
+                target: "new".to_string(),
+                mtime: None,
+                was_present: true,
+            },
+        );
+        assert_eq!(
+            verify_unchanged_since_scan(&diff, dir.path(), dir.path(), &obs),
+            vec!["link".to_string()]
+        );
+    }
+
+    #[test]
+    fn verify_accepts_paths_unchanged_since_the_scan() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("a.txt"), b"one").unwrap();
+        let obs = observed(dir.path(), &["a.txt"]);
+        let mut diff = HashMap::new();
+        diff.insert("a.txt".to_string(), modified(b"two"));
+        assert!(verify_unchanged_since_scan(&diff, dir.path(), dir.path(), &obs).is_empty());
+    }
+
+    #[test]
+    fn verify_flags_a_file_edited_after_the_scan() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("a.txt"), b"one").unwrap();
+        let obs = observed(dir.path(), &["a.txt"]);
+        // Different size: detected regardless of mtime granularity.
+        fs::write(dir.path().join("a.txt"), b"one, edited while downloading").unwrap();
+        let mut diff = HashMap::new();
+        diff.insert("a.txt".to_string(), modified(b"two"));
+        assert_eq!(
+            verify_unchanged_since_scan(&diff, dir.path(), dir.path(), &obs),
+            vec!["a.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn verify_flags_a_same_size_edit_via_mtime() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("a.txt"), b"one").unwrap();
+        let obs = observed(dir.path(), &["a.txt"]);
+        fs::write(dir.path().join("a.txt"), b"uno").unwrap(); // same length
+        let later = std::time::SystemTime::now() + Duration::from_secs(60);
+        filetime::set_file_mtime(
+            dir.path().join("a.txt"),
+            filetime::FileTime::from_system_time(later),
+        )
+        .unwrap();
+        let mut diff = HashMap::new();
+        diff.insert("a.txt".to_string(), modified(b"two"));
+        assert_eq!(
+            verify_unchanged_since_scan(&diff, dir.path(), dir.path(), &obs),
+            vec!["a.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn verify_flags_a_file_deleted_after_the_scan() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("a.txt"), b"one").unwrap();
+        let obs = observed(dir.path(), &["a.txt"]);
+        fs::remove_file(dir.path().join("a.txt")).unwrap();
+        let mut diff = HashMap::new();
+        diff.insert("a.txt".to_string(), modified(b"two"));
+        assert_eq!(
+            verify_unchanged_since_scan(&diff, dir.path(), dir.path(), &obs),
+            vec!["a.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn verify_flags_a_new_file_appearing_where_the_pull_will_add_one() {
+        // The scan found nothing at b.txt; a local file appeared since, and the
+        // pull's Added(b.txt) would replace it.
+        let dir = TempDir::new().unwrap();
+        let obs = ScanObservation::new(HashMap::new());
+        fs::write(dir.path().join("b.txt"), b"local addition").unwrap();
+        let mut diff = HashMap::new();
+        diff.insert("b.txt".to_string(), added(b"remote"));
+        assert_eq!(
+            verify_unchanged_since_scan(&diff, dir.path(), dir.path(), &obs),
+            vec!["b.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn verify_accepts_an_added_path_that_is_still_absent() {
+        let dir = TempDir::new().unwrap();
+        let obs = ScanObservation::new(HashMap::new());
+        let mut diff = HashMap::new();
+        diff.insert("b.txt".to_string(), added(b"remote"));
+        assert!(verify_unchanged_since_scan(&diff, dir.path(), dir.path(), &obs).is_empty());
+    }
+
+    #[test]
+    fn verify_flags_a_deletion_of_a_file_that_appeared_after_the_scan() {
+        // Scan saw nothing at c.txt (so the diff was clean); the pull would delete
+        // it, but a file is there now.
+        let dir = TempDir::new().unwrap();
+        let obs = ScanObservation::new(HashMap::new());
+        fs::write(dir.path().join("c.txt"), b"new local file").unwrap();
+        let mut diff = HashMap::new();
+        diff.insert("c.txt".to_string(), DiffEntry::Deleted);
+        assert_eq!(
+            verify_unchanged_since_scan(&diff, dir.path(), dir.path(), &obs),
+            vec!["c.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn verify_ignores_entries_with_no_working_file_to_lose() {
+        // Directory stubs, empty dirs and paths the scan never covered (stubbed
+        // or ignored) are not regular files the scan could have observed.
+        let dir = TempDir::new().unwrap();
+        let obs = ScanObservation::new(HashMap::new());
+        let mut diff = HashMap::new();
+        diff.insert("d".to_string(), DiffEntry::AddedEmptyDir);
+        diff.insert("gone.txt".to_string(), DiffEntry::Deleted); // absent on both
+        assert!(verify_unchanged_since_scan(&diff, dir.path(), dir.path(), &obs).is_empty());
+    }
+
+    #[test]
+    fn verify_reports_every_offending_path_sorted() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("a.txt"), b"1").unwrap();
+        fs::write(dir.path().join("b.txt"), b"2").unwrap();
+        let obs = observed(dir.path(), &["a.txt", "b.txt"]);
+        fs::write(dir.path().join("b.txt"), b"22").unwrap();
+        fs::write(dir.path().join("a.txt"), b"11").unwrap();
+        let mut diff = HashMap::new();
+        diff.insert("b.txt".to_string(), modified(b"x"));
+        diff.insert("a.txt".to_string(), modified(b"y"));
+        assert_eq!(
+            verify_unchanged_since_scan(&diff, dir.path(), dir.path(), &obs),
+            vec!["a.txt".to_string(), "b.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn apply_diff_refuses_to_overwrite_a_file_edited_after_the_scan() {
+        let remote_dir = TempDir::new().unwrap();
+        let remote = LocalStore::for_remote(remote_dir.path());
+        let store_dir = TempDir::new().unwrap();
+        let store = LocalStore::for_cache(store_dir.path());
+        let work = TempDir::new().unwrap();
+
+        let content = b"remote version";
+        let hash = crate::object::blob_hash(content);
+        codec::chunk::store_chunked(&remote, &hash, &crate::object::serialise_blob(content), None)
+            .unwrap();
+        fs::write(work.path().join("a.txt"), b"scanned").unwrap();
+        let obs = observed(work.path(), &["a.txt"]);
+        fs::write(work.path().join("a.txt"), b"edited while the pull was downloading").unwrap();
+
+        let mut diff = HashMap::new();
+        diff.insert(
+            "a.txt".to_string(),
+            DiffEntry::Modified {
+                hash,
+                size: content.len() as u64,
+                mtime: None,
+                mode: None,
+            },
+        );
+        let err = apply_diff(
+            &diff,
+            work.path(),
+            &store,
+            &store,
+            work.path(),
+            0,
+            &remote,
+            None,
+            &obs,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Conflict), "{err:?}");
+        assert_eq!(
+            fs::read(work.path().join("a.txt")).unwrap(),
+            b"edited while the pull was downloading",
+            "the user's edit must survive"
+        );
+    }
+
+    #[test]
+    fn apply_diff_writes_nothing_when_any_path_fails_the_upfront_check() {
+        // The check for every path runs before the first write, so one edited
+        // file keeps the other, clean, files from being applied first.
+        let remote_dir = TempDir::new().unwrap();
+        let remote = LocalStore::for_remote(remote_dir.path());
+        let (mut diff, _files) = build_added_blobs_diff(&remote, 3);
+        let store_dir = TempDir::new().unwrap();
+        let store = LocalStore::for_cache(store_dir.path());
+        let work = TempDir::new().unwrap();
+        fs::write(work.path().join("keep.txt"), b"scanned").unwrap();
+        let obs = observed(work.path(), &["keep.txt"]);
+        fs::write(work.path().join("keep.txt"), b"edited later, longer").unwrap();
+        // The remote blob must exist: the download precedes the check.
+        let keep = b"remote keep";
+        codec::chunk::store_chunked(
+            &remote,
+            &crate::object::blob_hash(keep),
+            &crate::object::serialise_blob(keep),
+            None,
+        )
+        .unwrap();
+        diff.insert("keep.txt".to_string(), modified(keep));
+
+        let err = apply_diff(
+            &diff,
+            work.path(),
+            &store,
+            &store,
+            work.path(),
+            0,
+            &remote,
+            None,
+            &obs,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Conflict));
+        for i in 0..3 {
+            assert!(
+                !work.path().join(format!("file{i}.txt")).exists(),
+                "no clean path may be applied when another fails the check"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_diff_still_applies_when_nothing_changed_since_the_scan() {
+        let remote_dir = TempDir::new().unwrap();
+        let remote = LocalStore::for_remote(remote_dir.path());
+        let (diff, files) = build_added_blobs_diff(&remote, 4);
+        let store_dir = TempDir::new().unwrap();
+        let store = LocalStore::for_cache(store_dir.path());
+        let work = TempDir::new().unwrap();
+        let obs = ScanObservation::new(HashMap::new());
+        let changed = apply_diff(
+            &diff,
+            work.path(),
+            &store,
+            &store,
+            work.path(),
+            0,
+            &remote,
+            None,
+            &obs,
+        )
+        .unwrap();
+        assert_eq!(changed, files.len());
+    }
+
+    #[test]
+    fn apply_diff_rechecks_a_path_right_before_its_own_write() {
+        // The up-front pass passes; the file is edited during the (slow) blob
+        // fetch. A per-path check just before the write must catch it. The
+        // remote store's open_read hook edits the file, simulating that.
+        struct EditingStore {
+            inner: LocalStore,
+            victim: std::path::PathBuf,
+        }
+        impl ObjectStore for EditingStore {
+            fn exists(&self, h: &Hash) -> Result<bool, Error> {
+                self.inner.exists(h)
+            }
+            fn size(&self, h: &Hash) -> Result<u64, Error> {
+                self.inner.size(h)
+            }
+            fn list_with_sizes(&self) -> Result<Vec<(String, u64)>, Error> {
+                self.inner.list_with_sizes()
+            }
+            fn open_read(&self, h: &Hash) -> Result<Box<dyn std::io::Read>, Error> {
+                fs::write(&self.victim, b"edited during the download, much longer").unwrap();
+                self.inner.open_read(h)
+            }
+            fn write_from(&self, h: &Hash, r: &mut dyn std::io::Read) -> Result<(), Error> {
+                self.inner.write_from(h, r)
+            }
+        }
+
+        let remote_dir = TempDir::new().unwrap();
+        let inner = LocalStore::for_remote(remote_dir.path());
+        let content = b"remote version";
+        let hash = crate::object::blob_hash(content);
+        codec::chunk::store_chunked(&inner, &hash, &crate::object::serialise_blob(content), None)
+            .unwrap();
+        let work = TempDir::new().unwrap();
+        let victim = work.path().join("a.txt");
+        fs::write(&victim, b"scanned").unwrap();
+        let obs = observed(work.path(), &["a.txt"]);
+        let remote = EditingStore { inner, victim: victim.clone() };
+
+        let store_dir = TempDir::new().unwrap();
+        let store = LocalStore::for_cache(store_dir.path());
+        let mut diff = HashMap::new();
+        diff.insert(
+            "a.txt".to_string(),
+            DiffEntry::Modified {
+                hash,
+                size: content.len() as u64,
+                mtime: None,
+                mode: None,
+            },
+        );
+        let err = apply_diff(
+            &diff,
+            work.path(),
+            &store,
+            &store,
+            work.path(),
+            0,
+            &remote,
+            None,
+            &obs,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Conflict), "{err:?}");
+        assert_eq!(
+            fs::read(&victim).unwrap(),
+            b"edited during the download, much longer"
+        );
+    }
+
+    #[test]
+    fn scan_observation_maps_scoped_keys_to_repo_relative_paths() {
+        // A scoped pull's diff keys are relative to the scoped subtree; the scan
+        // records repo-relative paths. The lookup must join base_dir back on.
+        let work = TempDir::new().unwrap();
+        fs::create_dir(work.path().join("sub")).unwrap();
+        fs::write(work.path().join("sub/f.txt"), b"one").unwrap();
+        let mut files = HashMap::new();
+        files.insert("sub/f.txt".to_string(), scanned(&work.path().join("sub/f.txt")));
+        let obs = ScanObservation::new(files);
+        fs::write(work.path().join("sub/f.txt"), b"one and more").unwrap();
+        let mut diff = HashMap::new();
+        diff.insert("f.txt".to_string(), modified(b"x"));
+        assert_eq!(
+            verify_unchanged_since_scan(&diff, &work.path().join("sub"), work.path(), &obs),
+            vec!["sub/f.txt".to_string()]
+        );
+    }
+
     #[test]
     fn apply_diff_materialises_correct_content_for_many_added_blobs() {
         // Correctness only (design/04 pull step 5). This must already pass
@@ -3012,6 +3583,7 @@ mod tests {
             0,
             &remote,
             None,
+            &ScanObservation::new(HashMap::new()),
         )
         .unwrap();
 
@@ -3063,6 +3635,7 @@ mod tests {
             0,
             &remote,
             None,
+            &ScanObservation::new(HashMap::new()),
         )
         .unwrap();
 

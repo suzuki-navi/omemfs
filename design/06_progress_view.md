@@ -34,6 +34,35 @@ temporary file is created under `std::env::temp_dir()` and moved to
 `.omemfs/logs/` once the repository is located. If the command exits without
 finding a repository, the temporary file is discarded.
 
+The temporary file is created with `O_EXCL`, mode `0600`, and a **random**
+name (`omemfs-<random>.log`, via `tempfile`). Its name is never derived from
+the timestamp or command, so concurrent invocations cannot collide and another
+user cannot pre-create the name to make every command fail.
+
+### Final name collisions
+
+The final name is `YYYYMMDD-HHMMSS-{cmd}.log` with one-second resolution, so
+two invocations of the same command in the same second (for example two
+read-only `ls` runs) can want the same name. Relocation never overwrites an
+existing log: if the name is taken it tries `YYYYMMDD-HHMMSS-{cmd}-2.log`,
+`-3`, and so on until a free name is found. The suffixed names are ordinary
+logical names for `omemfs log`. Within the same second their relative order is
+not guaranteed (`-` sorts before `.`), which is acceptable: the sweep only needs
+seconds-level ordering.
+
+### Permissions
+
+`.omemfs/` and `.omemfs/logs/` are created with mode `0700` and log files with
+`0600` (see `02_storage_format.md`, "Local directory permissions").
+
+### Log content is single-line
+
+A log record is exactly one line. The message text is escaped for display (see
+`04_cli_spec.md`, "Terminal output safety") with LF and CR rendered as `\n` and
+`\r` *before* the line is written, so a name containing a newline can never
+forge a second record. ANSI colour codes are added only to the copy shown in
+the TTY view, after escaping.
+
 ### Retention
 
 `.omemfs/logs/` retains at most the newest **200** log files (`latest.log`

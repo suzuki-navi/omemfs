@@ -365,6 +365,18 @@ pub(crate) fn is_conflict_artifact(name: &str) -> bool {
     CONFLICT_ARTIFACT_SUFFIXES.iter().any(|s| name.ends_with(s))
 }
 
+/// Prefix of the in-flight staging file `fsguard` creates next to a working-tree
+/// write's destination (design/09 "`.omemfs-tmp-*`"). It is in the reserved
+/// `.omemfs-` namespace so a leftover from an interrupted write is excluded from
+/// every scan instead of being pushed as content.
+pub(crate) const WORKING_TREE_TMP_PREFIX: &str = ".omemfs-tmp-";
+
+/// Returns `true` if `name` is a working-tree staging file left by (or in use
+/// by) an `fsguard` write.
+pub(crate) fn is_working_tree_tmp(name: &str) -> bool {
+    name.starts_with(WORKING_TREE_TMP_PREFIX)
+}
+
 /// Validate a single tree-entry name before it is ever joined onto a
 /// filesystem path (e.g. `base_dir.join(entry.name())` in `pull`/`tree_ops`).
 ///
@@ -889,6 +901,17 @@ mod tests {
         // is a deliberate consistency trade-off (design/09), not an
         // oversight: see the "Reserved names in remote tree entries" section.
         assert_rejected("weird.omemfs-lookalike.txt");
+    }
+
+    #[test]
+    fn working_tree_tmp_names_are_recognised_and_stay_in_the_reserved_namespace() {
+        assert!(is_working_tree_tmp(".omemfs-tmp-1a-2b-0"));
+        assert!(!is_working_tree_tmp("notes.omemfs-tmp-1"));
+        assert!(!is_working_tree_tmp(".tmpabc"));
+        assert!(!is_working_tree_tmp("tmp"));
+        // Reserved, so a remote tree can never smuggle one in either.
+        assert!(is_reserved_name(".omemfs-tmp-1a-2b-0"));
+        assert_rejected(".omemfs-tmp-1a-2b-0");
     }
 
     #[test]

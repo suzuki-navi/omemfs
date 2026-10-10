@@ -20,6 +20,8 @@ mod stat_cache;
 mod store;
 mod stub;
 mod term;
+#[cfg(test)]
+mod test_umask;
 mod tree_ops;
 
 use std::path::PathBuf;
@@ -324,13 +326,13 @@ fn main() {
         let work_dir = match repo::Repo::discover(&cwd) {
             Ok(repo) => repo.work_dir,
             Err(e) => {
-                eprintln!("error: {e}");
+                eprintln!("error: {}", term::escape_display_multiline(&e.to_string()));
                 process::exit(1);
             }
         };
         let result = run_log_command(subcommand, work_dir);
         if let Err(e) = result {
-            eprintln!("error: {e}");
+            eprintln!("error: {}", term::escape_display_multiline(&e.to_string()));
             process::exit(1);
         }
         return;
@@ -347,7 +349,7 @@ fn main() {
         match repo::Repo::discover(&cwd) {
             Ok(repo) => repo.work_dir,
             Err(e) => {
-                eprintln!("error: {e}");
+                eprintln!("error: {}", term::escape_display_multiline(&e.to_string()));
                 process::exit(1);
             }
         }
@@ -596,7 +598,7 @@ fn main() {
     progress::clear_context();
 
     if let Err(e) = result {
-        eprintln!("error: {e}");
+        eprintln!("error: {}", term::escape_display_multiline(&e.to_string()));
         process::exit(1);
     }
 }

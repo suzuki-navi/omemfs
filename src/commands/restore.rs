@@ -937,7 +937,12 @@ fn plan_remove_added_files(
         // generic "unknown file" `DeleteFile` branch below, which would
         // report it as `deleted:` and count it as if it were a real file the
         // user is losing.
-        if crate::commands::conflict::is_conflict_artifact(&name) {
+        //
+        // A leftover fsguard staging file (`.omemfs-tmp-*`, design/09) is the
+        // same kind of residue and takes the same silent route.
+        if crate::commands::conflict::is_conflict_artifact(&name)
+            || crate::object::is_working_tree_tmp(&name)
+        {
             let rel = rel_path(&base_dir.join(&name), work_dir);
             plan.actions.push(Action::DeleteConflictArtifact { rel });
             continue;
@@ -1485,7 +1490,9 @@ fn remove_added_dir(
         // that is itself being wholly removed is the same kind of
         // omemfs-internal residue, treated the same way -- silently, with no
         // `deleted:` line and no count increment.
-        if crate::commands::conflict::is_conflict_artifact(&name) {
+        if crate::commands::conflict::is_conflict_artifact(&name)
+            || crate::object::is_working_tree_tmp(&name)
+        {
             if !dry_run {
                 let _ = crate::fsguard::remove_file_tolerant(work_dir, &abs);
             }
@@ -1621,6 +1628,10 @@ fn print_failed(path: &str, err: &Error) {
     let path = display_path(path);
     let colored = color_enabled(ColorChoice::Auto, atty::is(atty::Stream::Stdout));
     let styles = Styles::new();
+    // `err` may embed further names; keep its own line structure but no raw
+    // control characters.
+    let err_text = err.to_string();
+    let err = crate::term::escape_display_multiline(&err_text);
     let text = if colored {
         format!("{}: {}: {}", paint(colored, styles.deleted, "failed"), path, err)
     } else {
@@ -1634,8 +1645,13 @@ fn print_failed(path: &str, err: &Error) {
 /// `plan_tree`'s `rel_base` for the root call, and `work_dir.join("")` is a
 /// valid, correct path) -- that representation must not change, only how it
 /// is rendered to the user in an action line.
-fn display_path(path: &str) -> &str {
-    if path.is_empty() { "." } else { path }
+fn display_path(path: &str) -> std::borrow::Cow<'_, str> {
+    if path.is_empty() {
+        std::borrow::Cow::Borrowed(".")
+    } else {
+        // Names are untrusted (design/04 "Terminal output safety").
+        crate::term::escape_display(path)
+    }
 }
 
 /// Print a single action line. `kind` selects a color and prefix:
@@ -1661,7 +1677,12 @@ fn display_path(path: &str) -> &str {
 /// `rel`/`rel_base` is genuinely `""` internally -- never prints as a bare
 /// `unavailable: ` or `would fetch: ` with nothing after the colon.
 fn print_action(dry_run: bool, kind: &str, path: &str) {
-    let path = if kind == "plain" { path } else { display_path(path) };
+    let path = if kind == "plain" {
+        std::borrow::Cow::Borrowed(path)
+    } else {
+        display_path(path)
+    };
+    let path = path.as_ref();
     let colored = color_enabled(ColorChoice::Auto, atty::is(atty::Stream::Stdout));
     let styles = Styles::new();
     let text = match kind {
@@ -1962,6 +1983,12 @@ mod tests {
         assert_eq!(display_path(""), ".");
         assert_eq!(display_path("sub/file.txt"), "sub/file.txt");
         assert_eq!(display_path("."), ".");
+    }
+
+    #[test]
+    fn display_path_escapes_control_characters() {
+        assert_eq!(display_path("a\u{1b}[2Jb"), "a\\x1b[2Jb");
+        assert_eq!(display_path("a\nb"), "a\\nb");
     }
 
     // -----------------------------------------------------------------------

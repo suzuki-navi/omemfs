@@ -201,7 +201,7 @@ pub fn run(opts: ExpandOptions) -> Result<(), Error> {
         match &record.target_type {
             StubTargetType::Tree => {
                 if opts.dry_run {
-                    crate::progress::emit_output_line(&format!("  would expand: {}", rel_path));
+                    crate::progress::emit_output_line(&format!("  would expand: {}", crate::term::escape_display(&rel_path.to_string())));
                     continue;
                 }
                 // The tree object is fetched on demand by expand_tree below.
@@ -240,7 +240,7 @@ pub fn run(opts: ExpandOptions) -> Result<(), Error> {
                 // --dry-run: "show what would be expanded without writing files
                 // or removing stub records").
                 if opts.dry_run {
-                    crate::progress::emit_output_line(&format!("  would expand: {}", rel_path));
+                    crate::progress::emit_output_line(&format!("  would expand: {}", crate::term::escape_display(&rel_path.to_string())));
                     continue;
                 }
 
@@ -301,7 +301,7 @@ pub fn run(opts: ExpandOptions) -> Result<(), Error> {
         // on-disk stub records under --dry-run, so they are not in
         // `to_expand` -- report them here from the phase-0 result directly.
         for rel_path in &dry_run_virtual_targets {
-            crate::progress::emit_output_line(&format!("  would expand: {}", rel_path));
+            crate::progress::emit_output_line(&format!("  would expand: {}", crate::term::escape_display(&rel_path.to_string())));
         }
         let total_would_expand = to_expand.len() + dry_run_virtual_targets.len();
         let summary = if !kept_stubbed.is_empty() {

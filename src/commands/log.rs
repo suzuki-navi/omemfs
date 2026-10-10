@@ -69,21 +69,26 @@ pub fn run_ls(opts: LogLsOptions) -> Result<(), Error> {
     }
     entries.truncate(opts.count);
 
-    let logical_width = entries
+    // Log file names are arbitrary text; escape before measuring the column.
+    let shown: Vec<String> = entries
         .iter()
-        .map(|e| e.logical_name.len())
+        .map(|e| term::escape_display(&e.logical_name).into_owned())
+        .collect();
+    let logical_width = shown
+        .iter()
+        .map(|n| n.chars().count())
         .max()
         .unwrap_or(12)
         .max(12);
 
-    println!("{}:", logs_dir.display());
+    println!("{}:", term::escape_display(&logs_dir.display().to_string()));
     for (i, entry) in entries.iter().enumerate() {
         let latest_marker = if entry.is_latest { "  [latest]" } else { "" };
         println!(
             "  {:>2}  {:<lw$}  {}  {}{}",
             i + 1,
-            entry.logical_name,
-            entry.timestamp,
+            shown[i],
+            term::escape_display(&entry.timestamp),
             fmt_size(entry.size),
             latest_marker,
             lw = logical_width,
@@ -110,11 +115,14 @@ pub fn run_show(opts: LogShowOptions) -> Result<(), Error> {
         {
             continue;
         }
+        // The file may hold raw control characters (older version, hand edit).
+        // The fixed prefix has none, so escaping the whole line is safe.
+        let safe = term::escape_display(raw);
         if use_color {
-            let colored = colorize_prefix(raw, parsed.layer);
+            let colored = colorize_prefix(&safe, parsed.layer);
             println!("{}", colored);
         } else {
-            println!("{}", raw);
+            println!("{}", safe);
         }
     }
     Ok(())
@@ -217,12 +225,14 @@ fn resolve_latest_target(logs_dir: &std::path::Path) -> Option<String> {
 /// Parse "YYYYMMDD-HHMMSS-cmd" stem into "YYYY-MM-DD HH:MM:SS".
 fn parse_timestamp_from_stem(stem: &str) -> String {
     // Expected prefix: YYYYMMDD-HHMMSS
-    if stem.len() < 15 {
+    // The stem is a file name, so it is arbitrary text: use `get` and require
+    // ASCII digits so the fixed-offset slices below can never split a character.
+    let (Some(date), Some(sep), Some(time)) = (stem.get(..8), stem.get(8..9), stem.get(9..15))
+    else {
         return stem.to_string();
-    }
-    let date = &stem[..8];
-    let time = &stem[9..15];
-    if date.len() == 8 && time.len() == 6 && stem.as_bytes()[8] == b'-' {
+    };
+    let all_digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    if sep == "-" && all_digits(date) && all_digits(time) {
         format!(
             "{}-{}-{} {}:{}:{}",
             &date[..4],
@@ -372,11 +382,10 @@ fn layer_matches(layer: &Layer, filter: &[Layer]) -> bool {
 fn colorize_prefix(raw: &str, layer: Layer) -> String {
     // Replace "[omemfs Lx xxx ]" with a coloured version.
     // The prefix is exactly "[omemfs " (8) + 7-char tag + "]" = 16 chars.
-    if raw.len() < 16 {
+    // `get` because byte 16 may fall inside a multi-byte character.
+    let (Some(prefix), Some(rest)) = (raw.get(..16), raw.get(16..)) else {
         return raw.to_string();
-    }
-    let prefix = &raw[..16]; // "[omemfs L1 cmd ]"
-    let rest = &raw[16..];
+    };
     format!("\x1b[{}m{}\x1b[0m{}", layer.color_code(), prefix, rest)
 }
 
@@ -621,6 +630,40 @@ mod tests {
     fn parse_timestamp_short_stem() {
         let ts = parse_timestamp_from_stem("short");
         assert_eq!(ts, "short");
+    }
+
+    #[test]
+    fn parse_timestamp_does_not_panic_on_multibyte_stems() {
+        // The stem is a file name under .omemfs/logs/, so it is arbitrary.
+        for stem in [
+            "2026日本語1-143012-push",
+            "20260522-14😀012-push",
+            "日本語日本語日本語日本語日本語",
+            "2026052😀-143012-push",
+        ] {
+            let _ = parse_timestamp_from_stem(stem);
+        }
+        // Non-date stems come back unchanged.
+        assert_eq!(
+            parse_timestamp_from_stem("日本語日本語日本語日本語日本語"),
+            "日本語日本語日本語日本語日本語"
+        );
+    }
+
+    #[test]
+    fn colorize_prefix_does_not_panic_on_multibyte_lines() {
+        // Byte 16 falls inside a 3-byte character.
+        let line = format!("{}日本語 message", "x".repeat(15));
+        let _ = colorize_prefix(&line, Layer::L1);
+        let line = format!("[omemfs L1 cmd ]{}", "😀");
+        let _ = colorize_prefix(&line, Layer::L1);
+    }
+
+    #[test]
+    fn colorize_prefix_colours_a_normal_prefix() {
+        let s = colorize_prefix("[omemfs L1 cmd ]    +0.001s   x", Layer::L1);
+        assert!(s.starts_with("\x1b[32m[omemfs L1 cmd ]\x1b[0m"));
+        assert!(s.ends_with("    +0.001s   x"));
     }
 
     #[test]

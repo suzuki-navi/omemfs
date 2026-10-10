@@ -21,9 +21,12 @@ handled separately by CAS writes at the remote backend (see `03_sync_model.md`).
 exclusive `flock(2)` on it:
 
 ```
-open(".omemfs/clone_root.lock", O_WRONLY | O_CREAT)
+open(".omemfs/clone_root.lock", O_WRONLY | O_CREAT, 0600)
 flock(fd, LOCK_EX | LOCK_NB)
 ```
+
+The lock file is created with mode `0600` (the diagnostic PID and command name
+are for the owner only). An already existing lock file keeps its mode.
 
 `LOCK_NB` (non-blocking) makes acquisition fail immediately if another process
 holds the lock.  The winning process writes its PID and command name into the

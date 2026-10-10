@@ -113,7 +113,15 @@ omemfs log show [--layer <tag>]... [--grep <pattern>] [REF]
 ### Output
 
 Lines that do not parse as omemfs log lines (i.e. `parse_line` returns `None`)
-are silently skipped.  Matching lines are printed as-is from the log file.
+are silently skipped.  Matching lines are printed as they appear in the log
+file, except that the **message text is escaped for display** (see
+`04_cli_spec.md`, "Terminal output safety"): a log file can contain raw control
+characters (written by an older version, or edited by hand), and `log show`
+must not pass them to the terminal.
+
+`parse_line` and the prefix colouring work on characters, never on fixed byte
+offsets, so a line containing multi-byte characters anywhere (including inside
+the fixed-width prefix region) is skipped or printed but never causes a panic.
 When stdout is a TTY, each line's `[omemfs Lx xxx ]` prefix is coloured using
 the same ANSI codes as the TTY progress view (see `06_progress_view.md`).
 

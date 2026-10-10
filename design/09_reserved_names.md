@@ -89,6 +89,35 @@ For the full specification, see [`03_sync_model.md`](03_sync_model.md).
 
 ---
 
+### `.omemfs-tmp-*` — in-flight write staging
+
+`.omemfs-tmp-<pid>-<nanos>-<counter>` is the temporary sibling that `fsguard`
+creates next to the destination while it writes a working-tree file (or symlink)
+and then renames it into place (design/03 "Write safety: the working-tree write
+boundary"). It normally exists for a fraction of a second. If the process is
+killed in that window it is left behind.
+
+Because it lives in the working tree, it must never be mistaken for user
+content:
+
+- **Not tracked**: excluded from working-tree scans, silently (no "unknown
+  reserved file" warning), so a leftover is never uploaded by `push` and never
+  shown by `ls`.
+- `restore` treats a leftover as omemfs-internal residue and removes it
+  silently, without a `deleted:` line, like a stub marker or conflict helper.
+- `stats` does not count it.
+- **Stale sweep**: the first time a process writes into a directory, it removes
+  any `.omemfs-tmp-*` file in that directory that is more than 24 hours old.
+  Once per directory per process, not once per write, so writing many files
+  into one large directory stays linear. Fresh ones are left alone: they may
+  belong to a concurrent writer.
+
+Temporary files under `.omemfs/` (objects, `STAT_CACHE`, `config`, ...) keep the
+`.tmp` prefix used by `tempfile`; they are inside the metadata directory, which
+is never scanned.
+
+---
+
 ### `.omemfs-filter` — filter configuration
 
 A tracked configuration file that controls two aspects of working tree handling
@@ -127,6 +156,7 @@ The working tree scan (`scan_and_store`) always excludes:
 - `.omemfs/` — the metadata directory
 - `*.omemfs-stub` / `.omemfs-stub` — stub markers (handled separately)
 - `*.omemfs-conflict-base` / `*.omemfs-conflict-local` / `*.omemfs-conflict-remote` — conflict helpers
+- `.omemfs-tmp-*` — in-flight write staging files left by an interrupted write
 
 These exclusions are hard-coded and apply regardless of `.omemfs-filter` settings.
 

@@ -73,9 +73,10 @@ fn is_symlink_like(e: &io::Error) -> bool {
 /// `rand` needed for this).
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Build a unique `.tmp`-prefixed sibling filename. `.tmp` is the prefix
-/// `store::local::sweep_stale_temp_files` matches, so a crash leftover here is
-/// still swept the same way local cache writes already are.
+/// Build a unique staging sibling filename in the reserved `.omemfs-` namespace
+/// (design/09 "`.omemfs-tmp-*`"). The name lives in the working tree, so a
+/// leftover from an interrupted write must be excluded from every scan rather
+/// than pushed as content; a generic `.tmp` prefix would not be.
 fn temp_name() -> String {
     let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
@@ -83,7 +84,27 @@ fn temp_name() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!(".tmp{:x}-{:x}-{:x}", pid, nanos, n)
+    format!(
+        "{}{:x}-{:x}-{:x}",
+        crate::object::WORKING_TREE_TMP_PREFIX,
+        pid,
+        nanos,
+        n
+    )
+}
+
+/// How old a staging file must be before the sweep removes it. Younger ones may
+/// belong to a concurrent writer.
+const STALE_TMP_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Directories (by device and inode) already swept by this process, so a run
+/// that writes many files into one directory sweeps it once, not once per write.
+/// Keyed by identity, not by path: the same directory reached through a symlinked
+/// `work_dir` is still one directory.
+fn sweep_gate() -> &'static std::sync::Mutex<std::collections::HashSet<(u64, u64)>> {
+    static GATE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(u64, u64)>>> =
+        std::sync::OnceLock::new();
+    GATE.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
 }
 
 // ---------------------------------------------------------------------------
@@ -330,7 +351,74 @@ impl GuardedDir {
         Ok(unsafe { std::fs::File::from_raw_fd(fd) })
     }
 
-    /// openat(O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW) a ".tmp"-prefixed sibling
+    /// (device, inode) of this directory itself, via fstat on the verified fd.
+    fn identity(&self) -> Result<(u64, u64), Error> {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `st` is zero-initialised stack storage for `fstat` to fill in
+        // and `self.fd` is a valid open directory fd.
+        let ret = unsafe { libc::fstat(self.fd.as_raw_fd(), &mut st) };
+        if ret != 0 {
+            return Err(Error::Io(io::Error::last_os_error()));
+        }
+        Ok((st.st_dev as u64, st.st_ino as u64))
+    }
+
+    /// Remove `.omemfs-tmp-*` staging leftovers in this directory that are at
+    /// least `max_age` old (design/09 "`.omemfs-tmp-*`"). Only regular files and
+    /// symlinks are removed, and a symlink is unlinked, never followed;
+    /// directories and every other name are left alone. Best-effort per entry:
+    /// one that cannot be inspected or removed is skipped.
+    fn sweep_stale_tmp(&self, max_age: std::time::Duration) -> Result<(), Error> {
+        let now = std::time::SystemTime::now();
+        for (name, _d_type) in self.list_entries()? {
+            if !crate::object::is_working_tree_tmp(&name) {
+                continue;
+            }
+            let c_name = to_cstring(&name)?;
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: as `lstat_mode`: zeroed storage, valid dir fd, validated
+            // `/`-free component. AT_SYMLINK_NOFOLLOW inspects a symlink itself.
+            let ret = unsafe {
+                libc::fstatat(
+                    self.fd.as_raw_fd(),
+                    c_name.as_ptr(),
+                    &mut st,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if ret != 0 {
+                continue;
+            }
+            let fmt = st.st_mode as u32 & libc::S_IFMT as u32;
+            if fmt != libc::S_IFREG as u32 && fmt != libc::S_IFLNK as u32 {
+                continue;
+            }
+            let mtime = std::time::UNIX_EPOCH
+                + std::time::Duration::new(st.st_mtime.max(0) as u64, st.st_mtime_nsec.max(0) as u32);
+            match now.duration_since(mtime) {
+                Ok(age) if age >= max_age => {
+                    let _ = self.unlinkat(&name);
+                }
+                _ => {} // fresh, or mtime in the future: treat as live
+            }
+        }
+        Ok(())
+    }
+
+    /// Sweep this directory once per process (see [`sweep_gate`]). Never fails
+    /// the write that triggered it: housekeeping must not break a real write.
+    fn sweep_stale_tmp_once(&self) {
+        let Ok(id) = self.identity() else { return };
+        let first = sweep_gate()
+            .lock()
+            .map(|mut g| g.insert(id))
+            .unwrap_or(false);
+        if first {
+            let _ = self.sweep_stale_tmp(STALE_TMP_MAX_AGE);
+        }
+    }
+
+    /// openat(O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW) a reserved-name staging sibling
     /// of `name` in this directory, run `write_fn` against it, then
     /// renameat() it onto `name`. No fsync -- mirrors
     /// `store::local::atomic_write_with_no_fsync`. On any error from
@@ -341,6 +429,7 @@ impl GuardedDir {
         F: FnOnce(&mut dyn std::io::Write) -> Result<(), Error>,
     {
         validate_component(name)?;
+        self.sweep_stale_tmp_once();
         let tmp = temp_name();
         let file = self.open_tmp_file(&tmp)?;
         let result: Result<(), Error> = (|| {
@@ -365,6 +454,7 @@ impl GuardedDir {
     /// `store::local::atomic_write`.
     pub fn atomic_write_durable(&self, name: &str, data: &[u8]) -> Result<(), Error> {
         validate_component(name)?;
+        self.sweep_stale_tmp_once();
         let tmp = temp_name();
         let file = self.open_tmp_file(&tmp)?;
         let result: Result<(), Error> = (|| {
@@ -399,6 +489,7 @@ impl GuardedDir {
         {
             let _ = self.rmdir(name);
         }
+        self.sweep_stale_tmp_once();
         let tmp = temp_name();
         self.symlinkat(target, &tmp)?;
         if let Err(e) = self.renameat_within(&tmp, name) {
@@ -1049,6 +1140,141 @@ mod tests {
                 .collect();
             assert!(leftovers.is_empty(), "unexpected temp leftovers: {leftovers:?}");
         }
+    }
+
+    // ---- Working-tree staging names and stale sweep (design/09) -------------
+
+    fn age(path: &Path, secs: u64) {
+        let t = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+        filetime::set_symlink_file_times(
+            path,
+            FileTime::from_system_time(t),
+            FileTime::from_system_time(t),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn temp_names_are_reserved_and_unique() {
+        let a = temp_name();
+        let b = temp_name();
+        assert!(a.starts_with(".omemfs-tmp-"), "{a}");
+        assert!(crate::object::is_working_tree_tmp(&a));
+        assert!(crate::object::is_reserved_name(&a));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn a_write_stages_through_a_reserved_name() {
+        // While write_fn runs, the only extra entry in the directory is the
+        // staging file, and its name must be in the reserved namespace.
+        let work_dir = TempDir::new().unwrap();
+        let abs = work_dir.path().join("f.txt");
+        let dir_path = work_dir.path().to_path_buf();
+        let seen: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        atomic_write_with(work_dir.path(), &abs, |w| {
+            w.write_all(b"x").map_err(Error::Io)?;
+            w.flush().map_err(Error::Io)?;
+            for e in fs::read_dir(&dir_path).unwrap().flatten() {
+                seen.lock().unwrap().push(e.file_name().to_string_lossy().into_owned());
+            }
+            Ok(())
+        })
+        .unwrap();
+        let seen = seen.into_inner().unwrap();
+        assert!(
+            seen.iter().any(|n| n.starts_with(".omemfs-tmp-")),
+            "staging file must be reserved-named: {seen:?}"
+        );
+        assert!(!seen.iter().any(|n| n.starts_with(".tmp")), "{seen:?}");
+    }
+
+    #[test]
+    fn sweep_removes_only_old_staging_files() {
+        let work_dir = TempDir::new().unwrap();
+        let d = work_dir.path();
+        fs::write(d.join(".omemfs-tmp-old"), b"x").unwrap();
+        fs::write(d.join(".omemfs-tmp-fresh"), b"x").unwrap();
+        fs::write(d.join("user-old.txt"), b"x").unwrap();
+        fs::write(d.join(".tmp-user-file"), b"x").unwrap();
+        fs::create_dir(d.join(".omemfs-tmp-dir")).unwrap();
+        age(&d.join(".omemfs-tmp-old"), 25 * 3600);
+        age(&d.join("user-old.txt"), 25 * 3600);
+        age(&d.join(".tmp-user-file"), 25 * 3600);
+        age(&d.join(".omemfs-tmp-dir"), 25 * 3600);
+
+        let dir = resolve_dir(d, "", false).unwrap();
+        dir.sweep_stale_tmp(std::time::Duration::from_secs(24 * 3600)).unwrap();
+
+        assert!(!d.join(".omemfs-tmp-old").exists(), "old staging file is swept");
+        assert!(d.join(".omemfs-tmp-fresh").exists(), "fresh one may belong to a live writer");
+        assert!(d.join("user-old.txt").exists(), "user files are never touched");
+        assert!(d.join(".tmp-user-file").exists(), "a user's .tmp* file is not ours");
+        assert!(d.join(".omemfs-tmp-dir").is_dir(), "a directory is never removed");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sweep_removes_an_old_staging_symlink_without_following_it() {
+        let work_dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::write(outside.path().join("target"), b"keep").unwrap();
+        let d = work_dir.path();
+        std::os::unix::fs::symlink(outside.path().join("target"), d.join(".omemfs-tmp-link")).unwrap();
+        age(&d.join(".omemfs-tmp-link"), 25 * 3600);
+
+        let dir = resolve_dir(d, "", false).unwrap();
+        dir.sweep_stale_tmp(std::time::Duration::from_secs(24 * 3600)).unwrap();
+
+        assert!(d.join(".omemfs-tmp-link").symlink_metadata().is_err());
+        assert_eq!(fs::read(outside.path().join("target")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn writes_sweep_a_directory_once_per_process_not_once_per_write() {
+        let work_dir = TempDir::new().unwrap();
+        let d = work_dir.path();
+        // Unique directory name so no other test has swept it.
+        let sub = d.join("sweep-once-dir");
+        fs::create_dir(&sub).unwrap();
+
+        // First write into the directory: sweeps, so the old file goes.
+        fs::write(sub.join(".omemfs-tmp-first"), b"x").unwrap();
+        age(&sub.join(".omemfs-tmp-first"), 25 * 3600);
+        atomic_write_with(d, &sub.join("a.txt"), |w| w.write_all(b"1").map_err(Error::Io)).unwrap();
+        assert!(!sub.join(".omemfs-tmp-first").exists());
+
+        // Second write: no second sweep, so a newly planted old file stays.
+        fs::write(sub.join(".omemfs-tmp-second"), b"x").unwrap();
+        age(&sub.join(".omemfs-tmp-second"), 25 * 3600);
+        atomic_write_with(d, &sub.join("b.txt"), |w| w.write_all(b"2").map_err(Error::Io)).unwrap();
+        assert!(
+            sub.join(".omemfs-tmp-second").exists(),
+            "the sweep must not run again for the same directory"
+        );
+    }
+
+    #[test]
+    fn the_sweep_gate_is_keyed_by_directory_identity_not_a_lexical_path() {
+        // The same directory reached through a symlinked work_dir is one
+        // directory, so it is swept once, not once per spelling.
+        let real = TempDir::new().unwrap();
+        let link_parent = TempDir::new().unwrap();
+        let link = link_parent.path().join("via-link");
+        std::os::unix::fs::symlink(real.path(), &link).unwrap();
+
+        fs::write(real.path().join(".omemfs-tmp-a"), b"x").unwrap();
+        age(&real.path().join(".omemfs-tmp-a"), 25 * 3600);
+        atomic_write_with(real.path(), &real.path().join("f1"), |w| w.write_all(b"1").map_err(Error::Io)).unwrap();
+        assert!(!real.path().join(".omemfs-tmp-a").exists());
+
+        fs::write(real.path().join(".omemfs-tmp-b"), b"x").unwrap();
+        age(&real.path().join(".omemfs-tmp-b"), 25 * 3600);
+        atomic_write_with(&link, &link.join("f2"), |w| w.write_all(b"2").map_err(Error::Io)).unwrap();
+        assert!(
+            real.path().join(".omemfs-tmp-b").exists(),
+            "same directory via another path must not be swept again"
+        );
     }
 
     #[test]

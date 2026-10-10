@@ -42,6 +42,10 @@ pub struct ScannedFile {
     /// and a cache hit with `blob_sealed = true` gets `mark_sealed` (design/07
     /// "Usage in scan_and_store").
     pub blob_sealed: bool,
+    /// When this scan observed the file (the scan's start time). STAT_CACHE
+    /// judges racy-clean against this, never against the clock at writeback
+    /// (design/07 "Racily clean detection").
+    pub observed_at: SystemTime,
 }
 
 /// Side data collected while walking the working tree during a scan.
@@ -70,6 +74,16 @@ pub struct ScanSideData {
     /// Paths that could not be captured because they disappeared or remained
     /// active during this scan. Push preserves their previous tree entries.
     pub unstable_paths: HashSet<String>,
+    /// Paths the scan saw that are not regular files it hashed: symlinks and
+    /// directories (including stubbed ones), and stub-only names. `pull`
+    /// re-checks a path right before overwriting it (design/03, "Re-verifying a
+    /// path immediately before it is overwritten") and needs to tell "the scan
+    /// saw a symlink here" from "the scan saw nothing here".
+    pub seen_other: HashSet<String>,
+    /// Logical paths that had a file stub (`<name>.omemfs-stub`) and no real file
+    /// at scan time. The real file is absent by design, so `pull` expects it to
+    /// stay absent (design/03, "A file stub is a path with no file on disk").
+    pub seen_stub: HashSet<String>,
 }
 
 /// Result of `scan_and_store_with_cache`. Returns the root tree hash together
@@ -277,9 +291,9 @@ fn scan_thread_count() -> usize {
 /// Apply one scan's per-file results onto `cache`: a cache miss (including a
 /// clone-root fallback hit) is recorded with a fresh `update`, and a cache hit
 /// whose local blob was written or verified this scan (`blob_sealed`) gets
-/// `mark_sealed`. Shared by `refresh_stat_cache`, `refresh_stat_cache_scoped`,
-/// and `push`'s multi-path scoped loop so the writeback logic cannot drift
-/// across call sites (design/07 "Usage in scan_and_store").
+/// `mark_sealed`. Shared by `refresh_stat_cache` and `push`'s multi-path
+/// scoped loop so the writeback logic cannot drift across call sites
+/// (design/07 "Usage in scan_and_store").
 pub fn apply_scanned(cache: &mut StatCache, files: &HashMap<String, ScannedFile>) {
     for (path, scanned) in files {
         if !scanned.cache_hit {
@@ -297,6 +311,7 @@ pub fn apply_scanned(cache: &mut StatCache, files: &HashMap<String, ScannedFile>
                 scanned.fs_size,
                 scanned.hash.clone(),
                 scanned.blob_sealed,
+                scanned.observed_at,
             );
         } else if scanned.blob_sealed {
             // A direct STAT_CACHE hit whose local blob this scan wrote or
@@ -326,35 +341,16 @@ pub fn refresh_stat_cache(
     // STAT_CACHE is a pure acceleration cache (design/07): a write failure must
     // not abort the command. Emit a warning and continue. The write is skipped
     // entirely when nothing changed since load (no-change scans do not rewrite
-    // the cache file).
-    if let Err(e) = cache.write_if_dirty(omemfs_dir) {
-        eprintln!(
-            "warning: failed to write STAT_CACHE (acceleration cache): {}",
-            e
-        );
-    }
-}
-
-/// Like [`refresh_stat_cache`], but for a scope-limited scan: `cache` was loaded
-/// via [`StatCache::read_scoped`] with `scope_prefix` and therefore holds only
-/// the in-scope entries. The writeback re-reads the full file fresh and overlays
-/// the in-scope updates so out-of-scope entries survive byte-for-byte
-/// (design/07 "Read optimisation: scope-limited load").
-///
-/// Only used by `ls` (always a read-only, `write_blobs = false` scan), so
-/// there is no `write_blobs` parameter and no seal-epoch rotation here; the
-/// loaded `seal_epoch` is carried forward unchanged by `write_scoped_merge`.
-pub fn refresh_stat_cache_scoped(
-    mut cache: StatCache,
-    files: &HashMap<String, ScannedFile>,
-    omemfs_dir: &std::path::Path,
-    scope_prefix: &str,
-) {
-    apply_scanned(&mut cache, files);
-    // STAT_CACHE is a pure acceleration cache (design/07): a write failure must
-    // not abort the command. The merge re-reads the full file and overlays the
-    // in-scope updates; a no-change scoped scan skips the write entirely.
-    if let Err(e) = cache.write_scoped_merge(omemfs_dir, scope_prefix) {
+    // the cache file). A blob-writing scan holds the repository lock and writes
+    // its whole cache; a read-only scan may run without the lock (`ls`), so it
+    // merges only its own changes into a fresh copy (design/07 "Read-only
+    // writeback without the lock").
+    let written = if write_blobs {
+        cache.write_if_dirty(omemfs_dir)
+    } else {
+        cache.write_readonly_merge(omemfs_dir)
+    };
+    if let Err(e) = written {
         eprintln!(
             "warning: failed to write STAT_CACHE (acceleration cache): {}",
             e
@@ -404,6 +400,8 @@ fn merge_child(files: &mut HashMap<String, ScannedFile>, side: &mut ScanSideData
     side.ignored.extend(child.side.ignored);
     side.unknown_reserved.extend(child.side.unknown_reserved);
     side.unstable_paths.extend(child.side.unstable_paths);
+    side.seen_other.extend(child.side.seen_other);
+    side.seen_stub.extend(child.side.seen_stub);
 }
 
 /// Scan one directory level, building and storing its tree object and returning
@@ -465,6 +463,12 @@ fn scan_dir(
                         let rel = join_rel(rel_prefix, base);
                         side.conflict_paths.insert(rel);
                     }
+                    continue;
+                }
+                // An fsguard staging file (an in-flight or interrupted write) is
+                // omemfs-internal residue: skip it silently, never as content
+                // (design/09 "`.omemfs-tmp-*`").
+                if crate::object::is_working_tree_tmp(&n) {
                     continue;
                 }
                 // Unknown reserved name (produced by a newer omemfs version): warn
@@ -574,6 +578,7 @@ fn scan_dir(
                     // The real file is present iff this logical name carried a
                     // real DirEntry (set membership, no statx).
                     if real_entry.is_none() {
+                        side.seen_stub.insert(rel_path.clone());
                         entries.push(TreeEntry::Blob {
                             name,
                             hash: record.hash,
@@ -647,12 +652,14 @@ fn scan_dir(
                 Err(e) => return Err(Error::Io(e)),
             };
             let mtime = system_time_to_datetime(metadata.modified().ok());
+            side.seen_other.insert(rel_path.clone());
             entries.push(TreeEntry::Symlink {
                 name,
                 target,
                 mtime,
             });
         } else if ftype.is_dir() {
+            side.seen_other.insert(rel_path.clone());
             match classify_dir_stub(&child, &rel_path, &mut side)? {
                 // Fully stubbed: use the recorded tree hash directly without
                 // scanning the subtree.
@@ -1026,6 +1033,7 @@ fn process_file_job(job: &FileJob, cfg: &FileJobConfig<'_>) -> Result<FileJobRes
             // short-circuits otherwise). A read-only scan never checked, so
             // it is not sealed.
             blob_sealed: cfg.write_blobs,
+            observed_at: cfg.now,
         };
         let entry = TreeEntry::Blob {
             name,
@@ -1066,6 +1074,7 @@ fn process_file_job(job: &FileJob, cfg: &FileJobConfig<'_>) -> Result<FileJobRes
                     // Present exactly when write_blobs is true (the && chain
                     // above required blob_fully_cached() == true in that case).
                     blob_sealed: cfg.write_blobs,
+                    observed_at: cfg.now,
                 },
             )
         });
@@ -1140,6 +1149,7 @@ fn process_file_job(job: &FileJob, cfg: &FileJobConfig<'_>) -> Result<FileJobRes
                 // write_blobs is true (store_file_snapshot); a read-only scan
                 // never writes it.
                 blob_sealed: cfg.write_blobs,
+                observed_at: cfg.now,
             },
         )
     });
@@ -1345,6 +1355,7 @@ pub fn is_reserved_name(name: &str) -> bool {
 pub fn is_known_reserved_name(name: &str) -> bool {
     stub::is_stub_filename(name)
         || crate::object::is_conflict_artifact(name)
+        || crate::object::is_working_tree_tmp(name)
         || name == ".omemfs-filter"
 }
 
@@ -1377,7 +1388,7 @@ fn warn_unknown_reserved(rel: &str) {
     {
         eprintln!(
             "warning: unknown reserved file '{}' produced by a newer omemfs version; skipping",
-            rel
+            crate::term::escape_display(rel)
         );
     }
 }
@@ -1399,6 +1410,7 @@ mod tests {
     use crate::store::local::LocalStore;
     use crate::tree_ops;
     use std::fs;
+    use std::time::Duration;
 
     /// Deterministic pseudo-random byte generator (xorshift64*), mirroring
     /// `codec::chunk`'s test helper of the same name. Only needs to be
@@ -1589,6 +1601,7 @@ mod tests {
                     sf.fs_size,
                     sf.hash.clone(),
                     sf.blob_sealed,
+                    sf.observed_at,
                 );
             }
         }
@@ -1942,6 +1955,116 @@ mod tests {
         }
         cache.write_if_dirty(omemfs_dir).unwrap();
         result
+    }
+
+    #[test]
+    fn a_leftover_working_tree_staging_file_is_not_scanned_or_reported() {
+        // Regression (review R6): an interrupted fsguard write leaves its
+        // staging file in the working tree; it must not be pushed as content,
+        // and must not surface as an "unknown reserved file" either.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let work = tmp.path();
+        fs::write(work.join("real.txt"), b"x").unwrap();
+        fs::write(work.join(".omemfs-tmp-1a-2b-0"), b"half-written").unwrap();
+        fs::create_dir(work.join("sub")).unwrap();
+        fs::write(work.join("sub/.omemfs-tmp-9-9-9"), b"half").unwrap();
+        fs::write(work.join("sub/kept.txt"), b"y").unwrap();
+        let store = LocalStore::for_cache(work.join(".omemfs/objects"));
+
+        let result = scan_and_store_with_cache(
+            work,
+            work,
+            &store,
+            None,
+            &StatCache::default(),
+            false,
+        )
+        .unwrap();
+
+        let mut names: Vec<&String> = result.files.keys().collect();
+        names.sort();
+        assert_eq!(names, vec!["real.txt", "sub/kept.txt"]);
+        assert!(
+            result.side.unknown_reserved.is_empty(),
+            "a staging file is a known reserved kind, not a newer-version artefact: {:?}",
+            result.side.unknown_reserved
+        );
+    }
+
+    #[test]
+    fn staging_names_are_a_known_reserved_kind() {
+        assert!(is_known_reserved_name(".omemfs-tmp-1-2-3"));
+        assert!(!is_unknown_reserved_name(".omemfs-tmp-1-2-3"));
+        // A different .omemfs- kind is still unknown (forward compatibility).
+        assert!(is_unknown_reserved_name(".omemfs-newkind"));
+    }
+
+    #[test]
+    fn scanned_files_carry_the_scan_start_time_as_their_observation_time() {
+        // Regression (review R2): the racy-clean decision must use when the file
+        // was observed (scan start), not the clock at STAT_CACHE writeback.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let work = tmp.path();
+        fs::write(work.join("a.txt"), b"x").unwrap();
+        let store = LocalStore::for_cache(work.join(".omemfs/objects"));
+
+        let before = SystemTime::now();
+        let result = scan_and_store_with_cache(
+            work,
+            work,
+            &store,
+            None,
+            &StatCache::default(),
+            false,
+        )
+        .unwrap();
+        let after = SystemTime::now();
+
+        let sf = &result.files["a.txt"];
+        assert!(
+            sf.observed_at >= before && sf.observed_at <= after,
+            "observed_at must be a time within the scan"
+        );
+    }
+
+    #[test]
+    fn apply_scanned_uses_the_observation_time_not_the_current_clock() {
+        // A file modified "now" but observed by a scan that started 10 minutes
+        // ago would be judged safe by a writeback-time clock. Observation time
+        // is authoritative, so an observation right at the mtime stays racy,
+        // and an observation long after the mtime is safe -- independent of when
+        // apply_scanned runs.
+        let mtime_racy = SystemTime::now();
+        let mut files = HashMap::new();
+        files.insert(
+            "racy".to_string(),
+            ScannedFile {
+                fs_mtime: mtime_racy,
+                fs_size: 1,
+                hash: crate::object::blob_hash(b"r"),
+                cache_hit: false,
+                fallback_hit: false,
+                blob_sealed: false,
+                observed_at: mtime_racy,
+            },
+        );
+        let old = SystemTime::now() - Duration::from_secs(3_600);
+        files.insert(
+            "stable".to_string(),
+            ScannedFile {
+                fs_mtime: old,
+                fs_size: 1,
+                hash: crate::object::blob_hash(b"s"),
+                cache_hit: false,
+                fallback_hit: false,
+                blob_sealed: false,
+                observed_at: old + Duration::from_secs(10),
+            },
+        );
+        let mut cache = StatCache::default();
+        apply_scanned(&mut cache, &files);
+        assert!(cache.lookup_current("racy", mtime_racy, 1).is_none());
+        assert!(cache.lookup_current("stable", old, 1).is_some());
     }
 
     /// Run `f` with `OMEMFS_SEAL_SAMPLE=0` (sampling disabled) for its

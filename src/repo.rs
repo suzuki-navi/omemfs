@@ -29,10 +29,35 @@ pub struct Config {
 /// Per-remote encryption settings. The DEK is a randomly generated 32-byte
 /// value stored as base64. It is kept in the local config only; the remote
 /// backend never receives the plaintext DEK.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct EncryptionConfig {
     pub algorithm: String,
     pub dek: String, // base64-encoded 32 bytes
+}
+
+/// Secrets are never printed (design/02 "Credential management").
+const REDACTED: &str = "<redacted>";
+
+/// `Debug` view of an optional secret: `Some(<redacted>)` / `None`, so an unset
+/// credential stays distinguishable from a set one.
+struct RedactedOpt<'a>(&'a Option<String>);
+
+impl std::fmt::Debug for RedactedOpt<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(_) => write!(f, "Some({REDACTED})"),
+            None => write!(f, "None"),
+        }
+    }
+}
+
+impl std::fmt::Debug for EncryptionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncryptionConfig")
+            .field("algorithm", &self.algorithm)
+            .field("dek", &format_args!("{REDACTED}"))
+            .finish()
+    }
 }
 
 impl EncryptionConfig {
@@ -65,7 +90,7 @@ impl EncryptionConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum RemoteConfig {
     Local {
@@ -125,6 +150,76 @@ pub enum RemoteConfig {
         #[serde(skip_serializing_if = "Option::is_none")]
         encryption: Option<EncryptionConfig>,
     },
+}
+
+impl std::fmt::Debug for RemoteConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RemoteConfig::Local { path, encryption } => f
+                .debug_struct("Local")
+                .field("path", path)
+                .field("encryption", encryption)
+                .finish(),
+            RemoteConfig::S3 {
+                bucket,
+                region,
+                prefix,
+                access_key_id,
+                secret_access_key,
+                endpoint,
+                force_path_style,
+                encryption,
+            } => f
+                .debug_struct("S3")
+                .field("bucket", bucket)
+                .field("region", region)
+                .field("prefix", prefix)
+                .field("access_key_id", &RedactedOpt(access_key_id))
+                .field("secret_access_key", &RedactedOpt(secret_access_key))
+                .field("endpoint", endpoint)
+                .field("force_path_style", force_path_style)
+                .field("encryption", encryption)
+                .finish(),
+            RemoteConfig::Azure {
+                account,
+                container,
+                prefix,
+                tenant_id,
+                client_id,
+                client_secret: _,
+                endpoint,
+                encryption,
+            } => f
+                .debug_struct("Azure")
+                .field("account", account)
+                .field("container", container)
+                .field("prefix", prefix)
+                .field("tenant_id", tenant_id)
+                .field("client_id", client_id)
+                .field("client_secret", &format_args!("{REDACTED}"))
+                .field("endpoint", endpoint)
+                .field("encryption", encryption)
+                .finish(),
+            RemoteConfig::Gcs {
+                bucket,
+                prefix,
+                project_id,
+                credentials_json_path,
+                credentials_json,
+                endpoint,
+                encryption,
+            } => f
+                .debug_struct("Gcs")
+                .field("bucket", bucket)
+                .field("prefix", prefix)
+                .field("project_id", project_id)
+                .field("credentials_json_path", credentials_json_path)
+                .field("credentials_json", &RedactedOpt(credentials_json))
+                .field("endpoint", endpoint)
+                .field("encryption", encryption)
+                .finish(),
+        }
+    }
 }
 
 impl RemoteConfig {
@@ -208,7 +303,17 @@ impl Repo {
     pub fn init(work_dir: impl Into<PathBuf>, config: Config) -> Result<Self, Error> {
         let work_dir = work_dir.into();
         let omemfs_dir = work_dir.join(OMEMFS_DIR);
-        fs::create_dir_all(&omemfs_dir)?;
+        // `.omemfs/` holds the DEK and logs: create it 0700 (design/02 "Local
+        // directory permissions"). Only the directory omemfs itself creates is
+        // restricted; a pre-existing directory keeps its mode.
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&omemfs_dir)?;
         fs::create_dir_all(omemfs_dir.join(OBJECTS_DIR))?;
         fs::create_dir_all(omemfs_dir.join(TMP_DIR))?;
 
@@ -882,6 +987,109 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_creates_private_omemfs_dir_and_files_regardless_of_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        // umask 000 would make a umask-derived mode 0755/0644; the modes must
+        // be explicit instead.
+        let config = Config::new(
+            "origin",
+            RemoteConfig::Local {
+                path: "/tmp/x".to_string(),
+                encryption: None,
+            },
+        );
+        let repo =
+            crate::test_umask::with_umask(0o000, || Repo::init(tmp.path(), config).unwrap());
+
+        let mode_of = |p: std::path::PathBuf| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode_of(repo.omemfs_dir()), 0o700, ".omemfs/ must be 0700");
+        assert_eq!(mode_of(repo.omemfs_dir().join("config")), 0o600);
+    }
+
+    #[test]
+    fn debug_output_never_contains_credentials() {
+        let enc = EncryptionConfig {
+            algorithm: "aes-256-gcm".to_string(),
+            dek: "SUPER-SECRET-DEK".to_string(),
+        };
+        let s3 = RemoteConfig::S3 {
+            bucket: "my-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            prefix: "p".to_string(),
+            access_key_id: Some("AKIAACCESSKEYID".to_string()),
+            secret_access_key: Some("SECRETACCESSKEYVALUE".to_string()),
+            endpoint: None,
+            force_path_style: None,
+            encryption: Some(enc.clone()),
+        };
+        let azure = RemoteConfig::Azure {
+            account: "acct".to_string(),
+            container: "c".to_string(),
+            prefix: "p".to_string(),
+            tenant_id: "tenant".to_string(),
+            client_id: "client".to_string(),
+            client_secret: "AZURECLIENTSECRET".to_string(),
+            endpoint: None,
+            encryption: None,
+        };
+        let gcs = RemoteConfig::Gcs {
+            bucket: "b".to_string(),
+            prefix: "p".to_string(),
+            project_id: None,
+            credentials_json_path: Some("/path/to/sa.json".to_string()),
+            credentials_json: Some("{\"private_key\":\"GCSPRIVATEKEY\"}".to_string()),
+            endpoint: None,
+            encryption: None,
+        };
+        let mut remotes = std::collections::HashMap::new();
+        remotes.insert("a".to_string(), s3.clone());
+        remotes.insert("b".to_string(), azure.clone());
+        remotes.insert("c".to_string(), gcs.clone());
+        let config = Config {
+            version: "2.0".to_string(),
+            remotes,
+        };
+
+        let dump = format!("{:?} {:#?} {:?} {:?} {:?}", config, config, enc, s3, azure)
+            + &format!("{:?}", gcs);
+        for secret in [
+            "SUPER-SECRET-DEK",
+            "AKIAACCESSKEYID",
+            "SECRETACCESSKEYVALUE",
+            "AZURECLIENTSECRET",
+            "GCSPRIVATEKEY",
+        ] {
+            assert!(!dump.contains(secret), "Debug output leaked {secret}: {dump}");
+        }
+        assert!(dump.contains("<redacted>"));
+        // Non-secret fields stay visible so Debug remains useful.
+        assert!(dump.contains("my-bucket"));
+        assert!(dump.contains("us-east-1"));
+        assert!(dump.contains("/path/to/sa.json"));
+        assert!(dump.contains("aes-256-gcm"));
+    }
+
+    #[test]
+    fn debug_of_absent_secrets_is_not_shown_as_redacted() {
+        // An unset optional secret must stay distinguishable from a set one.
+        let s3 = RemoteConfig::S3 {
+            bucket: "b".to_string(),
+            region: "r".to_string(),
+            prefix: "p".to_string(),
+            access_key_id: None,
+            secret_access_key: None,
+            endpoint: None,
+            force_path_style: None,
+            encryption: None,
+        };
+        let dump = format!("{:?}", s3);
+        assert!(!dump.contains("<redacted>"), "{dump}");
+        assert!(dump.contains("None"));
     }
 
     #[test]

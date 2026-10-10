@@ -1006,3 +1006,148 @@ make_conflict() {
 
     rm -rf "$clone2"
 }
+
+# ---------------------------------------------------------------------------
+# The sidecar records which sides exist (design/03_sync_model.md, "The sidecar
+# records which sides exist"). accept-* decides from the recorded `sides`, not
+# from helper-file presence alone, and refuses to guess when the helpers on
+# disk contradict it.
+# ---------------------------------------------------------------------------
+
+# Create a genuine edit-vs-edit conflict on file.txt in the current clone.
+make_genuine_conflict() {
+    local clone2
+    clone2="$(mktemp -d)"
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" "$clone2"
+    [ "$status" -eq 0 ]
+    echo "local change" > file.txt
+    (cd "$clone2" && echo "remote change" > file.txt && "$OMEMFS" push)
+    run "$OMEMFS" pull
+    [ "$status" -ne 0 ]
+    rm -rf "$clone2"
+}
+
+# Create a genuine local-edit vs remote-delete conflict on file.txt.
+make_remote_delete_conflict() {
+    local clone2
+    clone2="$(mktemp -d)"
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" "$clone2"
+    [ "$status" -eq 0 ]
+    echo "local change" > file.txt
+    (cd "$clone2" && rm file.txt && "$OMEMFS" push)
+    run "$OMEMFS" pull
+    [ "$status" -ne 0 ]
+    rm -rf "$clone2"
+}
+
+@test "conflict: pull records which sides exist in the metadata sidecar" {
+    make_genuine_conflict
+    [ -f file.txt.omemfs-conflict-meta ]
+    grep -q '"sides"' file.txt.omemfs-conflict-meta
+    ! grep -q '"remote": false' file.txt.omemfs-conflict-meta
+}
+
+@test "conflict accept-remote: aborts without changes when a recorded remote helper is missing" {
+    make_genuine_conflict
+    rm file.txt.omemfs-conflict-remote
+
+    run "$OMEMFS" conflict accept-remote file.txt
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"inconsistent"* ]]
+    [[ "$output" == *"file.txt"* ]]
+
+    # Nothing was touched: the working file (which accept-remote would have
+    # deleted as a "missing side") and every remaining artifact are intact.
+    [ "$(cat file.txt)" = "local change" ]
+    [ -f file.txt.omemfs-conflict-local ]
+    [ -f file.txt.omemfs-conflict-base ]
+    [ -f file.txt.omemfs-conflict-meta ]
+
+    # Nor was clone_root advanced: pulling again still reports the conflict.
+    run "$OMEMFS" pull
+    [ "$status" -ne 0 ]
+}
+
+@test "conflict accept-local: aborts without changes when a recorded local helper is missing" {
+    make_genuine_conflict
+    rm file.txt.omemfs-conflict-local
+
+    run "$OMEMFS" conflict accept-local file.txt
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"inconsistent"* ]]
+    [ "$(cat file.txt)" = "local change" ]
+    [ -f file.txt.omemfs-conflict-meta ]
+}
+
+@test "conflict accept-remote: aborts when a helper exists for a side the sidecar records as absent" {
+    make_remote_delete_conflict
+    [ ! -f file.txt.omemfs-conflict-remote ]
+
+    # A stray remote helper appears (e.g. copied in by hand). It must not be
+    # applied, and must not be silently ignored either.
+    echo "stray content" > file.txt.omemfs-conflict-remote
+
+    run "$OMEMFS" conflict accept-remote file.txt
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"inconsistent"* ]]
+    [ "$(cat file.txt)" = "local change" ]
+    [ -f file.txt.omemfs-conflict-meta ]
+}
+
+@test "conflict accept-remote: a consistent remote-delete conflict still deletes the file" {
+    make_remote_delete_conflict
+    grep -q '"remote": false' file.txt.omemfs-conflict-meta
+
+    run "$OMEMFS" conflict accept-remote file.txt
+    [ "$status" -eq 0 ]
+    [ ! -f file.txt ]
+    [ ! -f file.txt.omemfs-conflict-meta ]
+}
+
+@test "conflict accept-remote --dry-run: reports the same inconsistency error and changes nothing" {
+    make_genuine_conflict
+    rm file.txt.omemfs-conflict-remote
+
+    run "$OMEMFS" conflict accept-remote --dry-run file.txt
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"inconsistent"* ]]
+    [ "$(cat file.txt)" = "local change" ]
+    [ -f file.txt.omemfs-conflict-meta ]
+}
+
+@test "conflict accept-remote: one inconsistent path aborts the whole multi-path resolution before any change" {
+    echo "other" > other.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    local clone2
+    clone2="$(mktemp -d)"
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" "$clone2"
+    [ "$status" -eq 0 ]
+    echo "local change" > file.txt
+    echo "local other" > other.txt
+    (cd "$clone2" && echo "remote change" > file.txt && echo "remote other" > other.txt && "$OMEMFS" push)
+    run "$OMEMFS" pull
+    [ "$status" -ne 0 ]
+    rm -rf "$clone2"
+
+    rm other.txt.omemfs-conflict-remote
+
+    run "$OMEMFS" conflict accept-remote
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"other.txt"* ]]
+
+    # file.txt was consistent, but nothing is applied when any path is not.
+    [ "$(cat file.txt)" = "local change" ]
+    [ -f file.txt.omemfs-conflict-remote ]
+    [ -f file.txt.omemfs-conflict-meta ]
+}
+
+@test "conflict accept-remote: a sidecar without recorded sides falls back to helper-file presence" {
+    make_conflict file.txt
+    echo '{"remote_resolution":{"kind":"unrecorded"}}' > file.txt.omemfs-conflict-meta
+
+    run "$OMEMFS" conflict accept-remote file.txt
+    [ "$status" -eq 0 ]
+    [ "$(cat file.txt)" = "remote change" ]
+}

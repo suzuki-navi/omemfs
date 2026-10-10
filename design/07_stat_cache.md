@@ -136,8 +136,18 @@ On a miss (any condition fails), the caller must hash the file normally.
 
 The "racily clean" problem arises when a file is written and then immediately scanned within the same clock second. The cached `mtime_secs` matches the file's current `mtime_secs`, so a later write within the same second — which would update the file content — would not change `mtime_secs` and would produce a false cache hit.
 
-**Detection rule**: when inserting an entry, if `now - mtime < 3s`
-(i.e. `mtime_secs >= floor(now_as_unix_secs) - 2`), set `is_unsafe = true`.
+**Detection rule**: when inserting an entry, if `observed_at - mtime < 3s`
+(i.e. `mtime_secs >= floor(observed_at_as_unix_secs) - 2`), set `is_unsafe = true`.
+
+`observed_at` is the time at which the scan **observed** the file, never the
+time at which the cache is written back. A scan can take far longer than the
+3-second window (hundreds of thousands of files), so a writeback-time clock
+would judge a file that was hashed at the start of the scan as if it had been
+hashed minutes later, and mark a genuinely racy entry safe. Each `ScannedFile`
+therefore carries the scan's start time (`observed_at`, the same instant as the
+`now` used by the clone-root fallback), and `apply_scanned` passes it to
+`update`. An earlier `observed_at` can only make an entry *more* likely to be
+racy, so using the scan start is conservative.
 This 3-second window (`RACY_THRESHOLD_SECS`, defined once in `src/stat_cache.rs`)
 is the same constant used by the clone-root fallback in `scan_and_store`
 (see [Usage in scan_and_store](#usage-in-scan_and_store)).
@@ -157,9 +167,9 @@ is_racily_clean(mtime, now) = (now - mtime < 3s)
 
 ## Update
 
-`update(path, mtime, fs_size, hash, sealed)`:
+`update(path, mtime, fs_size, hash, sealed, observed_at)`:
 
-Inserts or replaces the entry for `path`. Computes `is_unsafe` from the current clock at insertion time. `sealed` is set directly from the caller (see [Seal invalidation](#seal-invalidation) for who calls this with `sealed = true`).
+Inserts or replaces the entry for `path`. Computes `is_unsafe` from `observed_at` (see [Racily clean detection](#racily-clean-detection)); `update` takes it as an explicit argument, and there is no variant that reads the clock. `sealed` is set directly from the caller (see [Seal invalidation](#seal-invalidation) for who calls this with `sealed = true`).
 
 The entry is written even when `is_unsafe = true` so that the hash value is available for future reference (e.g., for debugging or for updating to a safe entry after the racy window passes).
 
@@ -180,7 +190,7 @@ During a working-tree scan:
    d. **Cache miss**: read and hash the file normally.
 
 2. After the scan completes:
-   - For each file that was **re-hashed** (cache miss): call `stat_cache.update(path, mtime, size, hash, sealed)`, where `sealed = write_blobs` (a blob-writing scan just wrote or verified the object it references; a read-only scan has not).
+   - For each file that was **re-hashed** (cache miss): call `stat_cache.update(path, mtime, size, hash, sealed, observed_at)`, where `observed_at` is the scan's start time and `sealed = write_blobs` (a blob-writing scan just wrote or verified the object it references; a read-only scan has not).
    - For each file that was a **cache hit** and whose local blob was written or verified during this scan (see [Seal invalidation](#seal-invalidation)): call `stat_cache.mark_sealed(path)`.
    - Write the updated cache back to disk atomically.
 
@@ -624,6 +634,40 @@ After a scope-limited scan, the cache is reloaded in full before writeback so th
 For a multi-path scoped command (multiple scopes given at once, for either `push` or `ls`), scope-limited loading is **not** used: the command falls back to a single full `read`. This keeps the union-of-scopes logic simple and correct (a full read already covers every scope). A single-path scoped `push` or `ls` uses `read_scoped` with that path's prefix, and writes back via `write_scoped_merge` with the same prefix. An unscoped command (no `<path>`) uses the full `read`/`write_if_dirty` path.
 
 The sorted INDEX section is always written to enable scope-limited reads.
+
+---
+
+## Read-only writeback without the lock
+
+`omemfs ls` takes no lock (design/12), so a `push` can rewrite STAT_CACHE
+(rotating `seal_epoch`, setting SEALED bits, adding entries) between an `ls`
+loading the cache and writing it back. If `ls` wrote back the copy it loaded,
+it would silently revert all of that.
+
+A read-only scan (`write_blobs = false`) therefore never writes back what it
+loaded. It records which entries it **changed** (`update` that altered an
+entry, `mark_sealed` that flipped a bit) and writes back by **merging**:
+
+1. If nothing was changed, skip the write (unchanged behaviour).
+2. Otherwise re-read the full file fresh.
+3. Overlay only the changed entries onto the fresh copy. Every other entry,
+   the `seal_epoch`, and every SEALED bit not touched by this scan are taken
+   from the fresh copy, i.e. from whatever a concurrent `push` left there.
+4. Write the result atomically.
+
+This applies to the unscoped and the scoped read-only writeback alike (the
+scoped merge previously overlaid every entry it had loaded, which could
+overwrite a concurrently updated in-scope entry with a stale one). A
+blob-writing scan (`push`, `stub`) holds the repository lock and keeps writing
+its whole cache.
+
+Residual window: between the fresh read in step 2 and the rename in step 4 a
+concurrent `push` can still complete. That window is the duration of one file
+read and write, not the duration of the scan; an entry lost that way is only
+re-hashed by the next scan. STAT_CACHE is an acceleration cache, so the
+consequence of losing a concurrent update is bounded to lost speed, never to a
+wrong hash: a stale entry fails the `(mtime, size)` comparison, and a stale
+SEALED bit is guarded by the seal epoch (see "Seal invalidation").
 
 ---
 

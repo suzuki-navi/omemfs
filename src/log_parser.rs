@@ -52,23 +52,16 @@ impl TimerSpan {
 /// followed by a signed elapsed time field and the message with leading spaces.
 pub fn parse_line(line: &str) -> Option<LogLine> {
     // Minimum: "[omemfs L1 cmd ] +0.000s " = 8 + 7 + 2 + 8 + 1 = 26 chars
-    if !line.starts_with("[omemfs ") {
-        return None;
-    }
-    let rest = &line[8..]; // after "[omemfs "
+    let rest = line.strip_prefix("[omemfs ")?;
 
-    // Next 7 chars: layer tag, then "] "
+    // Next 7 bytes: layer tag, then "] ". `get` (not indexing) because the line
+    // is arbitrary text: byte 7 may fall inside a multi-byte character.
     if rest.len() < 9 {
         return None;
     }
-    let tag = &rest[..7];
-    let layer = parse_layer_tag(tag)?;
+    let layer = parse_layer_tag(rest.get(..7)?)?;
 
-    let rest = &rest[7..];
-    if !rest.starts_with("] ") {
-        return None;
-    }
-    let rest = &rest[2..]; // after "] "
+    let rest = rest.get(7..)?.strip_prefix("] ")?;
 
     // The elapsed field uses {:+9.3}s format: right-aligned in 9 chars + sign, so
     // there may be leading spaces before the +/- sign. Skip optional leading spaces.
@@ -212,6 +205,46 @@ mod tests {
             depth,
             text: text.to_string(),
         }
+    }
+
+    #[test]
+    fn parse_line_accepts_a_well_formed_line() {
+        let l = parse_line("[omemfs L1 cmd ]    +1.616s   push: start").unwrap();
+        assert_eq!(l.layer, Layer::L1);
+        assert_eq!(l.depth, 1);
+        assert_eq!(l.text, "push: start");
+    }
+
+    #[test]
+    fn parse_line_does_not_panic_when_a_multibyte_char_straddles_the_tag() {
+        // Bytes 8..15 are the 7-byte tag. Put a 3-byte character so that byte 15
+        // is in the middle of it: `&rest[..7]` used to panic here.
+        let line = format!("[omemfs {}日本] rest of the line", "abcde");
+        assert_eq!(parse_line(&line), None);
+        // And a line where the multibyte char sits at the `] ` separator.
+        let line = format!("[omemfs L1 cmd 日] +0.000s x{}", "y".repeat(20));
+        assert_eq!(parse_line(&line), None);
+    }
+
+    #[test]
+    fn parse_line_never_panics_on_multibyte_input_at_any_offset() {
+        let base = "[omemfs L1 cmd ]    +1.616s   push: start";
+        for (i, _) in base.char_indices() {
+            // Replace the byte range starting at each char boundary with a
+            // 4-byte character, and also insert one, to hit every slice.
+            let mut replaced = base.to_string();
+            replaced.replace_range(i..i + 1, "😀");
+            let _ = parse_line(&replaced);
+            let mut inserted = base.to_string();
+            inserted.insert(i, '😀');
+            let _ = parse_line(&inserted);
+        }
+    }
+
+    #[test]
+    fn parse_line_message_with_multibyte_text_is_kept_intact() {
+        let l = parse_line("[omemfs L1 cmd ]    +0.001s   scan: 日本語/ファイル.txt").unwrap();
+        assert_eq!(l.text, "scan: 日本語/ファイル.txt");
     }
 
     // -- parse_line ----------------------------------------------------------

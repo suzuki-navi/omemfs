@@ -129,7 +129,10 @@ fn rotate_if_oversized(path: &Path) {
     let half = lines.len() / 2;
     let mut out = lines[half..].join("\n");
     out.push('\n');
-    let _ = fs::write(path, out);
+    // Temp file + rename, never an in-place truncating write: a crash or a
+    // concurrent reader must see the old file or the new one, not an empty or
+    // partial file (design/11). Best-effort like the rest of the rotation.
+    let _ = crate::store::local::atomic_write_no_fsync(path, out.as_bytes());
 }
 
 // ---------------------------------------------------------------------------
@@ -194,7 +197,14 @@ pub fn append_record_with_detail(
 
     let path = omemfs_dir.join("io_stats.jsonl");
     rotate_if_oversized(&path);
-    if let Ok(mut file) = fs::OpenOptions::new().append(true).create(true).open(&path) {
+    let mut opts = fs::OpenOptions::new();
+    opts.append(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600); // design/02 "Local directory permissions"
+    }
+    if let Ok(mut file) = opts.open(&path) {
         let _ = writeln!(file, "{}", json);
     }
 }
@@ -460,6 +470,60 @@ mod tests {
         assert!(kept[0].contains(&format!("\"i\":{}", expected_half)));
         // The LAST kept line must be the very last line originally written.
         assert!(kept[kept.len() - 1].contains(&format!("\"i\":{}", lines_needed - 1)));
+    }
+
+    #[test]
+    fn rotation_replaces_the_file_atomically_never_truncating_in_place() {
+        // Regression (review R5): rotation used fs::write, which truncates the
+        // destination first. A reader (or a crash) in that window saw an empty
+        // or partial file. An atomic rename gives the file a new inode and
+        // leaves the old content readable through an already-open handle.
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("io_stats.jsonl");
+        let line = "y".repeat(100);
+        let lines_needed = (MAX_IO_STATS_BYTES as usize / (line.len() + 1)) + 10;
+        let mut content = String::new();
+        for i in 0..lines_needed {
+            content.push_str(&format!("{{\"i\":{},\"pad\":\"{}\"}}\n", i, line));
+        }
+        fs::write(&path, &content).unwrap();
+        let ino_before = fs::metadata(&path).unwrap().ino();
+        let mut old_handle = fs::File::open(&path).unwrap();
+
+        rotate_if_oversized(&path);
+
+        assert_ne!(
+            fs::metadata(&path).unwrap().ino(),
+            ino_before,
+            "rotation must replace the file (rename), not rewrite it in place"
+        );
+        let mut still_readable = String::new();
+        std::io::Read::read_to_string(&mut old_handle, &mut still_readable).unwrap();
+        assert_eq!(still_readable.len(), content.len(), "old content stays intact");
+        let rotated = fs::read_to_string(&path).unwrap();
+        assert!(rotated.len() < content.len());
+        assert!(rotated.ends_with('\n'));
+    }
+
+    #[test]
+    fn rotation_leaves_no_temp_file_behind() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("io_stats.jsonl");
+        let line = "z".repeat(100);
+        let lines_needed = (MAX_IO_STATS_BYTES as usize / (line.len() + 1)) + 10;
+        let mut content = String::new();
+        for i in 0..lines_needed {
+            content.push_str(&format!("{{\"i\":{},\"pad\":\"{}\"}}\n", i, line));
+        }
+        fs::write(&path, &content).unwrap();
+        rotate_if_oversized(&path);
+        let names: Vec<String> = fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["io_stats.jsonl".to_string()], "{names:?}");
     }
 
     #[test]

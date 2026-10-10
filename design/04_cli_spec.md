@@ -13,6 +13,43 @@
 version, then exits successfully. It does not require a repository or contact
 a remote.
 
+## Terminal output safety
+
+Path and entry names come from the remote (tree objects) and from the working
+tree, so they are untrusted: a name may contain any byte sequence that is legal
+in a filename except `/` and NUL, including ESC, CR and LF. Printed verbatim, such
+a name can move the cursor, rewrite earlier lines, change colours, retitle the
+terminal, or forge additional output lines (for example a fake log record).
+
+Every path or entry name that omemfs prints to the terminal, in a phase-view
+detail line, in an error message, or into the log file is therefore
+**escaped for display**:
+
+| Character | Rendered as |
+|---|---|
+| LF, CR, TAB | `\n`, `\r`, `\t` |
+| other C0 controls (U+0000–U+001F, including ESC) and DEL | `\xNN` |
+| C1 controls (U+0080–U+009F) | `\u{XXXX}` |
+| Unicode line/paragraph separators (U+2028, U+2029) and bidirectional format controls (U+202A–U+202E, U+2066–U+2069) | `\u{XXXX}` |
+
+All other characters, including every printable non-ASCII character, are left
+untouched. A backslash is **not** doubled, so a name that literally contains
+`\n` is indistinguishable from one containing a newline; the escaping is for
+display only and is never parsed back.
+
+Two rules keep the escaping from damaging legitimate output:
+
+- Names are escaped **before** omemfs adds its own colour codes, so the colour
+  sequences omemfs emits are never touched.
+- A whole message that is legitimately multi-line (an error message that lists
+  several problems, one per line) is escaped with LF and TAB preserved and
+  every other character above escaped. Such a message cannot forge a line
+  *inside* a name, but a name embedded in it can still contain a raw LF; this is
+  why call sites escape the name itself wherever they can.
+
+The raw payload printed by `omemfs cat` is file content, not a name, and is
+never escaped.
+
 ## Repository discovery
 
 Every command except `clone` locates the repository by walking up from the current working directory: the first ancestor directory that contains a `.omemfs/` subdirectory is the **repository root**, and `.omemfs/` lives directly under it. The search continues to the filesystem root; if no `.omemfs/` is found in the current directory or any ancestor, the command fails with `not a omemfs repository (no .omemfs/ found in <cwd> or any parent)`. There is no environment-variable override.
@@ -489,7 +526,7 @@ omemfs pull [<path>...]
 2. Compute the diff between clone root and remote root (remote changes).
 3. If the working tree differs from clone root (local changes): compute the diff between clone root and working tree (local changes). Check for path-level conflicts (same path in both diffs). If any → abort (see Conflict handling below).
 4. Collect the blob hashes referenced by the remote diff that are missing from the local cache and download all of them in a single batched, concurrent transfer (see `02_storage_format.md`, "Multi-root batching"), rather than one blob at a time. Tree objects needed to enumerate directory children along the way are still fetched individually as the diff is walked; only the leaf-blob fetches are batched.
-5. Apply remote changes to the working tree, restoring `mtime` and the executable-bit `mode` for each materialised file from the remote tree entry. A remote change that only flips the executable bit is applied as a modification. Local-only changes are left untouched.
+5. Re-verify, in one pass and before the first write, that every path about to be overwritten, deleted or created still matches what the scan saw (`(mtime, size)`, or still absent), then apply remote changes to the working tree, restoring `mtime` and the executable-bit `mode` for each materialised file from the remote tree entry. Each path is checked again immediately before its own write. A remote change that only flips the executable bit is applied as a modification. Local-only changes are left untouched. If a path was edited after the scan, the pull is aborted like a conflict: helpers are written for it, `clone_root` is not advanced (`03_sync_model.md`, "Re-verifying a path immediately before it is overwritten").
 6. Write the remote root hash to `clone_root`.
 
 **Behaviour (path-scoped pull)**
@@ -1116,6 +1153,8 @@ Files that are already stubbed (`<file>.omemfs-stub` exists) are skipped with a 
 
 `clone_root` is not updated. The stub is transparent to the next `omemfs push` — the scan reads the stub record and includes the same hash in the tree, so the remote sees no change.
 
+Immediately before a target's content is deleted, it is checked once more against what the precondition check saw (`(mtime, size)`; for a directory, every file and no new file). A target edited in between is left as it is, its stub record is removed again, and the command fails naming the path, so an edit made while `stub` was running is never deleted (`08_stub_system.md`, "omemfs stub", "Re-verifying immediately before the delete").
+
 **Output example**
 
 ```
@@ -1533,7 +1572,7 @@ Working-tree file sizes   (n=3,975, total=1.4 GiB)
 - `pack_detail.orphaned_bytes` is a **lower-bound estimate** of the bytes this pack run made unreachable from `INDEX_ROOT`: the size of the previous hot index, the combined size of all delta index files just merged away, and the previous Bloom filter's size are counted in full (each is unconditionally replaced by a new object with a new hash); the size of consolidated small pack files is approximated by `consolidated_bytes_in` (the payload bytes actually copied out of them), which understates the true figure whenever a consolidated pack file still has other entries referenced from a cold shard (that pack file is not fully orphaned, but its consolidated entries' bytes are still counted here as if it were). Used together with `orphans` in `omemfs stats --remote`'s Remote storage section to judge whether a given pack cadence is worth its storage cost.
 - Pack's index-root read and CAS-write go through the `LocalRootPointer` file-ops path (not through `ObjectStore`), so those operations are NOT counted in the pack I/O record — an accepted minor undercount.
 - Local cache I/O is not counted. Commands that fail before touching the remote do not append a record. `omemfs stats` displays only the most recent 20 entries.
-- Retention: before appending a new record, if `io_stats.jsonl` exceeds **10 MiB**, it is rewritten to keep only the newest (line-count) half of its records, then the new record is appended. This bounds the file's growth (refactor-instructions.md G4a) without needing a separate maintenance command. Rotation is best-effort: any I/O error during it is silently ignored, and the append is attempted regardless.
+- Retention: before appending a new record, if `io_stats.jsonl` exceeds **10 MiB**, it is rewritten to keep only the newest (line-count) half of its records, then the new record is appended. This bounds the file's growth (refactor-instructions.md G4a) without needing a separate maintenance command. Rotation is best-effort: any I/O error during it is silently ignored, and the append is attempted regardless. The rewrite goes through a temp file and an atomic rename, so an interrupted rotation leaves the previous file intact instead of a truncated one (design/11).
 
 ---
 
@@ -1609,7 +1648,7 @@ omemfs conflict <subcommand> [--dry-run] [<path>...]
 - `accept-local` — adopt the local version and remove helper files
 - `accept-base` — adopt the base (clone root) version and remove helper files
 
-**Conflict metadata sidecar.** Alongside the three `<path>.omemfs-conflict-{base,local,remote}` helpers, `pull` writes one `<path>.omemfs-conflict-meta` sidecar (JSON) recording the tracked metadata (modification time and the executable-bit mode) of the **base** and **remote** sides. omemfs tracks `mtime` and `mode` in each tree entry, so they are part of the entry's hash. Without restoring them, `accept-remote` / `accept-base` would leave the resolved file with a fresh `mtime`, so its tree-entry hash would differ from the remote / clone root and the next `push` would needlessly re-upload it (and mint a new remote root) even though the content is identical. The sidecar lets `accept` restore the accepted side's metadata so the resolution is idempotent against that root. The **local** side is intentionally not recorded: `accept-local` keeps the working-tree file as-is, so its metadata needs no restoration. The sidecar is excluded from scan/push exactly like the conflict helpers, and is removed by `accept`, `clean`, and `restore`.
+**Conflict metadata sidecar.** Alongside the three `<path>.omemfs-conflict-{base,local,remote}` helpers, `pull` writes one `<path>.omemfs-conflict-meta` sidecar (JSON) recording the tracked metadata (modification time and the executable-bit mode) of the **base** and **remote** sides. omemfs tracks `mtime` and `mode` in each tree entry, so they are part of the entry's hash. Without restoring them, `accept-remote` / `accept-base` would leave the resolved file with a fresh `mtime`, so its tree-entry hash would differ from the remote / clone root and the next `push` would needlessly re-upload it (and mint a new remote root) even though the content is identical. The sidecar lets `accept` restore the accepted side's metadata so the resolution is idempotent against that root. The **local** side is intentionally not recorded: `accept-local` keeps the working-tree file as-is, so its metadata needs no restoration. The sidecar also records `sides` (which of the base/local/remote helpers `pull` wrote) and the remote's resolved value (`remote_resolution`); `accept-*` decides from these rather than from helper-file presence, and refuses to proceed when the helpers on disk contradict `sides` (`03_sync_model.md`, "The sidecar records which sides exist"). The sidecar is excluded from scan/push exactly like the conflict helpers, and is removed by `accept`, `clean`, and `restore`.
 
 ---
 
@@ -1691,7 +1730,7 @@ omemfs conflict accept-remote [--dry-run] [<path>...]
 **Behaviour** for all conflicting paths `<p>` in scope, in this order (see `03_sync_model.md`, "Advancing clone_root on resolution", "Ordering guarantee"):
 
 1. Compute the advanced `clone_root` for every `<p>` (splicing in the value observed on the remote when the conflict was detected) and write it once, durably, before touching any helper file or sidecar. Reading the intermediate clone_root tree objects needed for this may transparently fetch a locally-missing one from the remote through the same lazy tree store `pull`/`ls` use (`03_sync_model.md`, "Lazy tree reads").
-2. For each `<p>`: if `<p>.omemfs-conflict-remote` exists, overwrite `<p>` with its contents, then restore the remote side's tracked `mtime` and `mode` from the conflict metadata sidecar (if present) so the result is idempotent — a subsequent `push` does not re-upload an unchanged file. If `<p>.omemfs-conflict-remote` does not exist, this is one of two shapes recorded in the sidecar's `remote_resolution` (`03_sync_model.md`, "Missing sides", "Remote side is a symlink"): a local-add vs remote-delete conflict (`Deleted`) deletes `<p>`; a local-edit vs remote-turned-into-a-symlink conflict (`Symlink { target, mtime }`) instead replaces whatever is at `<p>` with a symlink to `target` and restores its `mtime` (symlinks have no executable-bit `mode`).
+2. For each `<p>`: if the remote side has content (per the sidecar's `sides`; helper-file presence when the sidecar has no `sides`), `<p>.omemfs-conflict-remote` exists and `<p>` is overwritten with its contents, then restore the remote side's tracked `mtime` and `mode` from the conflict metadata sidecar (if present) so the result is idempotent — a subsequent `push` does not re-upload an unchanged file. If the remote side has no content, this is one of two shapes recorded in the sidecar's `remote_resolution` (`03_sync_model.md`, "Missing sides", "Remote side is a symlink"): a local-add vs remote-delete conflict (`Deleted`) deletes `<p>`; a local-edit vs remote-turned-into-a-symlink conflict (`Symlink { target, mtime }`) instead replaces whatever is at `<p>` with a symlink to `target` and restores its `mtime` (symlinks have no executable-bit `mode`).
 3. Only after step 1's `clone_root` write has succeeded: delete all three helper files for `<p>` (whichever exist), plus the `<p>.omemfs-conflict-meta` sidecar.
 
 For `accept-remote`, the advancement in step 1 matches what the working tree already holds, so it changes nothing observable on its own — it is applied for consistency with `accept-local`/`accept-base` and so a later `pull` does not re-detect the same conflict.
@@ -1707,6 +1746,7 @@ $ omemfs conflict accept-remote src/main.rs
 **Errors**
 
 - No conflict helper files found for the given path: `error: no conflict files found for 'src/lib.rs'`
+- The helper files on disk contradict the sidecar's recorded `sides` (a recorded helper is missing, or an unrecorded one exists): `error: conflict artifacts for 'src/lib.rs' are inconsistent (remote helper missing); run 'omemfs pull' again, or 'omemfs conflict clean' / 'omemfs restore'`. Detected before any change is made, for every subcommand (`accept-remote`, `accept-local`, `accept-base`) and for `--dry-run`. Nothing is modified, including `clone_root`.
 
 ---
 
@@ -1724,7 +1764,7 @@ omemfs conflict accept-local [--dry-run] [<path>...]
 **Behaviour** for all conflicting paths `<p>` in scope, in this order (see `03_sync_model.md`, "Advancing clone_root on resolution", "Ordering guarantee"):
 
 1. Compute the advanced `clone_root` for every `<p>` (splicing in the value observed on the remote when the conflict was detected) and write it once, durably, before touching any helper file or sidecar. Reading the intermediate clone_root tree objects needed for this may transparently fetch a locally-missing one from the remote through the same lazy tree store `pull`/`ls` use (`03_sync_model.md`, "Lazy tree reads"). Without this advancement, a subsequent `push` would be rejected as a lost update — the accepted local content deliberately differs from the remote's conflicting version — and a subsequent `pull` would re-detect the same conflict.
-2. For each `<p>`: if `<p>.omemfs-conflict-local` exists, overwrite `<p>` with its contents. If `<p>.omemfs-conflict-local` does not exist (local-delete vs remote-modify conflict), delete `<p>`.
+2. For each `<p>`: if the local side has content (per the sidecar's `sides`; helper-file presence when the sidecar has no `sides`), overwrite `<p>` with `<p>.omemfs-conflict-local`. If the local side has no content (local-delete vs remote-modify conflict), delete `<p>`.
 3. Only after step 1's `clone_root` write has succeeded: delete all three helper files for `<p>` (whichever exist), plus the `<p>.omemfs-conflict-meta` sidecar.
 
 **Output example**
@@ -1751,7 +1791,7 @@ omemfs conflict accept-base [--dry-run] [<path>...]
 **Behaviour** for all conflicting paths `<p>` in scope, in this order (see `03_sync_model.md`, "Advancing clone_root on resolution", "Ordering guarantee"):
 
 1. Compute the advanced `clone_root` for every `<p>` (splicing in the value observed on the remote when the conflict was detected) and write it once, durably, before touching any helper file or sidecar. Reading the intermediate clone_root tree objects needed for this may transparently fetch a locally-missing one from the remote through the same lazy tree store `pull`/`ls` use (`03_sync_model.md`, "Lazy tree reads"). Without this advancement, a subsequent `push` would be rejected as a lost update — the restored base content deliberately differs from the remote's conflicting version — and a subsequent `pull` would re-detect the same conflict.
-2. For each `<p>`: if `<p>.omemfs-conflict-base` exists, overwrite `<p>` with its contents, then restore the base side's tracked `mtime` and `mode` from the conflict metadata sidecar (if present) so the result matches the clone-root state. If `<p>.omemfs-conflict-base` does not exist (both sides added a new file), delete `<p>` — the base state is absence of the file.
+2. For each `<p>`: if the base side has content (per the sidecar's `sides`; helper-file presence when the sidecar has no `sides`), overwrite `<p>` with `<p>.omemfs-conflict-base`, then restore the base side's tracked `mtime` and `mode` from the conflict metadata sidecar (if present) so the result matches the clone-root state. If the base side has no content (both sides added a new file), delete `<p>` — the base state is absence of the file.
 3. Only after step 1's `clone_root` write has succeeded: delete all three helper files for `<p>` (whichever exist), plus the `<p>.omemfs-conflict-meta` sidecar.
 
 **Output example**

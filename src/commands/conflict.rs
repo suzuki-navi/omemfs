@@ -78,6 +78,28 @@ pub(crate) enum RemoteResolution {
     Unrecorded,
 }
 
+/// Which sides of a conflict had content when `pull` wrote the helpers: each
+/// flag is true exactly when the matching `.omemfs-conflict-*` helper was
+/// written. `accept-*` decides from this rather than from helper-file
+/// presence alone (design/03_sync_model.md, "The sidecar records which sides
+/// exist").
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub(crate) struct Sides {
+    pub base: bool,
+    pub local: bool,
+    pub remote: bool,
+}
+
+impl Sides {
+    fn has(&self, side: &AcceptSide) -> bool {
+        match side {
+            AcceptSide::Base => self.base,
+            AcceptSide::Local => self.local,
+            AcceptSide::Remote => self.remote,
+        }
+    }
+}
+
 /// Sidecar metadata for a conflicting path: the tracked metadata of the base
 /// and remote sides, plus the remote's resolved value for advancing
 /// `clone_root`. The local side's metadata is intentionally absent —
@@ -85,6 +107,11 @@ pub(crate) enum RemoteResolution {
 /// no restoration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct ConflictMeta {
+    /// Absent when read from a sidecar written before this field existed (or
+    /// a hand-made one): `accept-*` then falls back to helper-file presence.
+    /// Always filled in by [`write_conflict_artifacts`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sides: Option<Sides>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<SideMeta>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -108,7 +135,11 @@ impl ConflictMeta {
         work_dir: &std::path::Path,
         base_path: &std::path::Path,
     ) -> Result<(), Error> {
-        if self.base.is_none() && self.remote.is_none() && self.remote_resolution.is_none() {
+        if self.sides.is_none()
+            && self.base.is_none()
+            && self.remote.is_none()
+            && self.remote_resolution.is_none()
+        {
             return Ok(());
         }
         let meta_path = sidecar_path(base_path);
@@ -240,6 +271,186 @@ pub(crate) fn remove_all_conflict_artifacts(
 }
 
 // ---------------------------------------------------------------------------
+// write (used by pull)
+// ---------------------------------------------------------------------------
+
+/// One side (base / local / remote) of a conflict, resolved to a streamable
+/// source instead of an in-memory byte buffer. Each variant is written to its
+/// helper file chunk-by-chunk so no whole-blob buffer is ever held -- for a
+/// GB-class conflicted file this keeps peak memory bounded at roughly one chunk
+/// (<= CDC_MAX ~ 16 MiB) per side rather than the full file size.
+pub(crate) enum HelperSource {
+    /// A blob in the object store, addressed by its logical hash. Streamed to
+    /// the helper file via `codec::chunk::materialise_to_file`.
+    Blob(Hash),
+    /// A working-tree file held open at construction time. Holding the `File`
+    /// rather than a path avoids re-opening and prevents TOCTOU races: if the
+    /// file is deleted after it was opened the fd stays valid on Linux.
+    WorkingFile(std::fs::File),
+}
+
+/// Write the conflict artifacts for one conflicting path: clear every
+/// artifact left by an earlier conflict on the same path, write the helper
+/// for each side that has content, then write the sidecar with `sides`
+/// recording exactly which helpers were written.
+///
+/// The single write entry point for conflict artifacts (design/03_sync_model.md,
+/// "The sidecar records which sides exist", "Single owner"). `work_dir` must
+/// be the true repository root. `meta.sides` is overwritten here so it can
+/// never disagree with the helpers actually written.
+pub(crate) fn write_conflict_artifacts(
+    work_dir: &Path,
+    base_path: &Path,
+    base: Option<&HelperSource>,
+    local: Option<&HelperSource>,
+    remote: Option<&HelperSource>,
+    mut meta: ConflictMeta,
+    store: &dyn crate::store::ObjectStore,
+) -> Result<(), Error> {
+    // A "missing side" in this conflict must never be shadowed by a stale
+    // helper from a previous conflict on the same path (design/03_sync_model.md,
+    // "Missing sides", "Clearing stale residue before writing").
+    remove_all_conflict_artifacts(work_dir, base_path)?;
+    for (suffix, source) in [
+        (CONFLICT_SUFFIX_BASE, base),
+        (CONFLICT_SUFFIX_LOCAL, local),
+        (CONFLICT_SUFFIX_REMOTE, remote),
+    ] {
+        if let Some(src) = source {
+            write_helper_file(work_dir, base_path, suffix, src, store)?;
+        }
+    }
+    meta.sides = Some(Sides {
+        base: base.is_some(),
+        local: local.is_some(),
+        remote: remote.is_some(),
+    });
+    meta.write(work_dir, base_path)
+}
+
+/// Stream `source` into the helper file `<base_path><suffix>`.
+///
+///   - `Blob(hash)`: `materialise_to_file` streams the (possibly chunked) blob
+///     chunk-by-chunk into a temp file in the destination dir, then atomically
+///     renames it (the `ED F0` blob-escape is stripped from the first chunk).
+///   - `WorkingFile(file)`: `io::copy` streams the working-tree file into the
+///     same atomic temp+rename writer, never reading it whole.
+fn write_helper_file(
+    work_dir: &Path,
+    base_path: &Path,
+    suffix: &str,
+    source: &HelperSource,
+    store: &dyn crate::store::ObjectStore,
+) -> Result<(), Error> {
+    let helper_path = {
+        let s = base_path.to_string_lossy();
+        PathBuf::from(format!("{}{}", s, suffix))
+    };
+    match source {
+        HelperSource::Blob(hash) => {
+            crate::codec::chunk::materialise_to_file(work_dir, store, hash, None, &helper_path)?;
+        }
+        HelperSource::WorkingFile(file) => {
+            // Same working-tree write boundary as the `Blob` arm (which gets
+            // it via `materialise_to_file`): `helper_path` shares its parent
+            // directory with `base_path`, so a directory swapped for a
+            // symlink pointing outside `work_dir` must not be followed. See
+            // design/03_sync_model.md, "Write safety: the working-tree write
+            // boundary".
+            crate::fsguard::atomic_write_with(work_dir, &helper_path, |writer| {
+                // `&File` implements `Read`, so `io::copy` works without
+                // consuming or mutably borrowing through the enum reference.
+                std::io::copy(&mut &*file, writer)
+                    .map(|_| ())
+                    .map_err(Error::Io)
+            })?;
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// read (used by accept-*)
+// ---------------------------------------------------------------------------
+
+/// What `accept-<side>` does with one conflicting path.
+#[derive(Debug, PartialEq, Eq)]
+enum Resolution {
+    /// Overwrite the path with the accepted side's helper file.
+    Helper(PathBuf),
+    /// The accepted side has no content: delete the path.
+    Delete,
+    /// The remote side is a symlink (no helper is ever written for it): create it.
+    RemoteSymlink,
+}
+
+/// Decide what accepting `side` means for `base`, from the sidecar's recorded
+/// `sides` (falling back to helper-file presence when none were recorded).
+/// Errs, without touching anything, when the helper file on disk contradicts
+/// the recorded `sides` (design/03_sync_model.md, "The sidecar records which
+/// sides exist").
+fn resolve_side(
+    work_dir: &Path,
+    base: &str,
+    side: &AcceptSide,
+    meta: Option<&ConflictMeta>,
+) -> Result<Resolution, Error> {
+    let helper = work_dir.join(format!("{}{}", base, side.suffix()));
+    let exists = helper.exists();
+    let has_content = match meta.and_then(|m| m.sides) {
+        Some(sides) => {
+            let recorded = sides.has(side);
+            if recorded != exists {
+                let problem = if recorded { "missing" } else { "unexpected" };
+                return Err(Error::Other(format!(
+                    "conflict artifacts for '{}' are inconsistent ({} helper {}); \
+                     run 'omemfs pull' again, or 'omemfs conflict clean' / 'omemfs restore'",
+                    base,
+                    side.label(),
+                    problem
+                )));
+            }
+            recorded
+        }
+        None => exists,
+    };
+    if has_content {
+        Ok(Resolution::Helper(helper))
+    } else if matches!(side, AcceptSide::Remote)
+        && matches!(
+            meta.and_then(|m| m.remote_resolution.as_ref()),
+            Some(RemoteResolution::Symlink { .. })
+        )
+    {
+        Ok(Resolution::RemoteSymlink)
+    } else {
+        Ok(Resolution::Delete)
+    }
+}
+
+/// `resolve_side` for every path; on any inconsistency returns one error that
+/// lists all offending paths, before the caller has changed anything.
+fn resolve_all(
+    work_dir: &Path,
+    side: &AcceptSide,
+    metas: &[(String, Option<ConflictMeta>)],
+) -> Result<Vec<Resolution>, Error> {
+    let mut resolutions = Vec::with_capacity(metas.len());
+    let mut problems: Vec<String> = Vec::new();
+    for (base, meta) in metas {
+        match resolve_side(work_dir, base, side, meta.as_ref()) {
+            Ok(r) => resolutions.push(r),
+            Err(e) => problems.push(e.to_string()),
+        }
+    }
+    if problems.is_empty() {
+        Ok(resolutions)
+    } else {
+        Err(Error::Other(problems.join("\n")))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // list
 // ---------------------------------------------------------------------------
 
@@ -247,8 +458,7 @@ pub fn run_list(opts: ConflictListOptions) -> Result<(), Error> {
     let repo = Repo::open(&opts.work_dir)?;
     crate::progress::notify_repo_dir(&repo.work_dir);
 
-    let scope_paths =
-        resolve_scope_paths_or_cwd(&opts.work_dir, &opts.current_dir, &opts.paths)?;
+    let scope_paths = resolve_scope_paths_or_cwd(&opts.work_dir, &opts.current_dir, &opts.paths)?;
     let paths = collect_conflicting_base_paths_scoped(&opts.work_dir, &scope_paths);
     if paths.is_empty() {
         return Ok(());
@@ -258,7 +468,7 @@ pub fn run_list(opts: ConflictListOptions) -> Result<(), Error> {
     let mut sorted = paths.iter().cloned().collect::<Vec<_>>();
     sorted.sort();
     for p in &sorted {
-        out.writeln(&format!("  {}", p))?;
+        out.writeln(&format!("  {}", crate::term::escape_display(p)))?;
     }
     let n = sorted.len();
     out.writeln(&format!(
@@ -281,8 +491,7 @@ pub fn run_clean(opts: ConflictCleanOptions) -> Result<(), Error> {
     // concurrent pull writing them. See design/12_locking.md.
     let _lock = repo.acquire_lock()?;
 
-    let scope_paths =
-        resolve_scope_paths_or_cwd(&opts.work_dir, &opts.current_dir, &opts.paths)?;
+    let scope_paths = resolve_scope_paths_or_cwd(&opts.work_dir, &opts.current_dir, &opts.paths)?;
     let helper_files = collect_helper_files(&opts.work_dir, &scope_paths);
 
     let mut out = crate::term::Output::for_stdout();
@@ -294,7 +503,7 @@ pub fn run_clean(opts: ConflictCleanOptions) -> Result<(), Error> {
     for helper_path in &sorted_helpers {
         let abs = opts.work_dir.join(helper_path);
         if opts.dry_run {
-            out.writeln(&format!("  would delete: {}", helper_path))?;
+            out.writeln(&format!("  would delete: {}", crate::term::escape_display(helper_path)))?;
         } else {
             // design/03_sync_model.md, "Write safety: the working-tree write
             // boundary": a helper-file delete is a working-tree mutation
@@ -304,7 +513,7 @@ pub fn run_clean(opts: ConflictCleanOptions) -> Result<(), Error> {
             // ancestor of `helper_path` and could delete content outside
             // `work_dir`.
             crate::fsguard::remove_file_tolerant(&opts.work_dir, &abs)?;
-            out.writeln(&format!("  deleted: {}", helper_path))?;
+            out.writeln(&format!("  deleted: {}", crate::term::escape_display(helper_path)))?;
         }
         // Count unique base paths.
         let base = base_path_of_helper(helper_path);
@@ -351,8 +560,7 @@ pub fn run_accept(opts: ConflictAcceptOptions) -> Result<(), Error> {
     crate::progress::notify_repo_dir(&repo.work_dir);
     let _lock = repo.acquire_lock()?;
 
-    let scope_paths =
-        resolve_scope_paths_or_cwd(&opts.work_dir, &opts.current_dir, &opts.paths)?;
+    let scope_paths = resolve_scope_paths_or_cwd(&opts.work_dir, &opts.current_dir, &opts.paths)?;
     let conflicting = collect_conflicting_base_paths_scoped(&opts.work_dir, &scope_paths);
 
     if conflicting.is_empty() {
@@ -375,35 +583,6 @@ pub fn run_accept(opts: ConflictAcceptOptions) -> Result<(), Error> {
     let mut sorted = conflicting.into_iter().collect::<Vec<_>>();
     sorted.sort();
 
-    if opts.dry_run {
-        // --dry-run makes no changes and touches `clone_root` and the remote
-        // not at all: report what each path's helper file implies without
-        // reading the metadata sidecar or building a tree store.
-        let mut count = 0usize;
-        for base in &sorted {
-            let src_helper = opts
-                .work_dir
-                .join(format!("{}{}", base, opts.side.suffix()));
-            if src_helper.exists() {
-                out.writeln(&format!("  would accept {}: {}", opts.side.label(), base))?;
-            } else {
-                out.writeln(&format!(
-                    "  would delete (no {} version): {}",
-                    opts.side.label(),
-                    base
-                ))?;
-            }
-            count += 1;
-        }
-        out.writeln(&format!(
-            "{} conflict{} would be resolved (dry run).",
-            count,
-            if count == 1 { "" } else { "s" }
-        ))?;
-        out.finish()?;
-        return Ok(());
-    }
-
     // Read every path's metadata sidecar up front, before any file is
     // touched, so phase A below can compute the fully-advanced clone_root
     // before phase B starts changing the working tree (design/03_sync_model.md,
@@ -415,6 +594,41 @@ pub fn run_accept(opts: ConflictAcceptOptions) -> Result<(), Error> {
             (base.clone(), ConflictMeta::read(&abs_base))
         })
         .collect();
+
+    // Decide every path's resolution now, dry run or not: an inconsistency
+    // between the recorded sides and the helpers on disk aborts here, before
+    // any change, and a dry run must not predict a resolution the real run
+    // would refuse (design/03_sync_model.md, "The sidecar records which sides
+    // exist").
+    let resolutions = resolve_all(&opts.work_dir, &opts.side, &metas)?;
+
+    if opts.dry_run {
+        // --dry-run makes no changes and touches `clone_root` and the remote
+        // not at all: no tree store is built.
+        let mut count = 0usize;
+        for (base, resolution) in sorted.iter().zip(&resolutions) {
+            match resolution {
+                Resolution::Delete => out.writeln(&format!(
+                    "  would delete (no {} version): {}",
+                    opts.side.label(),
+                    crate::term::escape_display(base)
+                ))?,
+                Resolution::Helper(_) | Resolution::RemoteSymlink => out.writeln(&format!(
+                    "  would accept {}: {}",
+                    opts.side.label(),
+                    crate::term::escape_display(base)
+                ))?,
+            }
+            count += 1;
+        }
+        out.writeln(&format!(
+            "{} conflict{} would be resolved (dry run).",
+            count,
+            if count == 1 { "" } else { "s" }
+        ))?;
+        out.finish()?;
+        return Ok(());
+    }
 
     // Clone_root tree objects along a resolved path may be absent locally
     // after a lazy clone; route splice/remove reads through the same
@@ -514,13 +728,10 @@ pub fn run_accept(opts: ConflictAcceptOptions) -> Result<(), Error> {
     // them.
     // ------------------------------------------------------------------
     let mut deleted_paths: Vec<&str> = Vec::new();
-    for (base, conflict_meta) in &metas {
+    for ((base, conflict_meta), resolution) in metas.iter().zip(&resolutions) {
         let abs_base = opts.work_dir.join(base);
-        let src_helper = opts
-            .work_dir
-            .join(format!("{}{}", base, opts.side.suffix()));
 
-        if src_helper.exists() {
+        if let Resolution::Helper(src_helper) = resolution {
             // Write through a temporary sibling and rename it into place, so
             // other processes never observe a partially written resolution.
             // Preserve the previous permissions for accept-local; remote/base
@@ -532,7 +743,7 @@ pub fn run_accept(opts: ConflictAcceptOptions) -> Result<(), Error> {
             let original_permissions = std::fs::symlink_metadata(&abs_base)
                 .ok()
                 .map(|metadata| metadata.permissions());
-            let data = std::fs::read(&src_helper).map_err(Error::Io)?;
+            let data = std::fs::read(src_helper).map_err(Error::Io)?;
             crate::fsguard::atomic_write_durable(&opts.work_dir, &abs_base, &data)?;
             if let Some(permissions) = original_permissions {
                 std::fs::set_permissions(&abs_base, permissions).map_err(Error::Io)?;
@@ -553,7 +764,7 @@ pub fn run_accept(opts: ConflictAcceptOptions) -> Result<(), Error> {
                     restore_side_meta(&opts.work_dir, &abs_base, side);
                 }
             }
-        } else if matches!(opts.side, AcceptSide::Remote)
+        } else if matches!(resolution, Resolution::RemoteSymlink)
             && let Some(cm) = conflict_meta
             && let Some(RemoteResolution::Symlink { target, mtime }) = &cm.remote_resolution
         {
@@ -598,16 +809,9 @@ pub fn run_accept(opts: ConflictAcceptOptions) -> Result<(), Error> {
     // ------------------------------------------------------------------
     let mut count = 0usize;
     for (base, _) in &metas {
-        for suffix in CONFLICT_SUFFIXES {
-            let helper = opts.work_dir.join(format!("{}{}", base, suffix));
-            crate::fsguard::remove_file_tolerant(&opts.work_dir, &helper)?;
-        }
-        let meta_sidecar = opts
-            .work_dir
-            .join(format!("{}{}", base, CONFLICT_META_SUFFIX));
-        crate::fsguard::remove_file_tolerant(&opts.work_dir, &meta_sidecar)?;
+        remove_all_conflict_artifacts(&opts.work_dir, &opts.work_dir.join(base))?;
 
-        out.writeln(&format!("  accepted {}: {}", opts.side.label(), base))?;
+        out.writeln(&format!("  accepted {}: {}", opts.side.label(), crate::term::escape_display(base)))?;
         count += 1;
     }
 
@@ -861,6 +1065,26 @@ fn resolve_scope_paths_or_cwd(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec;
+    use crate::store::local::LocalStore;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// Deterministic pseudo-random byte generator (xorshift64*), enough for
+    /// FastCDC to find multiple cut points. Not for crypto.
+    fn pseudo_random(seed: u64, len: usize) -> Vec<u8> {
+        let mut state = seed | 1;
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            let v = state.wrapping_mul(0x2545F4914F6CDD1D);
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.truncate(len);
+        out
+    }
 
     #[test]
     fn is_conflict_artifact_matches_all_three_helpers_and_the_meta_sidecar() {
@@ -883,6 +1107,280 @@ mod tests {
             assert!(CONFLICT_ARTIFACT_SUFFIXES.contains(suffix));
         }
         assert!(CONFLICT_ARTIFACT_SUFFIXES.contains(&CONFLICT_META_SUFFIX));
-        assert_eq!(CONFLICT_ARTIFACT_SUFFIXES.len(), CONFLICT_SUFFIXES.len() + 1);
+        assert_eq!(
+            CONFLICT_ARTIFACT_SUFFIXES.len(),
+            CONFLICT_SUFFIXES.len() + 1
+        );
+    }
+
+    fn meta_with_sides(base: bool, local: bool, remote: bool) -> ConflictMeta {
+        ConflictMeta {
+            sides: Some(Sides {
+                base,
+                local,
+                remote,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resolve_side_uses_recorded_sides_when_consistent() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.omemfs-conflict-remote"), b"r").unwrap();
+        let meta = meta_with_sides(false, true, true);
+        assert_eq!(
+            resolve_side(dir.path(), "f", &AcceptSide::Remote, Some(&meta)).unwrap(),
+            Resolution::Helper(dir.path().join("f.omemfs-conflict-remote"))
+        );
+        // Recorded absent and no file: a genuine missing side.
+        assert_eq!(
+            resolve_side(dir.path(), "f", &AcceptSide::Base, Some(&meta)).unwrap(),
+            Resolution::Delete
+        );
+    }
+
+    #[test]
+    fn resolve_side_errors_when_a_recorded_helper_is_missing() {
+        let dir = TempDir::new().unwrap();
+        let meta = meta_with_sides(true, true, true);
+        let err = resolve_side(dir.path(), "f", &AcceptSide::Remote, Some(&meta)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("inconsistent") && msg.contains("remote helper missing"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_side_errors_when_an_unrecorded_helper_exists() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.omemfs-conflict-remote"), b"stray").unwrap();
+        let meta = meta_with_sides(true, true, false);
+        let err = resolve_side(dir.path(), "f", &AcceptSide::Remote, Some(&meta)).unwrap_err();
+        assert!(err.to_string().contains("remote helper unexpected"));
+    }
+
+    #[test]
+    fn resolve_side_falls_back_to_helper_presence_without_recorded_sides() {
+        let dir = TempDir::new().unwrap();
+        // No sidecar at all.
+        assert_eq!(
+            resolve_side(dir.path(), "f", &AcceptSide::Local, None).unwrap(),
+            Resolution::Delete
+        );
+        std::fs::write(dir.path().join("f.omemfs-conflict-local"), b"l").unwrap();
+        assert_eq!(
+            resolve_side(dir.path(), "f", &AcceptSide::Local, None).unwrap(),
+            Resolution::Helper(dir.path().join("f.omemfs-conflict-local"))
+        );
+        // A sidecar that predates `sides`.
+        let old = ConflictMeta::default();
+        assert!(matches!(
+            resolve_side(dir.path(), "f", &AcceptSide::Local, Some(&old)).unwrap(),
+            Resolution::Helper(_)
+        ));
+    }
+
+    #[test]
+    fn resolve_side_remote_symlink_has_no_helper() {
+        let dir = TempDir::new().unwrap();
+        let meta = ConflictMeta {
+            sides: Some(Sides {
+                base: true,
+                local: true,
+                remote: false,
+            }),
+            remote_resolution: Some(RemoteResolution::Symlink {
+                target: "t".to_string(),
+                mtime: None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_side(dir.path(), "f", &AcceptSide::Remote, Some(&meta)).unwrap(),
+            Resolution::RemoteSymlink
+        );
+        // Only the remote side may take the symlink branch.
+        assert_eq!(
+            resolve_side(dir.path(), "f2", &AcceptSide::Base, Some(&meta))
+                .unwrap_err()
+                .to_string()
+                .contains("inconsistent"),
+            true
+        );
+    }
+
+    #[test]
+    fn resolve_all_reports_every_inconsistent_path_and_no_partial_result() {
+        let dir = TempDir::new().unwrap();
+        let metas = vec![
+            ("a".to_string(), Some(meta_with_sides(true, true, true))),
+            ("b".to_string(), Some(meta_with_sides(true, true, true))),
+        ];
+        let msg = resolve_all(dir.path(), &AcceptSide::Remote, &metas)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("'a'") && msg.contains("'b'"), "{msg}");
+    }
+
+    #[test]
+    fn write_conflict_artifacts_records_sides_and_clears_stale_helpers() {
+        let dir = TempDir::new().unwrap();
+        let store_dir = TempDir::new().unwrap();
+        let store = LocalStore::for_cache(store_dir.path());
+        let base = dir.path().join("f.txt");
+        std::fs::write(&base, b"local").unwrap();
+        // Residue of an earlier conflict.
+        std::fs::write(dir.path().join("f.txt.omemfs-conflict-remote"), b"old").unwrap();
+
+        let file = std::fs::File::open(&base).unwrap();
+        write_conflict_artifacts(
+            dir.path(),
+            &base,
+            None,
+            Some(&HelperSource::WorkingFile(file)),
+            None,
+            ConflictMeta::default(),
+            &store,
+        )
+        .unwrap();
+
+        assert!(!dir.path().join("f.txt.omemfs-conflict-remote").exists());
+        assert_eq!(
+            std::fs::read(dir.path().join("f.txt.omemfs-conflict-local")).unwrap(),
+            b"local"
+        );
+        let meta = ConflictMeta::read(&base).unwrap();
+        let sides = meta.sides.unwrap();
+        assert!(!sides.base && sides.local && !sides.remote);
+    }
+
+    #[test]
+    fn write_helper_file_streams_blob_content() {
+        // A multi-chunk blob must be written to its helper file with byte-identical
+        // content (ED F0 escape stripped exactly once, no chunk tags leaking).
+        let content = pseudo_random(0x4242_1717, 10 * 1024 * 1024);
+        let store_dir = TempDir::new().unwrap();
+        let store = LocalStore::for_cache(store_dir.path());
+        let hash = crate::object::blob_hash(&content);
+        let serialised = crate::object::serialise_blob(&content);
+        codec::chunk::store_chunked(&store, &hash, &serialised, None).unwrap();
+        assert!(
+            codec::chunk::is_chunked(&store, &hash, None),
+            "expected multi-chunk blob"
+        );
+
+        let out_dir = TempDir::new().unwrap();
+        let base = out_dir.path().join("file.bin");
+        write_helper_file(
+            out_dir.path(),
+            &base,
+            ".omemfs-conflict-remote",
+            &HelperSource::Blob(hash),
+            &store,
+        )
+        .unwrap();
+
+        let helper = out_dir.path().join("file.bin.omemfs-conflict-remote");
+        assert_eq!(fs::read(&helper).unwrap(), content);
+    }
+
+    #[test]
+    fn write_helper_file_streams_working_file() {
+        // The local side stream-copies the working-tree file verbatim.
+        let content = pseudo_random(0x9999_0001, 3 * 1024 * 1024);
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("file.bin");
+        fs::write(&src, &content).unwrap();
+
+        // The store argument is unused for a WorkingFile source.
+        let store_dir = TempDir::new().unwrap();
+        let store = LocalStore::for_cache(store_dir.path());
+        let file = fs::File::open(&src).unwrap();
+        write_helper_file(
+            dir.path(),
+            &src,
+            ".omemfs-conflict-local",
+            &HelperSource::WorkingFile(file),
+            &store,
+        )
+        .unwrap();
+
+        let helper = dir.path().join("file.bin.omemfs-conflict-local");
+        assert_eq!(fs::read(&helper).unwrap(), content);
+    }
+
+    #[test]
+    fn write_helper_file_overwrites_existing() {
+        // A pre-existing helper file is overwritten (atomic temp+rename), matching
+        // the old fs::write behaviour.
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("file.bin");
+        fs::write(&src, b"new content").unwrap();
+        let helper = dir.path().join("file.bin.omemfs-conflict-local");
+        fs::write(&helper, b"stale helper content that is longer").unwrap();
+
+        let store_dir = TempDir::new().unwrap();
+        let store = LocalStore::for_cache(store_dir.path());
+        let file = fs::File::open(&src).unwrap();
+        write_helper_file(
+            dir.path(),
+            &src,
+            ".omemfs-conflict-local",
+            &HelperSource::WorkingFile(file),
+            &store,
+        )
+        .unwrap();
+        assert_eq!(fs::read(&helper).unwrap(), b"new content");
+    }
+
+    // `HelperSource::WorkingFile` must refuse to write a conflict-helper file
+    // through a directory that has been replaced by a symlink pointing
+    // outside `work_dir` -- the same guard the `Blob` arm already gets via
+    // `codec::chunk::materialise_to_file` (design/03_sync_model.md, "Write
+    // safety: the working-tree write boundary").
+    #[test]
+    #[cfg(unix)]
+    fn write_helper_file_refuses_working_file_through_symlinked_parent() {
+        let work_dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+
+        // "sub" stands in for a directory the clone_root tree tracks, but on
+        // disk it has been swapped for a symlink pointing outside the
+        // working tree.
+        let sub = work_dir.path().join("sub");
+        std::os::unix::fs::symlink(outside.path(), &sub).unwrap();
+
+        // The "local" file being conflict-helper-copied lives elsewhere; only
+        // `base_path`'s parent -- i.e. `sub` -- matters for the guard.
+        let src_dir = TempDir::new().unwrap();
+        let src = src_dir.path().join("local.txt");
+        fs::write(&src, b"local content").unwrap();
+        let file = fs::File::open(&src).unwrap();
+
+        let store_dir = TempDir::new().unwrap();
+        let store = LocalStore::for_cache(store_dir.path());
+
+        let base_path = sub.join("file.txt");
+        let err = write_helper_file(
+            work_dir.path(),
+            &base_path,
+            ".omemfs-conflict-local",
+            &HelperSource::WorkingFile(file),
+            &store,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::SymlinkEscape(_)),
+            "expected SymlinkEscape, got {err:?}"
+        );
+        assert!(
+            !outside
+                .path()
+                .join("file.txt.omemfs-conflict-local")
+                .exists(),
+            "conflict-helper content must never be written outside work_dir"
+        );
     }
 }

@@ -343,6 +343,35 @@ nothing is changed.
    logical content until a user manually intervenes.
 3. `clone_root` is not modified. The next `push` will see the stub as unchanged.
 
+**Re-verifying immediately before the delete.** The preconditions are checked
+up front, and for a directory that means a full scan that can take a long time.
+A file edited between that check and step (c) would be deleted with its unsaved
+edit, and the stub would restore the *old* content: the edit is lost. So each
+target records what the precondition check saw and step (c) re-checks it just
+before deleting:
+
+- A **file** target records the file's `(mtime, size)` when its hash was
+  verified. Immediately before `<name>` is deleted, its current `(mtime, size)`
+  must be unchanged; otherwise this target is **not** deleted, the stub record
+  written in step (b) is removed again, and the command fails with an error
+  naming the path (`... changed while being stubbed; nothing was deleted for
+  it`).
+- A **directory** target records the `(mtime, size)` of every regular file in
+  it, taking the snapshot **before** the verifying scan reads them (a snapshot
+  taken afterwards would record an edit made during the scan as if it had been
+  there all along). The same holds for a file target: its `(mtime, size)` is
+  read before its content is. Immediately before the directory's contents are removed, each
+  recorded file must be unchanged and no file may have appeared that was not
+  recorded; otherwise the directory is left untouched (its stub marker removed
+  again) and the command fails with an error naming the path.
+
+Targets are processed one at a time. A failure stops the command, but targets
+already stubbed stay stubbed (each is complete and self-consistent). Only the
+target whose re-check failed is rolled back. The window that remains is the few
+system calls between the re-check and the delete (the same limit as `pull`'s
+re-verification, design/03 "Re-verifying a path immediately before it is
+overwritten"); it cannot be closed for a path-based delete.
+
 Deletion in step (c) goes through the same `fsguard`-guarded boundary as any
 other working-tree mutation (`design/03_sync_model.md`, "Write safety: the
 working-tree write boundary") — including the directory-type check ahead of
