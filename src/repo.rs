@@ -820,6 +820,32 @@ fn lexically_normalize(path: &std::path::Path) -> PathBuf {
     out
 }
 
+/// Resolve symlinks in an absolute path. The longest existing ancestor is
+/// canonicalised and the not-yet-existing tail is appended lexically, so a
+/// path naming something that does not exist (a deleted file, a new file) still
+/// resolves through a symlinked prefix. `..` in the tail is folded lexically.
+fn canonical_abs(path: &std::path::Path) -> PathBuf {
+    let path = lexically_normalize(path);
+    let mut existing = path.as_path();
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    loop {
+        if let Ok(canon) = existing.canonicalize() {
+            let mut out = canon;
+            for comp in tail.iter().rev() {
+                out.push(comp);
+            }
+            return out;
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name);
+                existing = parent;
+            }
+            _ => return path,
+        }
+    }
+}
+
 /// Convert a `<path>` argument to a repository-root-relative, forward-slash
 /// string. Relative arguments are resolved against `cwd`; absolute arguments are
 /// used as-is. The result is then re-expressed relative to `repo_root`, so all
@@ -833,12 +859,15 @@ pub fn normalize_path(
     repo_root: &std::path::Path,
     cwd: &std::path::Path,
 ) -> Result<String, Error> {
+    // An absolute argument is canonicalised so it matches the (canonical) repo
+    // root whichever way it is spelled through a symlink. A relative argument
+    // is joined onto the already-canonical cwd and stays lexical: resolving a
+    // symlink *inside* the repository is fsguard's job, not path resolution's.
     let abs = if path.is_absolute() {
-        path.to_path_buf()
+        canonical_abs(path)
     } else {
-        cwd.join(path)
+        lexically_normalize(&cwd.join(path))
     };
-    let abs = lexically_normalize(&abs);
     let rel = abs.strip_prefix(repo_root).map_err(|_| {
         Error::Other(format!(
             "path '{}' is outside the repository '{}'",
@@ -856,9 +885,134 @@ pub fn normalize_path(
     Ok(normalised.trim_end_matches('/').to_string())
 }
 
+/// `normalize_path`, then refuse a result that names omemfs's own bookkeeping:
+/// the `.omemfs` metadata directory or anything in the reserved `.omemfs-`
+/// namespace, on any component (design/04 "Repository discovery", design/09
+/// "Reserved names as command arguments"). `.omemfs-filter` is tracked content
+/// and stays addressable. Checked on the resolved root-relative path, so `..`
+/// and absolute spellings cannot route around it; a path outside the
+/// repository keeps the outside-the-repository error.
+pub fn normalize_addressable_path(
+    path: &std::path::Path,
+    repo_root: &std::path::Path,
+    cwd: &std::path::Path,
+) -> Result<String, Error> {
+    let rel = normalize_path(path, repo_root, cwd)?;
+    let reserved = rel.split('/').any(|component| {
+        crate::object::is_metadata_dir_name(component)
+            || (component != ".omemfs-filter" && crate::object::is_reserved_name(component))
+    });
+    if reserved {
+        return Err(Error::Other(format!(
+            "'{}' is a reserved omemfs name and cannot be used as a path",
+            path.display()
+        )));
+    }
+    Ok(rel)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_abs_resolves_a_symlinked_prefix_and_a_missing_tail() {
+        let real = tempfile::TempDir::new().unwrap();
+        let real_path = real.path().canonicalize().unwrap();
+        let holder = tempfile::TempDir::new().unwrap();
+        let link = holder.path().join("link");
+        std::os::unix::fs::symlink(&real_path, &link).unwrap();
+        std::fs::write(real_path.join("a.txt"), b"x").unwrap();
+
+        assert_eq!(canonical_abs(&link.join("a.txt")), real_path.join("a.txt"));
+        // A target that does not exist yet keeps its missing tail.
+        assert_eq!(
+            canonical_abs(&link.join("new/dir.txt")),
+            real_path.join("new/dir.txt")
+        );
+        // `..` after a symlink is applied to the resolved location.
+        assert_eq!(canonical_abs(&link.join("sub/../a.txt")), real_path.join("a.txt"));
+    }
+
+    #[test]
+    fn normalize_path_accepts_an_absolute_path_spelled_through_a_symlinked_root() {
+        let real = tempfile::TempDir::new().unwrap();
+        let real_path = real.path().canonicalize().unwrap();
+        let holder = tempfile::TempDir::new().unwrap();
+        let link = holder.path().join("link");
+        std::os::unix::fs::symlink(&real_path, &link).unwrap();
+
+        // repo_root/cwd are the canonical ones (as main.rs passes them); the
+        // argument is spelled through the symlink.
+        let rel = normalize_path(&link.join("a.txt"), &real_path, &real_path).unwrap();
+        assert_eq!(rel, "a.txt");
+        // A path genuinely outside the repository is still rejected.
+        let other = tempfile::TempDir::new().unwrap();
+        assert!(normalize_path(other.path(), &real_path, &real_path).is_err());
+    }
+
+    #[test]
+    fn normalize_path_does_not_resolve_a_symlink_inside_the_repository() {
+        let real = tempfile::TempDir::new().unwrap();
+        let root = real.path().canonicalize().unwrap();
+        let elsewhere = tempfile::TempDir::new().unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), root.join("inner")).unwrap();
+        // Relative argument: stays lexical, so `inner/x` is still `inner/x`
+        // and not a path "outside the repository".
+        assert_eq!(
+            normalize_path(std::path::Path::new("inner/x"), &root, &root).unwrap(),
+            "inner/x"
+        );
+    }
+
+    #[test]
+    fn normalize_addressable_path_accepts_ordinary_and_filter_paths() {
+        let work = std::path::Path::new("/work");
+        for ok in ["", "a.txt", "sub/deep/b.txt", ".omemfs-filter", "sub/.omemfs-filter"] {
+            assert_eq!(
+                normalize_addressable_path(std::path::Path::new(ok), work, work).unwrap(),
+                ok
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_addressable_path_rejects_every_reserved_spelling() {
+        let work = std::path::Path::new("/work");
+        for bad in [
+            ".omemfs",
+            ".omemfs/config",
+            "foo.omemfs-stub",
+            "a.txt.omemfs-conflict-base",
+            "a.txt.omemfs-conflict-meta",
+            ".omemfs-newthing",
+            ".omemfs-tmp-1-2-3",
+            "d/.omemfs-stub",
+            "d/.omemfs-stub/x",
+            "x.omemfs-notes",
+        ] {
+            let err = normalize_addressable_path(std::path::Path::new(bad), work, work)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("reserved omemfs name"), "{bad}: {err}");
+            assert!(err.contains(bad), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn normalize_addressable_path_checks_the_resolved_path_not_the_spelling() {
+        let work = std::path::Path::new("/work");
+        let cwd = std::path::Path::new("/work/sub");
+        // `..` and absolute spellings resolve to the same reserved path.
+        assert!(normalize_addressable_path(std::path::Path::new("../.omemfs/x"), work, cwd).is_err());
+        assert!(normalize_addressable_path(std::path::Path::new("/work/sub/f.omemfs-stub"), work, cwd).is_err());
+        // A reserved-looking name that is *outside* the repository keeps the
+        // outside-the-repository error.
+        let err = normalize_addressable_path(std::path::Path::new("/elsewhere/.omemfs"), work, cwd)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("outside the repository"), "{err}");
+    }
     use tempfile::TempDir;
 
     #[test]

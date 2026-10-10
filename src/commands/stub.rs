@@ -205,7 +205,7 @@ pub fn run(opts: StubOptions) -> Result<(), Error> {
     for path in &opts.paths {
         // Resolve the argument against the cwd, then re-express it relative to
         // the repository root (so paths given from a subdirectory work).
-        let rel = crate::repo::normalize_path(path, &repo.work_dir, &opts.current_dir)?;
+        let rel = crate::repo::normalize_addressable_path(path, &repo.work_dir, &opts.current_dir)?;
         let abs = repo.work_dir.join(&rel);
 
         // fsguard::is_real_dir (design/03_sync_model.md, "Write safety: the

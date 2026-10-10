@@ -433,7 +433,7 @@ EOF
 
     run "$OMEMFS" push .omemfs
     [ "$status" -ne 0 ]
-    [[ "$output" == *"system path"* ]]
+    [[ "$output" == *"reserved omemfs name"* ]]
 }
 
 @test "push: scoped push of a file inside .omemfs is rejected" {
@@ -443,7 +443,7 @@ EOF
 
     run "$OMEMFS" push .omemfs/config
     [ "$status" -ne 0 ]
-    [[ "$output" == *"system path"* ]]
+    [[ "$output" == *"reserved omemfs name"* ]]
 }
 
 # ---------------------------------------------------------------------------
@@ -576,6 +576,75 @@ PY
     [ -f from_backup/file.txt ]
     [ "$(cat from_backup/file.txt)" = "backed up" ]
 
+    rm -rf "$BACKUP_DIR"
+}
+
+# ---------------------------------------------------------------------------
+# push --with-backup: a missing backup remote is a configuration error
+# (design/04 "Backup must be configured")
+# ---------------------------------------------------------------------------
+
+BACKUP_REQUIRED_MSG="--with-backup requires a 'backup' remote; run 'omemfs config add-backup' first"
+
+@test "push --with-backup: no backup configured is an error and origin is not touched" {
+    echo "hello" > file.txt
+    run "$OMEMFS" push --with-backup
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"$BACKUP_REQUIRED_MSG"* ]]
+    # The check runs before anything is pushed: origin stays empty and the
+    # file is still unpushed.
+    [ ! -f "$REMOTE_DIR/INDEX_ROOT" ]
+    run "$OMEMFS" ls --dirty
+    [[ "$output" == *"file.txt"* ]]
+}
+
+@test "push --with-backup: no backup configured is an error even when there is nothing to push" {
+    echo "hello" > file.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    run "$OMEMFS" push --with-backup
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"$BACKUP_REQUIRED_MSG"* ]]
+    [[ "$output" != *"Nothing to push"* ]]
+}
+
+@test "push --with-backup --dry-run: no backup configured is the same error" {
+    echo "hello" > file.txt
+    run "$OMEMFS" push --with-backup --dry-run
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"$BACKUP_REQUIRED_MSG"* ]]
+    [[ "$output" != *"Would push"* ]]
+}
+
+@test "push --with-backup: no backup configured is an error for a scoped push too" {
+    mkdir sub
+    echo "hello" > sub/file.txt
+    run "$OMEMFS" push --with-backup sub
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"$BACKUP_REQUIRED_MSG"* ]]
+    [ ! -f "$REMOTE_DIR/INDEX_ROOT" ]
+}
+
+@test "push: without --with-backup a missing backup remote is irrelevant" {
+    echo "hello" > file.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    run "$OMEMFS" push --dry-run
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"backup"* ]]
+}
+
+@test "push --with-backup: with a backup configured it still succeeds (check is not over-eager)" {
+    local BACKUP_DIR
+    BACKUP_DIR="$(mktemp -d)"
+    run "$OMEMFS" config add-backup --new --url "$BACKUP_DIR"
+    [ "$status" -eq 0 ]
+    echo "hello" > file.txt
+    run "$OMEMFS" push --with-backup --dry-run
+    [ "$status" -eq 0 ]
+    run "$OMEMFS" push --with-backup
+    [ "$status" -eq 0 ]
+    [ -f "$BACKUP_DIR/INDEX_ROOT" ]
     rm -rf "$BACKUP_DIR"
 }
 

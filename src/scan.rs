@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::SystemTime;
 
 use chrono::{DateTime, TimeZone, Utc};
@@ -10,7 +11,7 @@ use rayon::prelude::*;
 use crate::codec;
 use crate::dlog_l1;
 use crate::dtimer_l1;
-use crate::error::Error;
+use crate::error::{Error, map_fd_exhaustion};
 use crate::filter::FilterSet;
 use crate::fsguard::{EntryKind, EntryStat, GuardedDir};
 use crate::object::{Hash, TreeEntry};
@@ -199,6 +200,8 @@ pub fn scan_and_store_with_stub_store(
         stat_cache,
         write_blobs,
         false,
+        DEFAULT_FD_BUDGET,
+        None,
     )
 }
 
@@ -225,6 +228,8 @@ pub fn scan_and_store_tolerating_unresolved_stubs(
         stat_cache,
         false,
         true,
+        DEFAULT_FD_BUDGET,
+        None,
     )
 }
 
@@ -238,6 +243,8 @@ fn scan_impl(
     stat_cache: &StatCache,
     write_blobs: bool,
     tolerate_unresolved_stubs: bool,
+    fd_budget: usize,
+    probe: Option<&FdProbe>,
 ) -> Result<ScanResult, Error> {
     let _t = dtimer_l1!("scan");
     let now = SystemTime::now();
@@ -266,7 +273,7 @@ fn scan_impl(
         Err(Error::SymlinkEscape(_)) => {
             return Err(Error::SourceChanged(dir.display().to_string()));
         }
-        Err(e) => return Err(e),
+        Err(e) => return Err(map_fd_exhaustion(e, &rel_prefix)),
     };
     // Scope-limited filter load (design/05): when scanning a subtree (`dir` is a
     // descendant of `work_dir`), load only the filters that can affect in-scope
@@ -274,14 +281,18 @@ fn scan_impl(
     // delegates to the full load.
     let filters = FilterSet::load_scoped(work_dir, &rel_prefix);
     dlog_l1!("scan dir: {:?} (with stat cache)", dir);
+    let clone_root_children = clone_root_entries.map(ChildIndex::new);
     let cfg = FileJobConfig {
         store,
         stub_store,
         clone_root_entries,
+        clone_root_children: clone_root_children.as_ref(),
         stat_cache: Some(stat_cache),
         now,
         write_blobs,
         tolerate_unresolved_stubs,
+        fd_budget: FdBudget::new(fd_budget),
+        probe,
     };
     // Run the whole recursive walk inside the persistent scan pool so that the
     // top-level `rayon::scope` / `par_iter` and every nested one share the same
@@ -306,6 +317,7 @@ fn scan_impl(
             },
             &cfg,
             &filters,
+            false,
         )
     })?;
     if vanished {
@@ -482,20 +494,15 @@ struct DirScan {
     vanished: bool,
 }
 
-/// A subdirectory to recurse into, classified during the (sequential) name-walk
-/// of the parent level. The recursion itself runs in parallel across siblings.
+/// A subdirectory to recurse into, found during the (sequential) name-walk of
+/// the parent level. It holds no fd: the child is opened only when its own scan
+/// starts (design/03 "File descriptor budget").
 struct SubdirJob<'a> {
     name: String,
     rel_path: String,
     /// The already-open directory this subdirectory is listed in; the child
     /// is opened relative to it (`openat(O_NOFOLLOW)`), never by path.
     parent: &'a GuardedDir,
-    /// The subdirectory itself, opened from `parent` while classifying it.
-    dir: GuardedDir,
-    /// `Some(record)` for a partially-expanded directory stub: after the disk
-    /// subtree is scanned, its result is merged with the stub's recorded tree
-    /// (design/08 "Partial expansion"). `None` for an ordinary directory.
-    partial_stub: Option<stub::StubRecord>,
 }
 
 /// Merge a child's scan result into the parent's accumulators (files map and
@@ -522,12 +529,16 @@ fn merge_child(files: &mut HashMap<String, ScannedFile>, side: &mut ScanSideData
 /// are recursed via `rayon::scope` and regular files are hashed via `par_iter`.
 /// The `rayon::scope` join point waits for every child before this level builds
 /// its own tree, preserving the parent-after-child ordering the tree hash needs.
+///
+/// With `serial` set (fd budget exhausted above this directory) the same work
+/// runs as plain loops: no `rayon::scope`, no `par_iter`, no permits.
 fn scan_dir(
     dir: &GuardedDir,
     rel_prefix: &str,
     recheck: Option<&RecheckFn<'_>>,
     cfg: &FileJobConfig<'_>,
     filters: &FilterSet,
+    serial: bool,
 ) -> Result<DirScan, Error> {
     let mut entries: Vec<TreeEntry> = Vec::new();
     let mut files: HashMap<String, ScannedFile> = HashMap::new();
@@ -546,7 +557,10 @@ fn scan_dir(
     let mut raw_name_set: HashSet<String> = HashSet::new();
     {
         {
-            for (n, e) in dir.entries()? {
+            for (n, e) in dir
+                .entries()
+                .map_err(|e| map_fd_exhaustion(e, rel_prefix))?
+            {
                 if n == ".omemfs" {
                     continue;
                 }
@@ -667,7 +681,7 @@ fn scan_dir(
         // set lookup against the names already listed at this level (no statx).
         let stub_name = format!("{}{}", name, stub::STUB_SUFFIX);
         if raw_name_set.contains(&stub_name) {
-            match read_file_stub(dir, &stub_name) {
+            match read_file_stub(dir, &stub_name).map_err(|e| map_fd_exhaustion(e, &rel_path)) {
                 Ok(record) => {
                     // Record the stub as side data even when stale (real file
                     // present); display logic decides how to treat it.
@@ -687,7 +701,7 @@ fn scan_dir(
                     }
                     // Stale stub: the real file takes priority below.
                 }
-                Err(e) if real_entry.is_none() => {
+                Err(e) if real_entry.is_none() || matches!(e, Error::TooManyOpenFiles(_)) => {
                     // Fail-closed (design/08_stub_system.md, "Malformed stub
                     // records are fail-closed"): the real file is absent, so
                     // this marker is the ONLY record of this entry's content.
@@ -764,54 +778,13 @@ fn scan_dir(
             }
             EntryKind::Dir => {
                 side.seen_other.insert(rel_path.clone());
-                // Open the child relative to this directory's fd. A name that
-                // was a directory when listed but is a symlink (or gone) now is
-                // a live-path race: never followed, previous entry preserved.
-                let child_dir = match dir.open_subdir(&name) {
-                    Ok(d) => d,
-                    Err(Error::SymlinkEscape(_)) => {
-                        preserve_unstable_entry(&mut entries, &mut side, cfg, &rel_path);
-                        continue;
-                    }
-                    Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-                        preserve_unstable_entry(&mut entries, &mut side, cfg, &rel_path);
-                        continue;
-                    }
-                    Err(e) => return Err(e),
-                };
-                match classify_dir_stub(&child_dir, &rel_path, &mut side)? {
-                    // Fully stubbed: use the recorded tree hash directly without
-                    // scanning the subtree.
-                    DirStubKind::Full(record) => {
-                        entries.push(TreeEntry::Tree {
-                            name,
-                            hash: record.hash,
-                            mtime: record.mtime,
-                            size: record.size,
-                            blob_count: record.blob_count,
-                        });
-                        continue;
-                    }
-                    // Partial expansion: scan the disk subtree, then merge with the
-                    // stub's recorded tree after recursion.
-                    DirStubKind::Partial(record) => {
-                        subdir_jobs.push(SubdirJob {
-                            name,
-                            rel_path,
-                            parent: dir,
-                            dir: child_dir,
-                            partial_stub: Some(record),
-                        });
-                        continue;
-                    }
-                    DirStubKind::None => {}
-                }
+                // The child is opened (and its stub marker classified) by its
+                // own scan, not here, so a wide directory does not hold one
+                // fd per child while it is being listed.
                 subdir_jobs.push(SubdirJob {
                     name,
                     rel_path,
                     parent: dir,
-                    dir: child_dir,
-                    partial_stub: None,
                 });
             }
             EntryKind::File => {
@@ -846,24 +819,36 @@ fn scan_dir(
         }
     }
 
-    // --- Parallel pass 1: recurse into subdirectories ---------------------
-    // Each child scan is independent and returns its own DirScan. rayon::scope
-    // runs them on the shared pool and the scope's close is a join barrier: every
-    // child finishes before this level builds its tree (parent-after-child).
-    // Results are collected into a pre-sized slot vector so a panic-free scope
-    // body needs no locking; errors are surfaced first-error-wins after join.
+    // --- Pass 1: recurse into subdirectories -------------------------------
+    // Each child scan is independent and returns its own DirScan. In parallel
+    // mode rayon::scope runs them on the shared pool and the scope's close is a
+    // join barrier: every child finishes before this level builds its tree
+    // (parent-after-child). Results go into a pre-sized slot vector so the scope
+    // body needs no locking. In serial mode the children run one after another
+    // and each one (and everything below it) stays serial. Either way the first
+    // error wins.
     if !subdir_jobs.is_empty() {
-        let mut slots: Vec<Option<Result<(SubdirEntry, DirScan), Error>>> =
-            (0..subdir_jobs.len()).map(|_| None).collect();
-        rayon::scope(|scope| {
-            for (job, slot) in subdir_jobs.iter().zip(slots.iter_mut()) {
-                scope.spawn(move |_| {
-                    *slot = Some(scan_subdir(job, cfg, filters));
-                });
-            }
-        });
-        for slot in slots {
-            let (subentry, child_scan) = slot.expect("rayon::scope filled every slot")?;
+        let children: Vec<(SubdirEntry, DirScan)> = if serial {
+            subdir_jobs
+                .iter()
+                .map(|job| scan_subdir(job, cfg, filters, true))
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            let mut slots: Vec<Option<Result<(SubdirEntry, DirScan), Error>>> =
+                (0..subdir_jobs.len()).map(|_| None).collect();
+            rayon::scope(|scope| {
+                for (job, slot) in subdir_jobs.iter().zip(slots.iter_mut()) {
+                    scope.spawn(move |_| {
+                        *slot = Some(scan_subdir(job, cfg, filters, false));
+                    });
+                }
+            });
+            slots
+                .into_iter()
+                .map(|slot| slot.expect("rayon::scope filled every slot"))
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (subentry, child_scan) in children {
             // Merge the child's files/side first (moves child_scan.side out
             // before we read the entry built from it).
             let entry = subentry.entry;
@@ -874,15 +859,22 @@ fn scan_dir(
         }
     }
 
-    // --- Parallel pass 2: hash this level's regular files -----------------
+    // --- Pass 2: hash this level's regular files ---------------------------
     // Each job is independent (STAT_CACHE / clone-root lookups are read-only;
-    // content-addressed blob/tree writes are idempotent). par_iter collects into
-    // a Result, which short-circuits on the first Err (first-error-wins). Entry
-    // order does not matter — build_and_store sorts by name.
-    let job_results: Vec<FileJobResult> = file_jobs
-        .par_iter()
-        .map(|job| process_file_job(job, cfg))
-        .collect::<Result<Vec<_>, _>>()?;
+    // content-addressed blob/tree writes are idempotent). Both modes collect
+    // into a Result, which short-circuits on the first Err (first-error-wins).
+    // Entry order does not matter — build_and_store sorts by name.
+    let job_results: Vec<FileJobResult> = if serial {
+        file_jobs
+            .iter()
+            .map(|job| process_file_job(job, cfg))
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        file_jobs
+            .par_iter()
+            .map(|job| process_file_job(job, cfg))
+            .collect::<Result<Vec<_>, _>>()?
+    };
     for (entry, scanned, unstable) in job_results {
         if let Some((rel_path, sf)) = scanned {
             files.insert(rel_path, sf);
@@ -900,18 +892,16 @@ fn scan_dir(
     // reappeared by the end, this was not a stable deletion. Preserve the old
     // entry for this push; a later push will capture the replacement.
     if cfg.write_blobs
-        && let Some(previous) = cfg.clone_root_entries
+        && let Some(children) = cfg.clone_root_children
     {
-        for (path, old_entry) in previous {
-            if parent_rel(path) != rel_prefix
-                || raw_name_set.contains(old_entry.name())
-                || entries.iter().any(|entry| entry.name() == old_entry.name())
-            {
+        let present: HashSet<String> = entries.iter().map(|e| e.name().to_string()).collect();
+        for (path, old_entry) in children.children_of(rel_prefix) {
+            if raw_name_set.contains(old_entry.name()) || present.contains(old_entry.name()) {
                 continue;
             }
             match dir.lstat(old_entry.name()) {
                 Ok(_) => {
-                    side.unstable_paths.insert(path.clone());
+                    side.unstable_paths.insert(path.to_string());
                     entries.push(old_entry.clone());
                 }
                 Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -970,22 +960,91 @@ struct SubdirEntry {
     entry: Option<TreeEntry>,
 }
 
+/// A `DirScan` standing in for a subdirectory that was not scanned (fully
+/// stubbed, or gone / replaced before it could be opened). Only `side` matters.
+fn unscanned_dir(side: ScanSideData) -> DirScan {
+    DirScan {
+        hash: Hash::compute(b"unscanned-directory"),
+        mtime: None,
+        size: 0,
+        blob_count: 0,
+        files: HashMap::new(),
+        side,
+        vanished: false,
+    }
+}
+
 /// Scan one subdirectory job and produce both the parent's `TreeEntry` and the
 /// child's full `DirScan` (so the parent can merge files/side). For a partial
 /// directory-stub expansion, the disk subtree is merged with the stub's recorded
 /// tree (design/08 "Partial expansion") before the entry is built.
+///
+/// The child is opened here, through the parent's fd, and its stub marker is
+/// classified from that same open (design/03 "File descriptor budget"). Unless
+/// the subtree is already serial (`inherited_serial`), a budget permit decides
+/// the mode: with a permit this directory scans in parallel mode and holds the
+/// permit until its fd is closed; without one it and everything below it scan
+/// serially. The budget is never waited on.
 fn scan_subdir(
     job: &SubdirJob,
     cfg: &FileJobConfig<'_>,
     filters: &FilterSet,
+    inherited_serial: bool,
 ) -> Result<(SubdirEntry, DirScan), Error> {
+    // Declared before `child` so the fd is closed before the permit is released.
+    let permit = if inherited_serial {
+        None
+    } else {
+        cfg.fd_budget.try_acquire()
+    };
+    let serial = permit.is_none();
+    if serial && let Some(probe) = cfg.probe {
+        probe.serial_scans.fetch_add(1, Ordering::Relaxed);
+    }
+
+    let mut side = ScanSideData::default();
+    let child = match job.parent.open_subdir(&job.name) {
+        Ok(d) => d,
+        // A name that was a directory when listed but is a symlink (or gone)
+        // now is a live-path race: never followed, previous entry preserved.
+        Err(Error::SymlinkEscape(_)) => return Ok(unstable_subdir(job, cfg, side)),
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(unstable_subdir(job, cfg, side));
+        }
+        Err(e) => return Err(map_fd_exhaustion(e, &job.rel_path)),
+    };
+    let _open = ProbeOpen::new(cfg.probe);
+
+    let partial_stub = match classify_dir_stub(&child, &job.rel_path, &mut side)? {
+        // Fully stubbed: use the recorded tree hash directly without scanning
+        // the subtree.
+        DirStubKind::Full(record) => {
+            let entry = TreeEntry::Tree {
+                name: job.name.clone(),
+                hash: record.hash,
+                mtime: record.mtime,
+                size: record.size,
+                blob_count: record.blob_count,
+            };
+            return Ok((SubdirEntry { entry: Some(entry) }, unscanned_dir(side)));
+        }
+        // Partial expansion: scan the disk subtree, then merge with the stub's
+        // recorded tree after it.
+        DirStubKind::Partial(record) => Some(record),
+        DirStubKind::None => None,
+    };
+
     let recheck = || match job.parent.lstat(&job.name) {
         Ok(st) => Ok(Some(st)),
         Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     };
     let recheck: &RecheckFn<'_> = &recheck;
-    let mut child_scan = scan_dir(&job.dir, &job.rel_path, Some(recheck), cfg, filters)?;
+    let mut child_scan = scan_dir(&child, &job.rel_path, Some(recheck), cfg, filters, serial)?;
+    drop(_open);
+    drop(child);
+    drop(permit);
+    child_scan.side.stubs.extend(side.stubs);
     if child_scan.vanished {
         child_scan.side.unstable_paths.insert(job.rel_path.clone());
         return Ok((
@@ -995,7 +1054,7 @@ fn scan_subdir(
             child_scan,
         ));
     }
-    let entry = match &job.partial_stub {
+    let entry = match &partial_stub {
         Some(record) => {
             match merge_partial_expansion(&record.hash, &child_scan.hash, cfg.stub_store, cfg.store)
             {
@@ -1032,6 +1091,22 @@ fn scan_subdir(
     Ok((SubdirEntry { entry: Some(entry) }, child_scan))
 }
 
+/// Result for a subdirectory that could not be opened because it was replaced
+/// or removed after being listed: unstable, previous entry preserved.
+fn unstable_subdir(
+    job: &SubdirJob,
+    cfg: &FileJobConfig<'_>,
+    mut side: ScanSideData,
+) -> (SubdirEntry, DirScan) {
+    side.unstable_paths.insert(job.rel_path.clone());
+    (
+        SubdirEntry {
+            entry: previous_entry(cfg, &job.rel_path),
+        },
+        unscanned_dir(side),
+    )
+}
+
 /// Read and parse a file-stub marker (`<name>.omemfs-stub`). Any I/O or JSON
 /// error propagates as-is; callers decide whether that is fatal (see
 /// design/08_stub_system.md, "Malformed stub records are fail-closed").
@@ -1062,6 +1137,36 @@ fn parent_rel(path: &str) -> &str {
     path.rsplit_once('/')
         .map(|(parent, _)| parent)
         .unwrap_or("")
+}
+
+/// `clone_root` entries grouped by the directory that directly contains them
+/// (design/03 "The scan's per-directory cost depends only on that directory").
+/// Built once per scan so each directory level reads only its own recorded
+/// children instead of filtering the whole flat map.
+struct ChildIndex<'a> {
+    by_parent: HashMap<&'a str, Vec<(&'a str, &'a TreeEntry)>>,
+}
+
+impl<'a> ChildIndex<'a> {
+    fn new(flat: &'a HashMap<String, TreeEntry>) -> Self {
+        let mut by_parent: HashMap<&'a str, Vec<(&'a str, &'a TreeEntry)>> = HashMap::new();
+        for (path, entry) in flat {
+            by_parent
+                .entry(parent_rel(path))
+                .or_default()
+                .push((path.as_str(), entry));
+        }
+        Self { by_parent }
+    }
+
+    /// The recorded `(path, entry)` pairs directly inside `dir`
+    /// (`""` = the repository root), in no particular order.
+    fn children_of(&self, dir: &str) -> impl Iterator<Item = (&'a str, &'a TreeEntry)> + '_ {
+        self.by_parent
+            .get(dir)
+            .into_iter()
+            .flat_map(|v| v.iter().copied())
+    }
 }
 
 fn previous_entry(cfg: &FileJobConfig<'_>, rel_path: &str) -> Option<TreeEntry> {
@@ -1122,12 +1227,95 @@ struct FileJobConfig<'a> {
     /// construct both from the same underlying `.omemfs/objects/` directory.
     stub_store: &'a dyn ObjectStore,
     clone_root_entries: Option<&'a HashMap<String, TreeEntry>>,
+    /// `clone_root_entries` grouped by parent directory; `Some` exactly when
+    /// `clone_root_entries` is.
+    clone_root_children: Option<&'a ChildIndex<'a>>,
     stat_cache: Option<&'a StatCache>,
     now: SystemTime,
     write_blobs: bool,
     /// `ls`: a partial expansion whose recorded tree cannot be read is left
     /// unmerged and reported instead of failing the scan.
     tolerate_unresolved_stubs: bool,
+    /// Directory-fd permits for this scan (per scan, never process-global).
+    fd_budget: FdBudget,
+    /// Test instrumentation; `None` outside tests.
+    probe: Option<&'a FdProbe>,
+}
+
+/// Default number of directory fds a scan may hold open in parallel mode
+/// (design/03 "File descriptor budget").
+const DEFAULT_FD_BUDGET: usize = 128;
+
+/// Non-blocking counter of directory-fd permits. Waiting on it could deadlock:
+/// permits are held by ancestors that are themselves waiting for their children.
+struct FdBudget {
+    permits: AtomicUsize,
+}
+
+impl FdBudget {
+    fn new(permits: usize) -> Self {
+        Self {
+            permits: AtomicUsize::new(permits),
+        }
+    }
+
+    fn try_acquire(&self) -> Option<FdPermit<'_>> {
+        self.permits
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .ok()
+            .map(|_| FdPermit { budget: self })
+    }
+}
+
+/// A held permit; released on drop.
+struct FdPermit<'a> {
+    budget: &'a FdBudget,
+}
+
+impl Drop for FdPermit<'_> {
+    fn drop(&mut self) {
+        self.budget.permits.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// Per-scan counters used by tests to observe fd use without process-global state.
+#[derive(Default)]
+struct FdProbe {
+    open: AtomicUsize,
+    peak: AtomicUsize,
+    serial_scans: AtomicUsize,
+}
+
+#[cfg(test)]
+impl FdProbe {
+    fn peak(&self) -> usize {
+        self.peak.load(Ordering::Relaxed)
+    }
+
+    fn serial_scans(&self) -> usize {
+        self.serial_scans.load(Ordering::Relaxed)
+    }
+}
+
+/// Counts one open child directory in the probe while alive.
+struct ProbeOpen<'a>(Option<&'a FdProbe>);
+
+impl<'a> ProbeOpen<'a> {
+    fn new(probe: Option<&'a FdProbe>) -> Self {
+        if let Some(p) = probe {
+            let now = p.open.fetch_add(1, Ordering::Relaxed) + 1;
+            p.peak.fetch_max(now, Ordering::Relaxed);
+        }
+        Self(probe)
+    }
+}
+
+impl Drop for ProbeOpen<'_> {
+    fn drop(&mut self) {
+        if let Some(p) = self.0 {
+            p.open.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Result of one file job: optional entry (new transient files may disappear),
@@ -1267,7 +1455,7 @@ fn process_file_job(job: &FileJob<'_>, cfg: &FileJobConfig<'_>) -> Result<FileJo
             Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Ok((previous_entry(cfg, rel_path), None, Some(rel_path.clone())));
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(map_fd_exhaustion(e, rel_path)),
         }
     } else {
         None
@@ -1279,7 +1467,7 @@ fn process_file_job(job: &FileJob<'_>, cfg: &FileJobConfig<'_>) -> Result<FileJo
             Err(Error::SourceChanged(_)) => {
                 return Ok((previous_entry(cfg, rel_path), None, Some(rel_path.clone())));
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(map_fd_exhaustion(e, rel_path)),
         },
     };
     let effective_mtime_st = captured
@@ -1364,7 +1552,7 @@ fn classify_dir_stub(
         Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(DirStubKind::None);
         }
-        Err(e) => return Err(e),
+        Err(e) => return Err(map_fd_exhaustion(e, rel_path)),
     }
     // Fail-closed (design/08_stub_system.md, "Malformed stub records are
     // fail-closed"): the marker existing means the real directory content is
@@ -1374,13 +1562,14 @@ fn classify_dir_stub(
     // uploads as a deletion -- silently destroying the remote's copy of
     // content that in truth still exists, only its local marker is damaged.
     // Abort the whole scan instead so the operator notices and repairs it.
-    let text = read_to_string_at(dir, stub::DIR_STUB_NAME)?;
+    let text = read_to_string_at(dir, stub::DIR_STUB_NAME)
+        .map_err(|e| map_fd_exhaustion(e, rel_path))?;
     let record: stub::StubRecord = serde_json::from_str(&text)?;
     side.stubs.push((rel_path.to_string(), record.clone()));
     if record.target_type != stub::StubTargetType::Tree {
         return Ok(DirStubKind::None);
     }
-    Ok(if dir_has_real_children(dir) {
+    Ok(if dir_has_real_children(dir, rel_path)? {
         DirStubKind::Partial(record)
     } else {
         DirStubKind::Full(record)
@@ -1390,10 +1579,15 @@ fn classify_dir_stub(
 /// Returns true if `dir` contains any entry other than the directory stub
 /// marker (`.omemfs-stub`). Used to distinguish a fully-stubbed directory from
 /// a partially expanded one.
-fn dir_has_real_children(dir: &GuardedDir) -> bool {
+fn dir_has_real_children(dir: &GuardedDir, rel_path: &str) -> Result<bool, Error> {
     match dir.entries() {
-        Ok(entries) => entries.iter().any(|(n, _)| n != stub::DIR_STUB_NAME),
-        Err(_) => false,
+        Ok(entries) => Ok(entries.iter().any(|(n, _)| n != stub::DIR_STUB_NAME)),
+        Err(e) => match map_fd_exhaustion(e, rel_path) {
+            // Treating fd exhaustion as "no children" would misclassify a
+            // partially expanded directory as fully stubbed.
+            e @ Error::TooManyOpenFiles(_) => Err(e),
+            _ => Ok(false),
+        },
     }
 }
 
@@ -1577,6 +1771,152 @@ mod tests {
     use crate::tree_ops;
     use std::fs;
     use std::time::Duration;
+
+    fn blob(name: &str) -> TreeEntry {
+        TreeEntry::Blob {
+            name: name.to_string(),
+            hash: crate::object::blob_hash(name.as_bytes()),
+            mtime: None,
+            size: name.len() as u64,
+            mode: None,
+        }
+    }
+
+    fn flat(paths: &[&str]) -> HashMap<String, TreeEntry> {
+        paths
+            .iter()
+            .map(|p| {
+                let name = p.rsplit('/').next().unwrap();
+                (p.to_string(), blob(name))
+            })
+            .collect()
+    }
+
+    /// The old per-directory scan: every flat entry whose parent is `dir`.
+    fn children_by_full_scan(flat: &HashMap<String, TreeEntry>, dir: &str) -> Vec<String> {
+        let mut v: Vec<String> = flat
+            .keys()
+            .filter(|p| parent_rel(p) == dir)
+            .cloned()
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn children_by_index(index: &ChildIndex<'_>, dir: &str) -> Vec<String> {
+        let mut v: Vec<String> = index
+            .children_of(dir)
+            .map(|(path, _)| path.to_string())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn child_index_matches_a_full_scan_for_every_directory() {
+        let map = flat(&[
+            "top.txt",
+            "a/one",
+            "a/two",
+            "a/deep/x",
+            "a/deep/y",
+            "a/deep/er/z",
+            "b/only",
+            "a b/space",
+            "a/.hidden",
+        ]);
+        let index = ChildIndex::new(&map);
+        for dir in ["", "a", "a/deep", "a/deep/er", "b", "a b", "missing", "a/dee"] {
+            assert_eq!(
+                children_by_index(&index, dir),
+                children_by_full_scan(&map, dir),
+                "directory {dir:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn child_index_does_not_mistake_a_name_prefix_for_a_parent() {
+        // `ab/x` is not a child of `a`, and `a/x` is not a child of `ab`.
+        let map = flat(&["a/x", "ab/x", "a/b/x"]);
+        let index = ChildIndex::new(&map);
+        assert_eq!(children_by_index(&index, "a"), vec!["a/x"]);
+        assert_eq!(children_by_index(&index, "ab"), vec!["ab/x"]);
+        assert_eq!(children_by_index(&index, "a/b"), vec!["a/b/x"]);
+    }
+
+    #[test]
+    fn child_index_of_an_empty_map_has_no_children() {
+        let map: HashMap<String, TreeEntry> = HashMap::new();
+        let index = ChildIndex::new(&map);
+        assert_eq!(index.children_of("").count(), 0);
+        assert_eq!(index.children_of("a").count(), 0);
+    }
+
+    #[test]
+    fn child_index_returns_the_recorded_entry_for_each_child() {
+        let map = flat(&["a/one"]);
+        let index = ChildIndex::new(&map);
+        let (path, entry) = index.children_of("a").next().unwrap();
+        assert_eq!(path, "a/one");
+        assert_eq!(entry.name(), "one");
+    }
+
+    /// A recorded file that is gone from the working tree is a real deletion
+    /// and must NOT be resurrected by the reappeared-entry check. Pinned across
+    /// nested directories so an index that returned another directory's
+    /// children would show up as a resurrected entry.
+    #[test]
+    fn unchanged_scan_drops_a_recorded_file_that_is_really_gone() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let work = dir.path();
+        fs::create_dir_all(work.join("a/deep")).unwrap();
+        fs::write(work.join("a/keep.txt"), b"keep").unwrap();
+        fs::write(work.join("a/deep/kept.txt"), b"kept").unwrap();
+
+        let mut clone_root = flat(&["a/keep.txt", "a/deep/kept.txt", "a/gone.txt", "a/deep/gone2.txt", "zzz/elsewhere.txt"]);
+        // Give the entries real hashes so nothing else differs.
+        clone_root.insert("a/keep.txt".into(), blob("keep.txt"));
+
+        let store_dir = tempfile::TempDir::new().unwrap();
+        let store = LocalStore::for_cache(store_dir.path());
+        let stat_cache = StatCache::default();
+        let result =
+            scan_and_store_with_cache(work, work, &store, Some(&clone_root), &stat_cache, true)
+                .unwrap();
+
+        assert!(
+            result.side.unstable_paths.is_empty(),
+            "a really deleted file is not 'unstable': {:?}",
+            result.side.unstable_paths
+        );
+        let tree = tree_ops::load_all_entries(&result.root_hash, &store).unwrap();
+        let names: Vec<&str> = tree.iter().map(|e| e.name()).collect();
+        assert_eq!(names, vec!["a"], "only the on-disk tree remains");
+    }
+
+    /// The scan cost must not grow with (directories x recorded entries): with a
+    /// recorded map far larger than the tree being scanned, the per-directory
+    /// lookup touches only that directory's own children. Counts the entries
+    /// the index hands out instead of timing, so it is deterministic.
+    #[test]
+    fn child_index_lookup_cost_is_bounded_by_the_directory_not_the_map() {
+        let mut paths: Vec<String> = Vec::new();
+        for d in 0..2000 {
+            paths.push(format!("d{d}/f1"));
+            paths.push(format!("d{d}/f2"));
+        }
+        let refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+        let map = flat(&refs);
+        let index = ChildIndex::new(&map);
+        let mut handed_out = 0usize;
+        for d in 0..2000 {
+            handed_out += index.children_of(&format!("d{d}")).count();
+        }
+        // Each entry is handed out exactly once across all directories: O(N),
+        // not 2000 x 4000 comparisons.
+        assert_eq!(handed_out, map.len());
+    }
 
     /// Deterministic pseudo-random byte generator (xorshift64*), mirroring
     /// `codec::chunk`'s test helper of the same name. Only needs to be
@@ -3022,5 +3362,293 @@ mod tests {
             matches!(result, Err(Error::ObjectNotFound(_))),
             "push and pull must keep failing instead of tolerating the gap"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // fd budget (design/03 "File descriptor budget")
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn fd_budget_grants_up_to_its_size_and_releases_on_drop() {
+        let budget = FdBudget::new(2);
+        let a = budget.try_acquire().expect("first permit");
+        let _b = budget.try_acquire().expect("second permit");
+        assert!(budget.try_acquire().is_none(), "third must not be granted");
+        drop(a);
+        let _c = budget.try_acquire().expect("a dropped permit is reusable");
+        assert!(budget.try_acquire().is_none());
+    }
+
+    #[test]
+    fn fd_budget_of_zero_never_grants() {
+        let budget = FdBudget::new(0);
+        assert!(budget.try_acquire().is_none());
+        assert!(budget.try_acquire().is_none());
+    }
+
+    fn scan_with_budget(
+        work: &Path,
+        store: &LocalStore,
+        fd_budget: usize,
+        probe: Option<&FdProbe>,
+    ) -> ScanResult {
+        scan_impl(
+            work,
+            work,
+            store,
+            store,
+            None,
+            &StatCache::default(),
+            false,
+            false,
+            fd_budget,
+            probe,
+        )
+        .unwrap()
+    }
+
+    fn sorted<T: Ord + Clone>(it: impl IntoIterator<Item = T>) -> Vec<T> {
+        let mut v: Vec<T> = it.into_iter().collect();
+        v.sort();
+        v
+    }
+
+    /// Everything a scan reports besides the root hash, in a comparable form.
+    fn scan_fingerprint(r: &ScanResult) -> String {
+        let files = sorted(
+            r.files
+                .iter()
+                .map(|(p, f)| format!("{p} {:?} {}", f.hash, f.fs_size)),
+        );
+        let s = &r.side;
+        format!(
+            "{files:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}",
+            sorted(s.conflict_paths.iter().cloned()),
+            sorted(s.stubs.iter().map(|(p, rec)| format!("{p} {rec:?}"))),
+            sorted(s.ignored.iter().cloned()),
+            sorted(s.unknown_reserved.iter().cloned()),
+            sorted(s.unstable_paths.iter().cloned()),
+            sorted(s.seen_other.iter().cloned()),
+            sorted(s.seen_stub.iter().cloned()),
+            sorted(s.unresolved_stubs.iter().cloned()),
+        )
+    }
+
+    fn build_mixed_tree(work: &Path, store: &LocalStore) {
+        for i in 0..60 {
+            let d = work.join(format!("t{i:02}"));
+            fs::create_dir(&d).unwrap();
+            fs::write(d.join("f.txt"), format!("file {i}")).unwrap();
+            if i % 3 == 0 {
+                fs::create_dir_all(d.join("s/u")).unwrap();
+                fs::write(d.join("s/g.txt"), format!("g {i}")).unwrap();
+                fs::write(d.join("s/u/h.txt"), format!("h {i}")).unwrap();
+            }
+            if i % 7 == 0 {
+                fs::create_dir(d.join("empty")).unwrap();
+            }
+        }
+        fs::write(work.join("top.txt"), "top").unwrap();
+        fs::write(work.join("c.txt.omemfs-conflict-base"), "base").unwrap();
+        std::os::unix::fs::symlink("t00", work.join("link")).unwrap();
+        std::os::unix::fs::symlink("../t06", work.join("t05/l")).unwrap();
+
+        let stub_tree = tree_ops::build_and_store(
+            vec![TreeEntry::Blob {
+                name: "orig.txt".to_string(),
+                hash: Hash::compute(b"orig"),
+                mtime: None,
+                size: 4,
+                mode: None,
+            }],
+            store,
+        )
+        .unwrap();
+        fs::create_dir(work.join("stub_full")).unwrap();
+        stub::write_dir_stub(
+            work,
+            "stub_full",
+            &stub::StubRecord {
+                target_type: stub::StubTargetType::Tree,
+                hash: stub_tree.clone(),
+                size: 4,
+                mtime: None,
+                mode: None,
+                blob_count: 1,
+            },
+        )
+        .unwrap();
+        write_partial_stub(work, "t10/stub_part", &stub_tree);
+        write_partial_stub(work, "stub_part_top", &stub_tree);
+    }
+
+    #[test]
+    fn scan_result_is_identical_for_every_fd_budget() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let work = tmp.path().join("work");
+        fs::create_dir(&work).unwrap();
+        let store_dir = tempfile::TempDir::new().unwrap();
+        let store = LocalStore::for_cache(store_dir.path());
+        build_mixed_tree(&work, &store);
+
+        let reference = scan_with_budget(&work, &store, DEFAULT_FD_BUDGET, None);
+        assert!(reference.files.len() > 100);
+        assert!(!reference.side.stubs.is_empty());
+        let expected = scan_fingerprint(&reference);
+        for budget in [0, 1, 2, 7] {
+            let r = scan_with_budget(&work, &store, budget, None);
+            assert_eq!(r.root_hash, reference.root_hash, "root hash, budget {budget}");
+            assert_eq!(scan_fingerprint(&r), expected, "files/side, budget {budget}");
+        }
+    }
+
+    fn make_flat_tree(work: &Path, width: usize) {
+        for i in 0..width {
+            fs::create_dir(work.join(format!("d{i:04}"))).unwrap();
+        }
+    }
+
+    #[test]
+    fn peak_open_directories_stay_within_the_budget_on_a_wide_tree() {
+        let work = tempfile::TempDir::new().unwrap();
+        make_flat_tree(work.path(), 2000);
+        let store_dir = tempfile::TempDir::new().unwrap();
+        let store = LocalStore::for_cache(store_dir.path());
+
+        let probe = FdProbe::default();
+        let small = scan_with_budget(work.path(), &store, 8, Some(&probe));
+        assert!(
+            probe.peak() <= 8 + 16,
+            "budget 8: peak open child dirs was {}",
+            probe.peak()
+        );
+
+        let probe = FdProbe::default();
+        let default = scan_with_budget(work.path(), &store, DEFAULT_FD_BUDGET, Some(&probe));
+        assert!(
+            probe.peak() <= DEFAULT_FD_BUDGET + 16,
+            "default budget: peak open child dirs was {} on a 2000-wide directory",
+            probe.peak()
+        );
+        assert_eq!(small.root_hash, default.root_hash);
+    }
+
+    #[test]
+    fn budget_zero_scans_serially_with_depth_bounded_fds() {
+        let work = tempfile::TempDir::new().unwrap();
+        for a in 0..3 {
+            for b in 0..3 {
+                for c in 0..3 {
+                    let d = work.path().join(format!("a{a}/b{b}/c{c}"));
+                    fs::create_dir_all(&d).unwrap();
+                    fs::write(d.join("f.txt"), format!("{a}{b}{c}")).unwrap();
+                }
+            }
+        }
+        let store_dir = tempfile::TempDir::new().unwrap();
+        let store = LocalStore::for_cache(store_dir.path());
+
+        let probe = FdProbe::default();
+        let r = scan_with_budget(work.path(), &store, 0, Some(&probe));
+        assert_eq!(r.files.len(), 27);
+        assert!(probe.serial_scans() > 0);
+        let depth = 3;
+        assert!(
+            probe.peak() <= depth * scan_thread_count() + 2,
+            "peak {} with depth {depth}",
+            probe.peak()
+        );
+        let default = scan_with_budget(work.path(), &store, DEFAULT_FD_BUDGET, None);
+        assert_eq!(r.root_hash, default.root_hash);
+    }
+
+    #[test]
+    fn a_deep_serial_chain_holds_one_fd_per_level() {
+        let work = tempfile::TempDir::new().unwrap();
+        let mut d = work.path().to_path_buf();
+        for i in 0..12 {
+            d.push(format!("l{i}"));
+        }
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("leaf.txt"), "x").unwrap();
+        let store_dir = tempfile::TempDir::new().unwrap();
+        let store = LocalStore::for_cache(store_dir.path());
+
+        let probe = FdProbe::default();
+        scan_with_budget(work.path(), &store, 0, Some(&probe));
+        assert_eq!(probe.peak(), 12);
+    }
+
+    /// Run `scan_subdir` for `name` directly, with an optional recorded entry
+    /// for it in the clone root.
+    fn scan_subdir_of(
+        work: &Path,
+        name: &str,
+        previous: Option<TreeEntry>,
+    ) -> Result<(SubdirEntry, DirScan), Error> {
+        let store_dir = tempfile::TempDir::new().unwrap();
+        let store = LocalStore::for_cache(store_dir.path());
+        let recorded: HashMap<String, TreeEntry> =
+            previous.into_iter().map(|e| (name.to_string(), e)).collect();
+        let index = ChildIndex::new(&recorded);
+        let cfg = FileJobConfig {
+            store: &store,
+            stub_store: &store,
+            clone_root_entries: Some(&recorded),
+            clone_root_children: Some(&index),
+            stat_cache: None,
+            now: SystemTime::now(),
+            write_blobs: false,
+            tolerate_unresolved_stubs: false,
+            fd_budget: FdBudget::new(DEFAULT_FD_BUDGET),
+            probe: None,
+        };
+        let root = crate::fsguard::open_dir(work, "").unwrap();
+        let job = SubdirJob {
+            name: name.to_string(),
+            rel_path: name.to_string(),
+            parent: &root,
+        };
+        scan_subdir(&job, &cfg, &FilterSet::load(work), false)
+    }
+
+    fn recorded_tree(name: &str) -> TreeEntry {
+        TreeEntry::Tree {
+            name: name.to_string(),
+            hash: Hash::compute(b"recorded"),
+            mtime: None,
+            size: 1,
+            blob_count: 1,
+        }
+    }
+
+    #[test]
+    fn a_child_that_is_a_symlink_when_opened_is_unstable_and_keeps_its_previous_entry() {
+        let work = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        fs::write(outside.path().join("secret.txt"), "s").unwrap();
+        std::os::unix::fs::symlink(outside.path(), work.path().join("sub")).unwrap();
+
+        let (entry, scan) =
+            scan_subdir_of(work.path(), "sub", Some(recorded_tree("sub"))).unwrap();
+        assert_eq!(
+            entry.entry.as_ref().and_then(|e| e.hash()),
+            recorded_tree("sub").hash()
+        );
+        assert!(scan.side.unstable_paths.contains("sub"));
+        assert!(scan.files.is_empty(), "nothing is read through the link");
+    }
+
+    #[test]
+    fn a_child_that_is_gone_when_opened_is_unstable_and_keeps_its_previous_entry() {
+        let work = tempfile::TempDir::new().unwrap();
+        let (entry, scan) =
+            scan_subdir_of(work.path(), "sub", Some(recorded_tree("sub"))).unwrap();
+        assert!(entry.entry.is_some());
+        assert!(scan.side.unstable_paths.contains("sub"));
+
+        let (entry, scan) = scan_subdir_of(work.path(), "sub", None).unwrap();
+        assert!(entry.entry.is_none(), "no previous entry to preserve");
+        assert!(scan.side.unstable_paths.contains("sub"));
     }
 }

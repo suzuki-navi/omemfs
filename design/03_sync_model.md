@@ -125,6 +125,23 @@ without oversubscribing disk I/O; the local object store's transfer concurrency
 also defaults to 1 (`OMEMFS_TRANSFER_CONCURRENCY`, see `04_cli_spec.md`). On a
 2-core machine the effective default is 2.
 
+The pool size bounds threads, not file descriptors. The directory fds held open during the walk are bounded separately by the **fd budget** (see "File descriptor budget" under "The read side"): when the budget is exhausted a subtree is scanned serially instead of being handed to the pool.
+
+**The scan's per-directory cost depends only on that directory.** A directory
+level consults the last-synced `clone_root` for two things: the recorded entry of
+each child it hashes, and — on a write scan (`push`) — the children that were
+recorded but are missing from the listing (the "reappeared" check below). Both
+are answered from a **parent-directory index** of `clone_root`, built once per
+scan: a map from a directory's repository-relative path to the names recorded
+directly inside it. A level then touches only its own recorded children, so the
+whole scan is linear in (working-tree entries + `clone_root` entries). Scanning
+every directory against the full flat `clone_root` map instead would cost
+(directories × `clone_root` entries): an unchanged `push` of a tree with tens of
+thousands of directories and hundreds of thousands of entries would spend most of
+its time comparing paths that are not children of the directory being scanned.
+The index is purely an acceleration structure; it never changes which entries are
+preserved, dropped, or reported unstable.
+
 **Parallelism does not affect the result.** The tree hash is order-independent of
 how the entries are produced: `build_and_store` sorts entries by name before
 serialising (see `01_object_model.md`), so child results may be merged in any
@@ -444,7 +461,7 @@ blob (and any chunk manifest children) from the remote only when it is actually
 written to the working tree. Sub-threshold blobs of a stubbed subtree the diff
 never descends into are never fetched.
 
-The same lazy tree store backs:
+The same lazy tree-resolution policy backs:
 
 - the clone-root vs remote-root diff (remote changes),
 - `navigate` along a scoped pull's path components into **both** the clone root
@@ -469,30 +486,39 @@ The same lazy tree store backs:
   the actual upload/CAS are independent: the reader never reads the writer's
   CAS snapshot and vice versa (see "Push → Steps" below), so building the
   reader earlier introduces no ordering dependency on the writer,
-- `ls`'s local (clone-root vs working-tree) diff (see `04_cli_spec.md`, "Local
-  diff self-healing") — the one other command that reads clone-root tree
-  objects the same way pull does. (`ls`'s own working-tree *scan* does not yet
-  route the equivalent partial-expansion read through this store, unlike
-  push/pull now do — see `04_cli_spec.md`, "Local diff self-healing", for why
-  this is left as an open item rather than folded into this fix: `ls`'s design
-  intent is to never block on the remote, and a scan's side effects are harder
-  to cleanly abandon mid-way than a pure diff read's.)
+- `ls`'s local (clone-root vs working-tree) diff and its partial-expansion
+  working-tree scan (see `04_cli_spec.md`, "Local diff self-healing" and
+  "Self-healing during the working-tree scan"). `ls` uses the same object
+  resolution semantics but schedules them as local discovery followed by
+  concurrent batches, rather than synchronously fetching one object at each
+  read. This preserves lazy scope pruning while avoiding one remote round trip
+  per missing tree.
 - `restore`'s plan-phase walk of `clone_root` against the working tree (see
   `04_cli_spec.md`, "omemfs restore"), when that walk hits a clone-root tree
   object the local cache does not hold.
 
-This is a shared abstraction (`tree_ops::LazyTreeStore`, `pub(crate)`), not
-pull-exclusive: pull's own uses above are unbounded (pull's entire purpose is
-to talk to the remote, so it always waits out a fetch), and push's scan use is
-unbounded for the same reason (push already unconditionally needs a working
-remote connection to complete at all), while `ls` wraps its use in an overall
-timeout and falls back to a local-only, per-subtree-tolerant diff on timeout or
-an unrecoverable remote error, since `ls` is meant to stay responsive rather
-than block on, or abort because of, a slow or unreachable remote.
+Object resolution is shared infrastructure rather than pull-exclusive.
+`LazyTreeStore` remains the synchronous read-through form used by pull, push,
+and other command paths that naturally discover one dependency while walking.
+`ls` uses a collecting form of the same local-cache/pack-reader resolution: a
+local pass records every tree hash that blocked progress, the pack reader
+fetches the deduplicated set with bounded concurrency, and only the affected
+continuations are retried. A newly fetched parent may reveal missing children,
+so the process is iterative and remains lazy by tree depth.
 
-The bounded memory guarantee is preserved: the lazy store never holds a whole
-skeleton in memory — each fetched object is cached to the local store as
-plaintext and the in-memory footprint is a single object at a time.
+Neither form imposes a command-level correctness timeout. Storage backends may
+have connect/request timeouts, and those failures propagate. In particular,
+`ls` never converts a timeout or missing object into an incomplete successful
+local diff: if every required clone-root-reachable tree cannot be resolved, it
+returns an error without a listing. Its separate current-remote status lookup
+remains best-effort and time-bounded because that lookup affects only the
+optional `R` column, not the correctness of the local `X` diff.
+
+The bounded memory guarantee is preserved: neither form holds a whole skeleton
+in memory. The synchronous lazy store handles one object at a time. The
+collecting form holds only suspended-continuation metadata plus one bounded
+transfer window; each completed object is written through to the local cache
+rather than retaining every fetched tree body until the whole walk finishes.
 
 #### Working tree scan optimization with a partially-stubbed clone root
 
@@ -861,6 +887,8 @@ The following call sites are all inside this boundary; each is either walking th
 - `omemfs conflict clean`'s helper-file and metadata-sidecar deletion (`src/commands/conflict.rs`, `run_clean`): removes each collected helper path, and each base path's `.omemfs-conflict-meta` sidecar, via `fsguard::remove_file_tolerant`.
 - Path-scoped `push` (`src/commands/push.rs`, `push_scoped`): before scanning or reading a scoped path's content for upload, every path component from `work_dir` down to (and including) the scoped path itself is verified to be symlink-free via `fsguard::is_real_dir`/`fsguard`'s component walk, so a symlinked ancestor of the scoped path can never be traversed to read — and upload — content from outside `work_dir`.
 
+- `omemfs conflict accept-*` (`src/commands/conflict.rs`, `run_accept`): the accepted side's helper file is **read** through `fsguard::open_leaf` + `GuardedDir::open_file` (`openat` with `O_NOFOLLOW`), not `std::fs::read`. A helper that is a symlink is refused (`SourceChanged`) rather than followed, so `accept-remote` can never copy the contents of a file outside the repository into the working tree by way of a symlink planted as `<path>.omemfs-conflict-remote`. Helper files are regular files omemfs itself wrote, so a symlink in that position is always wrong. The refusal happens in the resolve step, before anything is written, deleted, or advanced.
+
 #### The read side: the working-tree scan and content capture
 
 The guarantee above used to stop at mutation. The scan that feeds `push` built every path by joining names onto a `Path` and then calling `read_dir`, `symlink_metadata`, `read_link` and `File::open` on the result, so a directory swapped for a symlink *after* the parent was listed (or after `is_real_dir` approved a scoped path) was followed, and whatever lives behind the link was hashed and uploaded. Reproduction: swap a directory and a symlink to an outside directory with `renameat2(RENAME_EXCHANGE)` in a tight loop while `omemfs push` runs; outside files reach the remote. A one-shot `is_real_dir` check cannot close this, because the check and the later use resolve the path independently.
@@ -870,6 +898,7 @@ The scan therefore walks the tree the way the write side does: by directory fd.
 - The scan root is opened once with `fsguard` (component-by-component `openat(O_DIRECTORY|O_NOFOLLOW)` from `work_dir`). Every deeper directory is opened with `openat(O_DIRECTORY|O_NOFOLLOW)` *relative to its parent's fd*. Listing (`fdopendir`), `fstatat(AT_SYMLINK_NOFOLLOW)`, `readlinkat` and the file open (`openat(O_NOFOLLOW|O_NONBLOCK)`) all go through the fd of the directory that was listed, never through a path string. No step can be redirected by replacing a name after it was listed.
 - A name that was listed as a directory or regular file but is no longer one when it is opened (`ELOOP`/`ENOTDIR` from `O_NOFOLLOW`, `ENOENT`, or an `fstat` of the opened handle that is not a regular file) is a live-path race, not an error and not a deletion: the path is reported as unstable and its previous tree entry is preserved, exactly like a file that vanished after listing (see "Scan blob-write mode" and the `actively changing path` warning). A FIFO or device swapped in is handled the same way; `O_NONBLOCK` keeps the open from hanging on a FIFO.
 - The directory-stub marker and file-stub records are read through the same fds. A symlink named `.omemfs-stub` is not a marker.
+- **A child directory is opened just before it is scanned, not when it is listed.** The listing of a directory records only names and kinds. The subdirectory jobs it produces carry `(parent fd, name)`, and the `openat(O_DIRECTORY|O_NOFOLLOW)` of the child happens at the start of that child's own scan, through the parent's fd, which is still open because the parent waits for all of its children. The stub classification of a child (`.omemfs-stub` marker: none / full / partial) is made from that same single open, so a directory is opened exactly once per scan. This keeps every guarantee above (the open is still parent-fd-relative and `O_NOFOLLOW`), and a child that is a symlink or gone by then is the same live-path race as before: unstable, previous entry preserved. The point is to bound how many directory fds are open at once; see "File descriptor budget" below.
 - The file is opened once and both its metadata and its content come from that handle (this was already true of `store_file_snapshot`); only the *open* changed, from a path to `(directory fd, name)`.
 - Path-scoped `push` keeps the `fsguard::is_real_dir` pre-check (it gives a precise `SymlinkEscape` error for the common static case), but it is no longer what the guarantee rests on: the scan root and a scoped single file are opened by fd, a root swapped between the check and the open is a live-path race (`unstable`), and the "nothing there, so delete" decision uses a guarded `lstat` (`fsguard::lstat_path`) rather than `symlink_metadata` on the joined path, which a swapped ancestor could have made report `NotFound` and turned into a pushed deletion.
 
@@ -882,6 +911,32 @@ A consequence for `expand` with no explicit path: a stubbed directory that has s
 Enumerating call sites is deliberately avoided as a *substitute* for the guarantee above — the guarantee comes from `fsguard` being the only available primitive for working-tree mutation and boundary-sensitive reads, not from an exhaustive list. The list above documents where each of the read/delete decisions is anchored, for reviewers checking this specific boundary; it is not a claim that no other call site matters. See `src/fsguard.rs`'s module doc comment for the primitive's exact contract (error policy, temp-file naming, and the `GuardedDir` API).
 
 ---
+
+#### File descriptor budget
+
+The scan must work under the common default `ulimit -n 1024` on a tree of any width. Each directory the scan has open costs one file descriptor, and a directory fd must stay open for as long as its children are being scanned (they are opened relative to it, see above). Opening every child of a wide directory while listing it would make the peak fd count grow with the sum of the sibling counts along the active paths; a directory with 1000 subdirectories alone exhausted a limit of 1024.
+
+The scan therefore keeps an **fd budget** for directory fds, and stays within it without ever waiting for it:
+
+- A subdirectory scan opens its directory lazily (see above) and asks the budget for a permit first. A permit is held for exactly as long as the directory fd is open, and is released when the fd is closed.
+- If a permit is available, the subdirectory is scanned in **parallel mode**: its own child directories and its regular files are processed with `rayon::scope` / `par_iter`, as described in "Parallel walk and hash computation".
+- If the budget is exhausted, the subdirectory and everything below it are scanned in **serial mode**: a plain recursive walk that does not call `rayon::scope` or `par_iter`, and that does not take permits. Serial mode never returns to parallel mode within that subtree.
+- The scan never blocks on the budget. Blocking would deadlock: a permit is held by an ancestor that is itself waiting for its children, so a child waiting for a permit could never be released by anyone. Serial mode is also what keeps the peak bounded: a rayon worker that waits in `rayon::scope` / `par_iter` executes other queued jobs while it waits, so parallel-mode frames may nest on one thread; a serial-mode subtree has no such wait, so nothing is stacked on top of it.
+- The fd count of the directory walk is bounded by `budget + threads x depth of a serial subtree`, independent of the width of any directory. The default budget is 128 permits. There is no environment variable: the value is not a tuning knob, and tests inject a small budget through the scan configuration instead.
+
+The scan result is identical in both modes. The tree hash does not depend on the order in which children are scanned (`build_and_store` sorts by name), so a subtree that runs in serial mode produces the same objects and the same `files` / `side` data as the same subtree in parallel mode. The budget only trades parallelism for descriptors: a very wide directory runs its first `budget` children in parallel and the rest serially.
+
+Known limit: a tree so deep that one serial chain is thousands of directories long needs one fd per level of that chain, as the previous implementation did. Separately, the scan recurses on the worker thread's stack; a chain of a few hundred nested directories can overflow it. Both are outside this budget's scope.
+
+**Exhaustion is reported with its cause.** If an `openat`/`fdopendir`/file open during the scan or the stub-record read fails with `EMFILE` or `ENFILE`, the error names the operation and the path and states the current soft limit:
+
+```
+error: too many open files while scanning '<path>' (RLIMIT_NOFILE soft limit: 1024); raise it with `ulimit -n`
+```
+
+and the command exits with status 1. (For `ENFILE`, the system-wide limit was hit, and the message says so instead of pointing at `ulimit -n`.) The process's own `RLIMIT_NOFILE` is deliberately **not** raised by omemfs: a raised soft limit would be inherited by the child processes omemfs starts (`git`, `flock`), and would hide the problem on hosts whose hard limit is also low.
+
+Commands that do not scan a tree (`clone`, `stub`, `expand`, `restore`) open a bounded number of directory fds at a time and are not affected. Fd use of the cloud backends' network connections is governed by their own concurrency setting (`OMEMFS_TRANSFER_CONCURRENCY`) and is not part of this budget.
 
 ## Checking local changes
 

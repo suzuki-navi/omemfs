@@ -321,7 +321,7 @@ fn pull_scoped(
     // root, then deduplicate ancestors.
     let mut rels: Vec<String> = raw_paths
         .iter()
-        .map(|p| crate::repo::normalize_path(p, &repo.work_dir, current_dir))
+        .map(|p| crate::repo::normalize_addressable_path(p, &repo.work_dir, current_dir))
         .collect::<Result<Vec<_>, _>>()?;
 
     if rels.iter().any(|r| r.is_empty()) {

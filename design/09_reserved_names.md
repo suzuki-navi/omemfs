@@ -147,6 +147,19 @@ For the full specification, see [`05_ignore_and_aggregate.md`](05_ignore_and_agg
 | `.omemfs-conflict-*` | Excluded from scan; **push refuses** if any are present (unless in an ignored directory); user resolves via `omemfs conflict accept-*` / `conflict clean` | Written on conflict | — | Deleted for the restored path |
 | `.omemfs-filter` | Tracked as normal file; `[ignore]` section affects what else is scanned | Tracked; pulled as normal file | `[ignore]` section affects what is shown | Tracked; restored as normal file |
 
+### Reserved names as command arguments
+
+The table above describes what each command does when it *meets* a reserved
+name during a scan or a tree walk. A reserved name typed as a `<path>`
+argument is a different case and is refused outright by `push`, `pull`, `ls`,
+`restore`, `expand`, and `stub` (see `04_cli_spec.md`, "Repository
+discovery"). The scan never captures these names, so letting an
+argument reach them would bypass the exclusion — `push <reserved>` would
+otherwise upload it and plant a name in the remote tree that
+`Tree::deserialise` then rejects on every later read. `.omemfs-filter` is not
+affected: it is tracked content. `conflict` commands take a search scope, not
+a reserved target, and are not affected either.
+
 ---
 
 ## Scan exclusions

@@ -1859,7 +1859,7 @@ setup_two_clones_for_ls() {
     [ -f "$obj_path" ]
 }
 
-@test "ls: degrades gracefully with '?' when a clone-root tree object is unresolvable" {
+@test "ls: fails without a partial listing when a clone-root tree object is unresolvable" {
     mkdir -p sub/inner
     echo "one" > sub/inner/file.txt
     echo "untouched" > top.txt
@@ -1884,34 +1884,17 @@ setup_two_clones_for_ls() {
 
     # Make the remote unreachable too (established pattern in tests/stub.bats
     # "expand --dry-run does not download"), so the object is unresolvable on
-    # both sides -- exactly the "absent from both" degrade scenario.
+    # both sides.
     rm -rf "$REMOTE_DIR"
 
     echo "one changed" > sub/inner/file.txt
 
     run "$OMEMFS" ls -r
-    [ "$status" -eq 0 ]
-    # Degraded: sub/inner/ shows the STATUS_UNKNOWN '?' marker, never the
-    # blank ' ' ("in sync") that would misreport it.
-    dir_line=$(echo "$output" | grep 'sub/inner/$')
-    [[ -n "$dir_line" ]]
-    [[ "${dir_line:1:1}" == "?" ]]
-    # `-r` recursion into a directory's children is itself gated on being
-    # able to read that directory's clone-root tree object (ls.rs
-    # `collect_tree_rows`, pre-existing behaviour shared with the stub case:
-    # a stub's clone-root tree object is likewise absent by design, and its
-    # children are never listed either). Since sub/inner's clone-root tree
-    # object is unresolvable here, its child file.txt has no row at all --
-    # it is not shown as STATUS_UNKNOWN, it is simply not listed. The parent
-    # directory's own '?' is what tells the user something under it could
-    # not be determined.
-    ! echo "$output" | grep -q 'sub/inner/file\.txt$'
-    # An unrelated sibling elsewhere in the tree is unaffected and still shows
-    # its correct status -- the command must not abort or blank out the rest
-    # of the tree over one unresolvable subtree.
-    top_line=$(echo "$output" | grep ' top\.txt$')
-    [[ -n "$top_line" ]]
-    [[ "${top_line:1:1}" == " " ]]
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"cannot compute complete local diff"* ]]
+    # A failed completion must not emit independent sibling rows either: a
+    # successful-looking partial table would violate the complete-X contract.
+    ! echo "$output" | grep -q 'top\.txt$'
 }
 
 # ---------------------------------------------------------------------------
@@ -1921,7 +1904,7 @@ setup_two_clones_for_ls() {
 # After `clone --stub-threshold` whole-stubs a directory, its recorded tree
 # object is never downloaded. Adding a real file inside the stub marker
 # (partial expansion, design/08) makes the scan merge that recorded tree with
-# the on-disk files, so `ls` must fetch it (bounded) or degrade to `?`.
+# the on-disk files, so `ls` must fetch it or fail before listing rows.
 # ---------------------------------------------------------------------------
 
 # Push a two-file `bigdir` from a source clone, then lazy-clone it with a tiny
@@ -1994,31 +1977,27 @@ make_partially_expanded_lazy_clone() {
     [[ "${dir_line:1:1}" == "M" ]]
 }
 
-@test "ls: degrades to '?' instead of failing when the stub tree cannot be fetched" {
+@test "ls: fails when the partial-expansion stub tree cannot be fetched" {
     make_partially_expanded_lazy_clone
 
     # The remote is gone and the recorded tree was never cached locally.
     mv "$REMOTE_DIR" "${REMOTE_DIR}.gone"
     run "$OMEMFS" ls -r
     mv "${REMOTE_DIR}.gone" "$REMOTE_DIR"
-    [ "$status" -eq 0 ]
-    [[ "$output" != *"object not found"* ]]
-    dir_line=$(echo "$output" | grep ' bigdir/$')
-    [[ -n "$dir_line" ]]
-    [[ "${dir_line:1:1}" == "?" ]]
-    # The root cannot vouch for it either.
-    root_line=$(echo "$output" | grep ' \.$')
-    [[ "${root_line:1:1}" == "?" ]]
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"cannot compute complete local diff"* ]]
+    ! echo "$output" | grep -q ' bigdir/$'
 }
 
-@test "ls: --dirty lists an unresolvable partial-expansion stub with '?'" {
+@test "ls: --dirty fails for an unresolvable partial-expansion stub" {
     make_partially_expanded_lazy_clone
 
     mv "$REMOTE_DIR" "${REMOTE_DIR}.gone"
     run "$OMEMFS" ls --dirty
     mv "${REMOTE_DIR}.gone" "$REMOTE_DIR"
-    [ "$status" -eq 0 ]
-    echo "$output" | grep -qE '^ \? .* bigdir/$'
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"cannot compute complete local diff"* ]]
+    ! echo "$output" | grep -q 'bigdir/'
 }
 
 @test "ls: push still merges the partial expansion after ls healed the stub tree" {

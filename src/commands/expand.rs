@@ -39,16 +39,25 @@ pub fn run(opts: ExpandOptions) -> Result<(), Error> {
     let _t = dtimer_l1!("expand");
     let local = repo.local_store();
 
-    // Collect all stubs, then apply path scope filter.
-    // When no paths given, default to the current working directory.
+    // Collect all stubs, then apply path scope filter. With no paths the scope
+    // is the current working directory (design/04 expand Arguments); only paths
+    // the user actually named ("named") bypass --stub-threshold or trigger the
+    // stub-frontier lowering below.
     let mut all_stubs = stub::list(&repo.work_dir)?;
-    let scoped_paths: Vec<String> = if opts.paths.is_empty() {
-        Vec::new()
+    let cwd_default = [opts.current_dir.clone()];
+    let requested: &[PathBuf] = if opts.paths.is_empty() {
+        &cwd_default
     } else {
-        opts.paths
-            .iter()
-            .map(|path| crate::repo::normalize_path(path, &repo.work_dir, &opts.current_dir))
-            .collect::<Result<_, _>>()?
+        &opts.paths
+    };
+    let scoped_paths: Vec<String> = requested
+        .iter()
+        .map(|path| crate::repo::normalize_addressable_path(path, &repo.work_dir, &opts.current_dir))
+        .collect::<Result<_, _>>()?;
+    let named: &[String] = if opts.paths.is_empty() {
+        &[]
+    } else {
+        &scoped_paths
     };
 
     // Scopes that don't match any on-disk stub record directly, but may lie
@@ -56,10 +65,10 @@ pub fn run(opts: ExpandOptions) -> Result<(), Error> {
     // "Paths below the stub frontier"). Computed with pure string comparisons
     // -- no I/O -- so the offline-safe "Nothing to expand." fast path below
     // is unaffected when this is empty.
-    let unmatched: Vec<String> = if opts.paths.is_empty() || scoped_paths.iter().any(|s| s.is_empty()) {
+    let unmatched: Vec<String> = if named.iter().any(|s| s.is_empty()) {
         Vec::new()
     } else {
-        scoped_paths
+        named
             .iter()
             .filter(|scope| {
                 !all_stubs
@@ -77,7 +86,7 @@ pub fn run(opts: ExpandOptions) -> Result<(), Error> {
     // stub records for previously-unmatched scopes.
     let partition_stubs = |stubs: &[(String, stub::StubRecord)]| {
         let scoped: Vec<(String, stub::StubRecord)> =
-            if opts.paths.is_empty() || scoped_paths.iter().any(|scope| scope.is_empty()) {
+            if scoped_paths.iter().any(|scope| scope.is_empty()) {
                 stubs.to_vec()
             } else {
                 stubs
@@ -93,7 +102,7 @@ pub fn run(opts: ExpandOptions) -> Result<(), Error> {
         scoped.into_iter().partition::<Vec<_>, _>(|(rel, record)| {
             opts.stub_threshold == 0
                 || record.size < opts.stub_threshold
-                || scoped_paths.iter().any(|scope| rel == scope)
+                || named.iter().any(|scope| rel == scope)
         })
     };
 

@@ -28,6 +28,12 @@ pub fn run(opts: PushOptions) -> Result<(), Error> {
     let started = std::time::Instant::now();
     let repo = Repo::open(&opts.work_dir)?;
     crate::progress::notify_repo_dir(&repo.work_dir);
+    // A missing backup remote is a configuration error, decided from the local
+    // config alone before any lock, scan, or write -- also under --dry-run
+    // (design/04 "Backup must be configured").
+    if opts.with_backup {
+        require_backup_remote(&repo)?;
+    }
     let _lock = repo.acquire_lock()?;
     let local = repo.local_store();
 
@@ -235,7 +241,7 @@ fn push_scoped(
     // Normalise all paths against the cwd, re-expressed relative to the repo root.
     let mut rels: Vec<String> = raw_paths
         .iter()
-        .map(|p| crate::repo::normalize_path(p, &repo.work_dir, current_dir))
+        .map(|p| crate::repo::normalize_addressable_path(p, &repo.work_dir, current_dir))
         .collect::<Result<Vec<_>, _>>()?;
 
     // If any normalised path is empty, it means the root was specified → full push.
@@ -249,9 +255,6 @@ fn push_scoped(
     // Validate each path before touching anything.
     let filters = crate::filter::FilterSet::load(&repo.work_dir);
     for rel in &rels {
-        if is_system_path(rel) {
-            return Err(Error::Other(format!("cannot push system path: {}", rel)));
-        }
         if is_scoped_path_ignored(&filters, rel) {
             return Err(Error::Other(format!("cannot push ignored path: {}", rel)));
         }
@@ -997,6 +1000,17 @@ fn maybe_backup_push_on_no_op(
     }
 }
 
+/// Fail unless a `backup` remote is configured.
+fn require_backup_remote(repo: &Repo) -> Result<(), Error> {
+    if repo.read_config()?.remotes.contains_key("backup") {
+        return Ok(());
+    }
+    Err(Error::Other(
+        "--with-backup requires a 'backup' remote; run 'omemfs config add-backup' first"
+            .to_string(),
+    ))
+}
+
 /// Push the current clone_root state to the backup remote.
 ///
 /// Uses the same pack layer as origin (PackWriter): the backup remote gets the
@@ -1011,8 +1025,9 @@ fn push_to_backup(repo: &Repo, local: &dyn ObjectStore, clone_root_hash: &Hash) 
         }
     };
     if !config.remotes.contains_key("backup") {
-        eprintln!("warning: --with-backup specified but no 'backup' remote configured");
-        eprintln!("  Run 'omemfs config add-backup' to set one up.");
+        // `require_backup_remote` rejects this before the push starts; only a
+        // config edited mid-push can land here.
+        eprintln!("warning: 'backup' remote disappeared from the config during the push");
         return;
     }
     let backup = match repo.remote_store("backup") {
@@ -1420,12 +1435,6 @@ fn tree_entries_equal(a: &TreeEntry, b: &TreeEntry) -> bool {
         (TreeEntry::Symlink { target: t1, .. }, TreeEntry::Symlink { target: t2, .. }) => t1 == t2,
         _ => false,
     }
-}
-
-/// Returns true if `rel` refers to an internal system path that must never be pushed.
-fn is_system_path(rel: &str) -> bool {
-    let first = rel.split('/').next().unwrap_or("");
-    first == ".omemfs"
 }
 
 /// Returns true if `rel` or any ancestor component of `rel` is matched by

@@ -121,7 +121,7 @@ enum Command {
 
     /// Discard local changes and restore paths to clone_root state
     Restore {
-        /// Paths to restore (default: entire working tree)
+        /// Paths to restore (default: current directory)
         paths: Vec<PathBuf>,
         /// Remote to fetch missing objects from, if any are needed
         #[arg(long, default_value = "origin")]
@@ -152,6 +152,7 @@ enum Command {
     /// Convert working tree files into stubs
     Stub {
         /// Files or directories to stub
+        #[arg(required = true)]
         paths: Vec<PathBuf>,
         /// Show what would be stubbed without making changes
         #[arg(long)]
@@ -160,7 +161,7 @@ enum Command {
 
     /// Materialise stubbed files into the working tree
     Expand {
-        /// Paths to expand (default: expand all stubs)
+        /// Paths to expand (default: stubs under the current directory)
         paths: Vec<std::path::PathBuf>,
         /// Remote to download from if blobs are not cached locally
         #[arg(long, default_value = "origin")]

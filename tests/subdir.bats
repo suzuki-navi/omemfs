@@ -52,13 +52,49 @@ seed_tree() {
     [[ "$output" != *"top.txt"* ]]
 }
 
-@test "ls: paths are displayed relative to the repository root" {
+@test "ls: paths are displayed relative to the cwd" {
     seed_tree
     cd sub
     run "$OMEMFS" ls a.txt
     [ "$status" -eq 0 ]
-    # Root-anchored display path, not cwd-relative.
-    [[ "$output" == *"sub/a.txt"* ]]
+    # cwd-relative display path: not root-anchored.
+    [[ "$output" == *" a.txt" ]]
+    [[ "$output" != *"sub/a.txt"* ]]
+}
+
+@test "ls: a displayed path can be passed back to push, restore and expand from the same cwd" {
+    seed_tree
+    cd sub/deep
+    echo "b2" > b.txt
+    run "$OMEMFS" ls --dirty
+    [ "$status" -eq 0 ]
+    shown=$(echo "$output" | awk '{print $NF}' | grep 'b.txt')
+    [ "$shown" = "b.txt" ]
+    # The displayed name is a valid argument from this same directory.
+    run "$OMEMFS" restore "$shown"
+    [ "$status" -eq 0 ]
+    [ "$(cat b.txt)" = "b" ]
+}
+
+@test "ls: the listed directory itself is the '.' row when run in a subdirectory" {
+    seed_tree
+    cd sub
+    run "$OMEMFS" ls
+    [ "$status" -eq 0 ]
+    first=$(echo "$output" | head -1)
+    [[ "$first" == *" ." ]]
+    [[ "$output" == *" deep/"* ]]
+    [[ "$output" == *" a.txt"* ]]
+    [[ "$output" != *"sub/"* ]]
+}
+
+@test "ls -r: recursive output from a subdirectory is cwd-relative" {
+    seed_tree
+    cd sub
+    run "$OMEMFS" ls -r
+    [ "$status" -eq 0 ]
+    [[ "$output" == *" deep/b.txt"* ]]
+    [[ "$output" != *"sub/deep/b.txt"* ]]
 }
 
 @test "ls: relative path from a subdirectory resolves against cwd" {
@@ -66,8 +102,9 @@ seed_tree() {
     cd sub
     run "$OMEMFS" ls deep
     [ "$status" -eq 0 ]
-    [[ "$output" == *"sub/deep"* ]]
-    [[ "$output" == *"b.txt"* ]]
+    [[ "$output" == *" deep/"* ]]
+    [[ "$output" == *"deep/b.txt"* ]]
+    [[ "$output" != *"sub/deep"* ]]
 }
 
 @test "ls: .. climbs out of the subdirectory" {
@@ -75,7 +112,8 @@ seed_tree() {
     cd sub/deep
     run "$OMEMFS" ls ../a.txt
     [ "$status" -eq 0 ]
-    [[ "$output" == *"sub/a.txt"* ]]
+    # `a.txt` is in `sub`, one level above the cwd `sub/deep`.
+    [[ "$output" == *" ../a.txt"* ]]
 }
 
 @test "ls: path outside the repository is rejected" {
@@ -84,6 +122,27 @@ seed_tree() {
     run "$OMEMFS" ls ../../etc
     [ "$status" -ne 0 ]
     [[ "$output" == *"outside the repository"* ]]
+}
+
+@test "absolute path through a symlinked repository root resolves like the real one" {
+    seed_tree
+    local real link
+    real="$(pwd -P)"
+    link="$(mktemp -d)/link"
+    ln -s "$real" "$link"
+    cd "$link"
+    # cwd reached via the symlink; the absolute argument spelled both ways.
+    run "$OMEMFS" ls "$link/top.txt"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"top.txt"* ]]
+    run "$OMEMFS" ls "$real/top.txt"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"top.txt"* ]]
+    # And a path really outside the repository is still rejected.
+    run "$OMEMFS" ls /etc/hostname
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"outside the repository"* ]]
+    rm -rf "$(dirname "$link")"
 }
 
 @test "push: no-arg from a subdirectory scopes the push to that subtree" {
@@ -108,8 +167,10 @@ seed_tree() {
     cd sub
     run "$OMEMFS" ls --dirty
     [ "$status" -eq 0 ]
-    # Only the in-scope change is listed; the root-only change is not.
-    [[ "$output" == *"sub/a.txt"* ]]
+    # Only the in-scope change is listed (cwd-relative); the root-only change
+    # is not.
+    [[ "$output" == *" a.txt"* ]]
+    [[ "$output" != *"sub/a.txt"* ]]
     [[ "$output" != *"top.txt"* ]]
 }
 
@@ -120,8 +181,9 @@ seed_tree() {
     cd sub
     run "$OMEMFS" ls --dirty deep
     [ "$status" -eq 0 ]
-    [[ "$output" == *"sub/deep/b.txt"* ]]
-    [[ "$output" != *"sub/a.txt"* ]]
+    [[ "$output" == *" deep/b.txt"* ]]
+    [[ "$output" != *"sub/"* ]]
+    [[ "$output" != *" a.txt"* ]]
 }
 
 @test "ls --dirty: clean in-scope subtree prints nothing despite out-of-scope change" {
@@ -161,16 +223,72 @@ seed_tree() {
     [ "$(cat a.txt)" = "a" ]
 }
 
-@test "restore: no-arg from a subdirectory restores the whole tree" {
+@test "restore: no-arg from a subdirectory restores only that subtree" {
     seed_tree
     echo "changed" > top.txt
     cd sub
     echo "changed" > a.txt
     run "$OMEMFS" restore
     [ "$status" -eq 0 ]
-    # Both the in-subdir and the out-of-subdir change are reverted.
+    # The in-subdir change is reverted; the out-of-subdir change is left alone.
+    [ "$(cat a.txt)" = "a" ]
+    [ "$(cat ../top.txt)" = "changed" ]
+}
+
+@test "restore: no-arg at the repository root still restores the whole tree" {
+    seed_tree
+    echo "changed" > top.txt
+    echo "changed" > sub/a.txt
+    run "$OMEMFS" restore
+    [ "$status" -eq 0 ]
+    [ "$(cat top.txt)" = "top" ]
+    [ "$(cat sub/a.txt)" = "a" ]
+}
+
+@test "restore: '..' from a subdirectory restores the whole tree explicitly" {
+    seed_tree
+    echo "changed" > top.txt
+    cd sub
+    echo "changed" > a.txt
+    run "$OMEMFS" restore ..
+    [ "$status" -eq 0 ]
     [ "$(cat a.txt)" = "a" ]
     [ "$(cat ../top.txt)" = "top" ]
+}
+
+@test "expand: no-arg from a subdirectory expands only stubs at or below the cwd" {
+    seed_tree
+    echo "inside" > sub/stubme.txt
+    echo "outside" > outer.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    run "$OMEMFS" stub sub/stubme.txt outer.txt
+    [ "$status" -eq 0 ]
+    [ -f sub/stubme.txt.omemfs-stub ]
+    [ -f outer.txt.omemfs-stub ]
+
+    cd sub
+    run "$OMEMFS" expand --stub-threshold 0
+    [ "$status" -eq 0 ]
+    # The stub under the cwd is expanded; the one outside it is untouched.
+    [ "$(cat stubme.txt)" = "inside" ]
+    [ ! -f stubme.txt.omemfs-stub ]
+    [ -f ../outer.txt.omemfs-stub ]
+    [ ! -f ../outer.txt ]
+}
+
+@test "expand: no-arg at the repository root still expands every stub" {
+    seed_tree
+    echo "inside" > sub/stubme.txt
+    echo "outside" > outer.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    run "$OMEMFS" stub sub/stubme.txt outer.txt
+    [ "$status" -eq 0 ]
+    run "$OMEMFS" expand --stub-threshold 0
+    [ "$status" -eq 0 ]
+    [ "$(cat sub/stubme.txt)" = "inside" ]
+    [ "$(cat outer.txt)" = "outside" ]
 }
 
 @test "pull: no-arg from a subdirectory scopes the pull to that subtree" {

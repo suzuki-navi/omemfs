@@ -58,11 +58,11 @@ pub fn run(opts: RestoreOptions) -> Result<(), Error> {
     })?;
     let local = repo.local_store();
 
-    // When no paths given, restore the entire working tree (the repo root),
-    // regardless of the cwd. Unlike push/pull/ls, restore does not narrow its
-    // no-argument default to the cwd subtree (design/04 restore Arguments).
+    // With no paths, the scope is the cwd, like every other command
+    // (design/04 restore Arguments). From the repository root that is the whole
+    // tree; from a subdirectory it is that subtree.
     let paths: Vec<PathBuf> = if opts.paths.is_empty() {
-        vec![opts.work_dir.clone()]
+        vec![opts.current_dir.clone()]
     } else {
         opts.paths.clone()
     };
@@ -479,7 +479,7 @@ fn plan_restore(
     let mut plan = Plan::default();
     let rels: Vec<String> = paths
         .iter()
-        .map(|path| crate::repo::normalize_path(path, work_dir, current_dir))
+        .map(|path| crate::repo::normalize_addressable_path(path, work_dir, current_dir))
         .collect::<Result<Vec<_>, _>>()?;
     // Problem 1 (design/04_cli_spec.md, "omemfs restore" Arguments):
     // deduplicate and collapse ancestor/descendant relationships among the

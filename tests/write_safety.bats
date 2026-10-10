@@ -140,6 +140,63 @@ teardown() {
 }
 
 # ---------------------------------------------------------------------------
+# S6: accept READS the helper; a symlinked helper must not be followed.
+# ---------------------------------------------------------------------------
+
+@test "write_safety: accept-remote refuses a symlinked helper and does not copy the outside file" {
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone1
+    [ "$status" -eq 0 ]
+    cd clone1
+    echo "base" > conflicted.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    local outside
+    outside="$(mktemp -d)"
+    echo "SECRET" > "$outside/secret"
+
+    echo "base" > conflicted.txt.omemfs-conflict-base
+    echo "local" > conflicted.txt
+    ln -s "$outside/secret" conflicted.txt.omemfs-conflict-remote
+
+    run "$OMEMFS" conflict accept-remote conflicted.txt
+    [ "$status" -ne 0 ]
+    [ "$(cat conflicted.txt)" = "local" ]
+    ! grep -q SECRET conflicted.txt
+    [ "$(cat "$outside/secret")" = "SECRET" ]
+
+    rm -rf "$outside"
+}
+
+@test "write_safety: accept-local and accept-base refuse a symlinked helper too" {
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone1
+    [ "$status" -eq 0 ]
+    cd clone1
+    echo "base" > conflicted.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    local outside
+    outside="$(mktemp -d)"
+    echo "SECRET" > "$outside/secret"
+
+    for side in local base; do
+        echo "x" > conflicted.txt.omemfs-conflict-base
+        echo "x" > conflicted.txt.omemfs-conflict-local
+        rm -f "conflicted.txt.omemfs-conflict-$side"
+        ln -s "$outside/secret" "conflicted.txt.omemfs-conflict-$side"
+        echo "work" > conflicted.txt
+        run "$OMEMFS" conflict "accept-$side" conflicted.txt
+        [ "$status" -ne 0 ]
+        ! grep -q SECRET conflicted.txt
+        rm -f conflicted.txt.omemfs-conflict-base conflicted.txt.omemfs-conflict-local \
+              conflicted.txt.omemfs-conflict-remote conflicted.txt.omemfs-conflict-meta
+    done
+
+    rm -rf "$outside"
+}
+
+# ---------------------------------------------------------------------------
 # create_dir_all repro: a refused content write must not have created any
 # directory inside the symlink target either.
 # ---------------------------------------------------------------------------

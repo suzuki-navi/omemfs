@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
+use std::io;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 
@@ -10,11 +12,12 @@ use crate::error::Error;
 use crate::object::{Hash, Tree, TreeEntry};
 use crate::repo::Repo;
 use crate::scan::{
-    ScanResult, ScanSideData, ScannedFile, refresh_stat_cache, scan_and_store_tolerating_unresolved_stubs,
+    refresh_stat_cache, scan_and_store_tolerating_unresolved_stubs, ScanResult, ScanSideData,
+    ScannedFile,
 };
 use crate::stat_cache::StatCache;
 use crate::store::ObjectStore;
-use crate::term::{Output, Styles, paint};
+use crate::term::{paint, Output, Styles};
 
 /// Which tree (remote root / clone root / working tree) provides the
 /// hash, size, blob_count, and mtime columns.
@@ -41,11 +44,9 @@ pub struct LsOptions {
 // Row — one output record before column widths are known
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct Row {
-    /// Local status (`X` column): `M`/`A`/`D`/` ` (see `status_char`), or
-    /// [`STATUS_UNKNOWN`] (`?`) when a clone-root tree object needed to
-    /// determine this path's status was unreadable (design/04_cli_spec.md
-    /// "Local diff self-healing").
+    /// Local status (`X` column): `M`/`A`/`D`/` ` (see `status_char`).
     status: char,
     /// Remote status: `M` (modified), `A` (added on remote), `D` (deleted on remote), or ` ` (in sync).
     remote_status: char,
@@ -69,6 +70,12 @@ pub fn run(mut opts: LsOptions) -> Result<(), Error> {
     let repo = Repo::open(&opts.work_dir)?;
     crate::progress::notify_repo_dir(&repo.work_dir);
 
+    // Rows are built with repository-root-relative paths (the tree-object
+    // paths every lookup uses); only the printed form is rebased onto the cwd
+    // (design/04 ls "<path>"). Computed before `opts.paths` is rewritten below.
+    let display_base =
+        crate::repo::normalize_path(&opts.current_dir, &opts.work_dir, &opts.current_dir)?;
+
     // Resolve every <path> against the cwd and re-express it as a repo-root-
     // anchored absolute path, so all downstream logic (which strips work_dir or
     // joins onto it) operates unchanged regardless of which subdirectory ls was
@@ -84,7 +91,8 @@ pub fn run(mut opts: LsOptions) -> Result<(), Error> {
         };
         let mut anchored: Vec<PathBuf> = Vec::with_capacity(raw_paths.len());
         for p in &raw_paths {
-            let rel = crate::repo::normalize_path(p, &opts.work_dir, &opts.current_dir)?;
+            let rel =
+                crate::repo::normalize_addressable_path(p, &opts.work_dir, &opts.current_dir)?;
             if rel.is_empty() {
                 // Whole-tree scope: represented as no path argument downstream.
                 continue;
@@ -136,14 +144,13 @@ pub fn run(mut opts: LsOptions) -> Result<(), Error> {
         };
         // ls is read-only: hash files but skip blob writes (design/03
         // "Scan blob-write mode"). Tree objects are still written for diffing.
-        let stub_store_dirty = scan_stub_store(&repo, &local);
-        let scan_result_dirty = scan_scoped_for_ls(
+        let scan_result_dirty = scan_complete_for_ls(
+            &repo,
             &opts.work_dir,
             &opts.paths,
             clone_root.as_ref(),
             clone_root_flat_dirty.as_ref(),
             &local,
-            &*stub_store_dirty,
             &stat_cache_dirty,
         )?;
         // ls is always a read-only (write_blobs = false) scan; its writeback
@@ -155,10 +162,7 @@ pub fn run(mut opts: LsOptions) -> Result<(), Error> {
             false,
         );
         let working_hash = scan_result_dirty.root_hash;
-        let unresolved_dirty = unresolved_stub_paths(&scan_result_dirty.side);
-        // An unresolved partial expansion stands for its recorded tree, which
-        // can equal the clone root's: the hash alone would then say "clean".
-        if clone_root.as_ref() == Some(&working_hash) && unresolved_dirty.is_empty() {
+        if clone_root.as_ref() == Some(&working_hash) {
             phase.complete("0 entries");
             return Ok(());
         }
@@ -173,7 +177,7 @@ pub fn run(mut opts: LsOptions) -> Result<(), Error> {
             })
             .collect();
         let scope_dirty = ScopeFilter::new(&scoped_prefixes_dirty);
-        let (diff, mut unknown_dirty) = if clone_root.as_ref() == Some(&working_hash) {
+        let (diff, _unknown_dirty) = if clone_root.as_ref() == Some(&working_hash) {
             (HashMap::new(), HashSet::new())
         } else {
             diff_trees_with_heal(
@@ -185,7 +189,6 @@ pub fn run(mut opts: LsOptions) -> Result<(), Error> {
                 &scoped_prefixes_dirty,
             )?
         };
-        unknown_dirty.extend(unresolved_dirty);
         let mut paths: Vec<&String> = diff.keys().collect();
         paths.sort();
         let mut rows: Vec<Row> = Vec::new();
@@ -234,29 +237,9 @@ pub fn run(mut opts: LsOptions) -> Result<(), Error> {
             };
             rows.push(row);
         }
-        // A subtree whose diff could not be resolved (see diff_trees_with_heal)
-        // has no entry in `diff`, so it would otherwise be silently absent from
-        // `--dirty` output even though its dirty status is genuinely unknown.
-        // Synthesize a row for it with STATUS_UNKNOWN rather than omitting it.
-        for up in &unknown_dirty {
-            rows.push(Row {
-                status: STATUS_UNKNOWN,
-                remote_status: ' ',
-                z: ' ',
-                hash_str: "-".to_string(),
-                size: None,
-                blob_count: 0,
-                mtime: None,
-                path: if up == "." {
-                    ".".to_string()
-                } else {
-                    format!("{}/", up)
-                },
-            });
-        }
         rows.sort_by(|a, b| a.path.cmp(&b.path));
         let count = rows.len();
-        print_rows(&rows)?;
+        print_rows(&rows, &display_base)?;
         phase.complete(format!("{} entries", count));
         return Ok(());
     }
@@ -298,14 +281,13 @@ pub fn run(mut opts: LsOptions) -> Result<(), Error> {
     // empty tree when none exists) to reconstruct a full working-tree root hash.
     // Out-of-scope paths reuse the clone-root tree objects unchanged and incur
     // no working-tree I/O. With no <path>, the full working tree is scanned.
-    let stub_store = scan_stub_store(&repo, &local);
-    let scan_result = scan_scoped_for_ls(
+    let scan_result = scan_complete_for_ls(
+        &repo,
         &opts.work_dir,
         &opts.paths,
         clone_root.as_ref(),
         clone_root_flat.as_ref(),
         &local,
-        &*stub_store,
         &stat_cache,
     )?;
     let working_hash = scan_result.root_hash.clone();
@@ -368,10 +350,9 @@ pub fn run(mut opts: LsOptions) -> Result<(), Error> {
         } else {
             (HashMap::new(), HashSet::new())
         };
-    // Partially expanded directories whose recorded tree could not be read are
-    // unknown too (design/04 "Self-healing during the working-tree scan").
-    let mut unknown_paths = unknown_paths;
-    unknown_paths.extend(unresolved_stub_paths(&scan_result.side));
+    // Completion of the working-tree scan and the local diff is mandatory.
+    // A successful ls therefore never has local-status unknown paths.
+    let unknown_paths = unknown_paths;
 
     // The no-clone-root top-level listing applies only to an unscoped ls. With a
     // path scope, fall through to the scoped branch using the working_hash
@@ -467,7 +448,7 @@ pub fn run(mut opts: LsOptions) -> Result<(), Error> {
                 }
             }
             let count = rows.len();
-            print_rows(&rows)?;
+            print_rows(&rows, &display_base)?;
             phase.complete(format!("{} entries", count));
             return Ok(());
         }
@@ -1122,52 +1103,13 @@ pub fn run(mut opts: LsOptions) -> Result<(), Error> {
         }
     }
 
-    // A subtree whose local diff could not be resolved (see
-    // diff_trees_with_heal) is not recorded as Added/Modified/Deleted in
-    // diff_map, so the normal status_char/force_status logic above leaves its
-    // row (and any listed ancestor directory row) at ' ' -- misreporting it as
-    // "in sync" when its status is actually unknown. Override those rows'
-    // status to STATUS_UNKNOWN here, after every other status/force_status
-    // assignment above, so nothing later overwrites it back to ' '.
-    if !unknown_paths.is_empty() {
-        // Bare directory path (no trailing slash; "." for the root) -> row
-        // index, for O(1) lookups while walking each unknown path's ancestors.
-        // Owned `String` keys (not borrowed from `rows`) so `rows` can still
-        // be mutated below while this map is in scope.
-        let dir_idx: HashMap<String, usize> = rows
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| r.path.ends_with('/') || r.path == ".")
-            .map(|(i, r)| (r.path.trim_end_matches('/').to_string(), i))
-            .collect();
-        for up in &unknown_paths {
-            // The unresolvable subtree's own row, if it is listed.
-            if let Some(&idx) = dir_idx.get(up.as_str()) {
-                rows[idx].status = STATUS_UNKNOWN;
-            }
-            // Ancestors: a listed ancestor directory cannot vouch for a
-            // descendant it could not resolve, so an ancestor otherwise
-            // reported "in sync" (' ') is upgraded to the same marker. An
-            // ancestor already showing a genuinely detected M/A/D change
-            // elsewhere keeps that (more specific) status.
-            let mut cur = up.as_str();
-            while cur != "." {
-                let anc = match cur.rfind('/') {
-                    Some(pos) => &cur[..pos],
-                    None => ".",
-                };
-                if let Some(&idx) = dir_idx.get(anc) {
-                    if rows[idx].status == ' ' {
-                        rows[idx].status = STATUS_UNKNOWN;
-                    }
-                }
-                cur = anc;
-            }
-        }
-    }
+    debug_assert!(
+        unknown_paths.is_empty(),
+        "complete local diff has no unknown paths"
+    );
 
     let count = rows.len();
-    print_rows(&rows)?;
+    print_rows(&rows, &display_base)?;
     phase.complete(format!("{} entries", count));
     Ok(())
 }
@@ -1263,6 +1205,17 @@ fn scan_scoped_for_ls(
 
         let components: Vec<&str> = rel_str.split('/').filter(|s| !s.is_empty()).collect();
 
+        // Below a fully stubbed directory nothing can be said about this path
+        // without the stub's tree (not held locally): it is neither deleted
+        // nor confirmed present. Refuse, like `push <path>` does.
+        if crate::stub::deepest_ancestor_stub(work_dir, &rel_str)?.is_some() {
+            return Err(Error::Other(format!(
+                "cannot ls '{}': an ancestor directory is stubbed (its content is deferred, not confirmed absent)\n\
+                 Run 'omemfs expand' on the stubbed ancestor first, or list the stubbed directory itself.",
+                crate::term::escape_display(&rel_str)
+            )));
+        }
+
         // An ignored path contributes nothing to the working-tree hash; leave the
         // base unchanged so the path is listed from the clone root (Z='i') or is
         // simply absent. This mirrors push, which skips ignored scoped paths.
@@ -1286,15 +1239,10 @@ fn scan_scoped_for_ls(
         // either, there is nothing to diff; leave the base unchanged (matches
         // the previous behaviour for a genuinely nonexistent path).
         //
-        // TODO: a path nested under a marker-based (fully-stubbed, i.e. a
-        // `.omemfs-stub` file with no expanded children) ancestor directory can
-        // still be misclassified as a deletion by this same `!abs.exists()`
-        // check, since such a path never exists on disk either. This mirrors a
-        // pre-existing, unverified edge case in `push_scoped`'s analogous check
-        // and is out of scope here.
+        // A path below a fully stubbed ancestor never reaches this check: it is
+        // refused above, so `!abs.exists()` here really means "absent".
         if !abs.exists() {
-            if let Some(new_hash) = crate::tree_ops::remove_entry(&root_hash, &components, store)?
-            {
+            if let Some(new_hash) = crate::tree_ops::remove_entry(&root_hash, &components, store)? {
                 root_hash = new_hash;
             }
             continue;
@@ -1448,7 +1396,11 @@ fn navigate_working(
 /// so the returned hash is `None` for it; every other entry kind always has one.
 fn resolve_entry_meta(
     entry: &TreeEntry,
-) -> (Option<Hash>, bool, Option<(u64, u64, Option<DateTime<Utc>>)>) {
+) -> (
+    Option<Hash>,
+    bool,
+    Option<(u64, u64, Option<DateTime<Utc>>)>,
+) {
     let is_blob = matches!(entry, TreeEntry::Blob { .. } | TreeEntry::Symlink { .. });
     let meta = if is_blob {
         None
@@ -1462,10 +1414,58 @@ fn resolve_entry_meta(
 // Column-aligned output
 // ---------------------------------------------------------------------------
 
-fn print_rows(rows: &[Row]) -> Result<(), Error> {
+/// Re-express a repository-root-relative display path (`.`, `dir/`, `a/b.txt`)
+/// relative to `base`, the cwd's root-relative path (empty at the repo root).
+/// A trailing `/` (the directory marker) is preserved. Paths outside `base`
+/// climb with `..` segments.
+fn display_rel(path: &str, base: &str) -> String {
+    if base.is_empty() {
+        return path.to_string();
+    }
+    let is_dir = path.ends_with('/') || path == ".";
+    let target: Vec<&str> = if path == "." {
+        Vec::new()
+    } else {
+        path.split('/').filter(|c| !c.is_empty()).collect()
+    };
+    let from: Vec<&str> = base.split('/').filter(|c| !c.is_empty()).collect();
+    let common = target
+        .iter()
+        .zip(from.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let ups = from.len() - common;
+    let rest = &target[common..];
+    if ups == 0 && rest.is_empty() {
+        return ".".to_string();
+    }
+    let mut parts: Vec<&str> = vec![".."; ups];
+    parts.extend(rest.iter().copied());
+    let mut out = parts.join("/");
+    if is_dir {
+        out.push('/');
+    }
+    out
+}
+
+fn print_rows(rows: &[Row], display_base: &str) -> Result<(), Error> {
     if rows.is_empty() {
         return Ok(());
     }
+    let rebased: Vec<Row>;
+    let rows: &[Row] = if display_base.is_empty() {
+        rows
+    } else {
+        rebased = rows
+            .iter()
+            .map(|r| {
+                let mut row = r.clone();
+                row.path = display_rel(&r.path, display_base);
+                row
+            })
+            .collect();
+        &rebased
+    };
 
     let hash_w = rows.iter().map(|r| r.hash_str.len()).max().unwrap_or(8);
     let size_w = rows
@@ -1546,7 +1546,6 @@ fn paint_status(colored: bool, status: char, styles: &Styles) -> String {
         'A' => paint(true, styles.added, &status.to_string()),
         'M' => paint(true, styles.modified, &status.to_string()),
         'D' => paint(true, styles.deleted, &status.to_string()),
-        STATUS_UNKNOWN => paint(true, styles.conflict, &status.to_string()),
         c => c.to_string(),
     }
 }
@@ -1854,16 +1853,6 @@ enum DiffRow {
     Deleted,
 }
 
-/// Status shown in the `X` column when a path's local status could not be
-/// determined: a clone-root tree object the diff needed was missing from the
-/// local cache and could not be resolved (fetched from the remote and
-/// healed, or otherwise proven absent) either — see `diff_trees_with_heal`
-/// and design/04_cli_spec.md "Local diff self-healing". Distinct from `' '`
-/// ("in sync") so an unresolvable path is never misreported as unchanged.
-/// This is a different column from the `Z` column's own `?` ("unrecognised
-/// reserved `.omemfs-` file"), so the two do not collide in meaning.
-const STATUS_UNKNOWN: char = '?';
-
 /// Compute the local (`X` column) diff between `base` (clone root) and
 /// `target` (working tree), tolerating a per-subtree object miss instead of
 /// aborting the whole walk (see `diff_recursive`/`mark_deleted`). Returns the
@@ -2116,120 +2105,229 @@ fn mark_deleted(
     Ok(())
 }
 
-/// The scan's unresolved partial expansions in the form `unknown` paths use: a
-/// bare path, `"."` for the root.
-fn unresolved_stub_paths(side: &ScanSideData) -> HashSet<String> {
-    side.unresolved_stubs
-        .iter()
-        .map(|p| if p.is_empty() { ".".to_string() } else { p.clone() })
-        .collect()
+/// Complete a working-tree scan before it is allowed to feed `ls` output.
+///
+/// A partial-expansion merge is the only scan operation that may legitimately
+/// need a clone-root tree.  The tolerant scan records every missing merge and
+/// preserves its recorded hash; this wrapper turns those suspended merges into
+/// local-first completion batches.  It deliberately constructs no remote
+/// reader until a local pass proves a tree is missing.
+fn scan_complete_for_ls(
+    repo: &Repo,
+    work_dir: &std::path::Path,
+    paths: &[PathBuf],
+    clone_root: Option<&Hash>,
+    clone_root_flat: Option<&HashMap<String, TreeEntry>>,
+    local: &crate::store::local::LocalStore,
+    stat_cache: &StatCache,
+) -> Result<ScanResult, Error> {
+    loop {
+        match scan_scoped_for_ls(
+            work_dir,
+            paths,
+            clone_root,
+            clone_root_flat,
+            local,
+            local,
+            stat_cache,
+        ) {
+            Ok(result) if result.side.unresolved_stubs.is_empty() => return Ok(result),
+            Ok(result) => {
+                let mut required = HashMap::<Hash, String>::new();
+                for path in &result.side.unresolved_stubs {
+                    let Some((_, record)) = result.side.stubs.iter().find(|(stub_path, record)| {
+                        stub_path == path && record.target_type == crate::stub::StubTargetType::Tree
+                    }) else {
+                        return Err(Error::Other(format!(
+                            "cannot compute complete local diff: no recorded tree for partial expansion '{}'",
+                            if path.is_empty() { "." } else { path }
+                        )));
+                    };
+                    required.insert(
+                        record.hash.clone(),
+                        if path.is_empty() {
+                            ".".to_string()
+                        } else {
+                            path.clone()
+                        },
+                    );
+                }
+                fetch_required_trees(repo, local, &required)?;
+            }
+            Err(Error::ObjectNotFound(hex)) => {
+                let hash = Hash::from_hex(&hex).map_err(|_| Error::Other(format!(
+                    "cannot compute complete local diff: local scan requires unreadable object {hex}"
+                )))?;
+                fetch_required_trees(repo, local, &HashMap::from([(hash, ".".to_string())]))?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
-/// Total time budget for the fetches one `ls` working-tree scan may make to
-/// read partially expanded directories' recorded trees (design/04
-/// "Self-healing during the working-tree scan"). The same figure as
-/// [`LOCAL_DIFF_HEAL_TIMEOUT`].
-const SCAN_HEAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
-
-/// The store `ls`'s working-tree scan reads a partially expanded directory's
-/// recorded tree through: `local` plus, when `origin` is configured, a
-/// time-budgeted fetch of a missing object from it. With no `origin` it is just
-/// `local`, so a miss is an ordinary `ObjectNotFound` the tolerant scan handles.
-fn scan_stub_store(
+/// Fetch just the missing tree roots, without recursively prefetching their
+/// descendants.  Newly exposed children are discovered by the next local pass.
+/// The transfer worker count is the normal bounded transfer concurrency.
+fn fetch_required_trees(
     repo: &Repo,
     local: &crate::store::local::LocalStore,
-) -> Box<dyn ObjectStore> {
-    let Ok((pack_reader, _remote, remote_key)) = repo.pack_reader("origin", None) else {
-        return Box::new(local.clone());
+    required: &HashMap<Hash, String>,
+) -> Result<(), Error> {
+    if required.is_empty() {
+        return Err(Error::Other(
+            "cannot compute complete local diff: no progress while resolving required trees"
+                .to_string(),
+        ));
+    }
+    let representative = required.iter().next().expect("non-empty required tree set");
+    let (pack_reader, _remote, remote_key) = repo.pack_reader("origin", None).map_err(|cause| {
+        let rendered = cause.to_string();
+        if rendered.contains("not configured") {
+            Error::Other(format!(
+                "cannot compute complete local diff: tree {} required for '{}' is not cached and no 'origin' remote is configured",
+                representative.0, representative.1
+            ))
+        } else {
+            Error::Other(format!(
+                "cannot compute complete local diff: failed to fetch tree {} required for '{}' from origin: {rendered}",
+                representative.0, representative.1
+            ))
+        }
+    })?;
+    let pending: Vec<Hash> = required
+        .keys()
+        .filter(|hash| local.exists(hash).map(|present| !present).unwrap_or(true))
+        .cloned()
+        .collect();
+    if pending.is_empty() {
+        return Err(Error::Other(
+            "cannot compute complete local diff: no progress while resolving required trees"
+                .to_string(),
+        ));
+    }
+    let workers = crate::commands::transfer::resolve_concurrency(&pack_reader)
+        .max(crate::commands::transfer::resolve_concurrency(local));
+    let fetch_one = |hash: &Hash| -> Result<(), Error> {
+        let plaintext = codec::store_read(&pack_reader, hash, remote_key.as_ref())?;
+        if Hash::compute(&plaintext) != *hash {
+            return Err(Error::InvalidObject(format!(
+                "tree {} does not match its content hash",
+                hash
+            )));
+        }
+        if !matches!(Tree::deserialise(&plaintext)?, Tree::Normal { .. }) {
+            return Err(Error::InvalidObject(format!(
+                "object {} is not a tree",
+                hash
+            )));
+        }
+        codec::store_write(local, hash, &plaintext, None)
     };
-    let local_for_fetch = local.clone();
-    let fetch: std::sync::Arc<crate::tree_ops::FetchFn> =
-        std::sync::Arc::new(move |hash: &Hash| {
-            let plaintext = codec::store_read(&pack_reader, hash, remote_key.as_ref())?;
-            codec::store_write(&local_for_fetch, hash, &plaintext, None)
-        });
-    Box::new(crate::tree_ops::BudgetedFetchStore::new(
-        local.clone(),
-        fetch,
-        SCAN_HEAL_BUDGET,
-    ))
+    let outcomes = crate::commands::transfer::parallel_map(&pending, workers, &fetch_one);
+    for (hash, outcome) in pending.iter().zip(outcomes) {
+        if let Err(cause) = outcome {
+            let path = required.get(hash).expect("pending hash has a path");
+            return Err(Error::Other(format!(
+                "cannot compute complete local diff: failed to fetch tree {} required for '{}' from origin: {}",
+                hash, path, cause
+            )));
+        }
+    }
+    Ok(())
 }
 
-/// Maximum time budget for the `LazyTreeStore`-backed local diff walk in
-/// [`diff_trees_with_heal`]. Unlike [`REMOTE_LOOKUP_TIMEOUT`] (below, which
-/// bounds a single `INDEX_ROOT` read), this bounds the *whole* recursive
-/// local diff walk, which may issue one remote fetch per differing or
-/// missing subtree rather than a single round trip. A longer budget avoids
-/// spuriously falling back to the degraded local-only pass just because a
-/// healthy remote takes longer than a single lookup would for a walk that
-/// touches several subtrees.
-const LOCAL_DIFF_HEAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// A local-only read wrapper which records missing tree hashes.  Diffing still
+/// runs all independent siblings because `diff_trees` tolerates these misses;
+/// the caller fetches the deduplicated set only after the discovery pass.
+struct MissingTreeStore<'a> {
+    local: &'a crate::store::local::LocalStore,
+    missing: Mutex<HashSet<Hash>>,
+}
 
-/// Compute the local (`X` column) diff for `ls`: `base` (clone root, or its
-/// scoped equivalent) vs `target` (the working tree), self-healing a local
-/// cache miss on a `base` tree object by fetching it from the `origin`
-/// remote -- the same [`crate::tree_ops::LazyTreeStore`] `pull` uses (see its
-/// doc comment and design/03_sync_model.md "Lazy tree reads") -- bounded by
-/// [`LOCAL_DIFF_HEAL_TIMEOUT`] so `ls` never blocks on a slow or unreachable
-/// remote (design/04_cli_spec.md "Local diff self-healing").
-///
-/// - When `base` is `None` (no clone root yet), `diff_recursive` never reads
-///   a base tree object at all (there is nothing to heal), so the
-///   thread/timeout machinery is skipped entirely and the diff runs directly
-///   against `local`.
-/// - Otherwise, the diff is attempted through a `LazyTreeStore` on a
-///   detached worker thread bounded by the timeout, mirroring
-///   `read_root_with_timeout`'s pattern: the thread owns clones of
-///   everything it touches, so it is safe for it to outlive the wait if the
-///   timeout fires. On success within budget, the (possibly self-healed)
-///   result is used exactly as-is.
-/// - On timeout, or if the walk returns an error other than a per-subtree
-///   object miss (`diff_recursive`/`mark_deleted` already tolerate that
-///   class internally -- see their doc comments -- so only a genuinely
-///   unrecoverable error, e.g. the remote being completely unreachable,
-///   reaches here), the attempt is abandoned and a local-only pass is run
-///   instead. That pass is itself tolerant of a per-subtree miss (see
-///   `diff_trees`), so `ls` still succeeds -- with the affected path(s)
-///   marked [`STATUS_UNKNOWN`] -- even when the remote cannot be reached at
-///   all within the budget.
+impl<'a> MissingTreeStore<'a> {
+    fn new(local: &'a crate::store::local::LocalStore) -> Self {
+        Self {
+            local,
+            missing: Mutex::new(HashSet::new()),
+        }
+    }
+
+    fn missing(&self) -> HashSet<Hash> {
+        self.missing
+            .lock()
+            .expect("missing-tree mutex poisoned")
+            .clone()
+    }
+
+    fn record<T>(&self, hash: &Hash, result: Result<T, Error>) -> Result<T, Error> {
+        if matches!(&result, Err(Error::ObjectNotFound(_))) {
+            self.missing
+                .lock()
+                .expect("missing-tree mutex poisoned")
+                .insert(hash.clone());
+        }
+        result
+    }
+}
+
+impl ObjectStore for MissingTreeStore<'_> {
+    fn exists(&self, hash: &Hash) -> Result<bool, Error> {
+        self.local.exists(hash)
+    }
+    fn size(&self, hash: &Hash) -> Result<u64, Error> {
+        self.record(hash, self.local.size(hash))
+    }
+    fn list_with_sizes(&self) -> Result<Vec<(String, u64)>, Error> {
+        self.local.list_with_sizes()
+    }
+    fn open_read(&self, hash: &Hash) -> Result<Box<dyn io::Read>, Error> {
+        self.record(hash, self.local.open_read(hash))
+    }
+    fn write_from(&self, hash: &Hash, reader: &mut dyn io::Read) -> Result<(), Error> {
+        self.local.write_from(hash, reader)
+    }
+}
+
+/// Compute a complete local (`X`) diff.  Each pass is strictly local: misses
+/// are collected while independent subtrees continue walking, then the
+/// deduplicated trees are fetched from origin as one bounded-concurrency batch.
+/// A success from this function has no unknown paths; an unreachable origin,
+/// corrupt object, or no-progress condition is an error before `ls` prints.
 fn diff_trees_with_heal(
     repo: &Repo,
     base: Option<&Hash>,
     target: Hash,
     local: &crate::store::local::LocalStore,
     scope: &ScopeFilter,
-    scoped_prefixes: &[String],
+    _scoped_prefixes: &[String],
 ) -> Result<(HashMap<String, DiffRow>, HashSet<String>), Error> {
     let Some(base_hash) = base else {
         return diff_trees(None, target, local, scope);
     };
-
-    if let Ok((pack_reader, _remote, remote_key)) = repo.pack_reader("origin", None) {
-        let base_owned = base_hash.clone();
-        let target_owned = target.clone();
-        let local_owned = local.clone();
-        let prefixes_owned = scoped_prefixes.to_vec();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let lazy =
-                crate::tree_ops::LazyTreeStore::new(&local_owned, &pack_reader, remote_key.as_ref());
-            let heal_scope = ScopeFilter::new(&prefixes_owned);
-            let result = diff_trees(Some(&base_owned), target_owned, &lazy, &heal_scope);
-            // The receiver may already be gone (timeout fired); ignore send errors.
-            let _ = tx.send(result);
-        });
-        if let Ok(result) = rx.recv_timeout(LOCAL_DIFF_HEAL_TIMEOUT) {
-            if result.is_ok() {
-                return result;
+    loop {
+        let collecting = MissingTreeStore::new(local);
+        let (diff, unknown) = diff_trees(Some(base_hash), target.clone(), &collecting, scope)?;
+        let missing = collecting.missing();
+        if missing.is_empty() {
+            if unknown.is_empty() {
+                return Ok((diff, unknown));
             }
-            // A non-tolerated error surfaced from the healed attempt: fall
-            // through to the local-only pass below.
+            return Err(Error::Other(
+                "cannot compute complete local diff: no progress while resolving required trees"
+                    .to_string(),
+            ));
         }
-        // Timeout (or the worker's send failed, e.g. it panicked): fall
-        // through to the local-only pass below.
+        let representative_path = unknown
+            .iter()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| ".".to_string());
+        let required = missing
+            .into_iter()
+            .map(|hash| (hash, representative_path.clone()))
+            .collect();
+        fetch_required_trees(repo, local, &required)?;
     }
-
-    diff_trees(Some(base_hash), target, local, scope)
 }
 
 /// Returns true when `path` is a direct child of `prefix`.
@@ -2617,6 +2715,37 @@ mod tests {
     use crate::store::local::LocalStore;
     use tempfile::TempDir;
 
+    #[test]
+    fn display_rel_is_unchanged_at_the_repository_root() {
+        assert_eq!(display_rel(".", ""), ".");
+        assert_eq!(display_rel("src/", ""), "src/");
+        assert_eq!(display_rel("src/lib.rs", ""), "src/lib.rs");
+    }
+
+    #[test]
+    fn display_rel_strips_the_cwd_prefix() {
+        assert_eq!(display_rel("sub/", "sub"), ".");
+        assert_eq!(display_rel("sub/a.txt", "sub"), "a.txt");
+        assert_eq!(display_rel("sub/deep/", "sub"), "deep/");
+        assert_eq!(display_rel("sub/deep/b.txt", "sub"), "deep/b.txt");
+        assert_eq!(display_rel("a/b/c.txt", "a/b"), "c.txt");
+    }
+
+    #[test]
+    fn display_rel_climbs_with_dotdot_outside_the_cwd() {
+        assert_eq!(display_rel("top.txt", "sub"), "../top.txt");
+        assert_eq!(display_rel("sub/a.txt", "sub/deep"), "../a.txt");
+        assert_eq!(display_rel(".", "sub"), "../");
+        assert_eq!(display_rel("sub/", "sub/deep"), "../");
+        assert_eq!(display_rel("other/x/", "sub/deep"), "../../other/x/");
+    }
+
+    #[test]
+    fn display_rel_does_not_confuse_a_shared_name_prefix_with_a_shared_directory() {
+        // `subway` merely starts with the characters of `sub`.
+        assert_eq!(display_rel("subway/a.txt", "sub"), "../subway/a.txt");
+    }
+
     fn blob_entry(name: &str, content: &[u8]) -> TreeEntry {
         TreeEntry::Blob {
             name: name.to_string(),
@@ -2640,6 +2769,22 @@ mod tests {
     /// Build and store a tree object from `entries`, returning its hash.
     fn store_tree(entries: Vec<TreeEntry>, store: &LocalStore) -> Hash {
         crate::tree_ops::build_and_store(entries, store).unwrap()
+    }
+
+    #[test]
+    fn missing_tree_store_collects_a_local_miss_for_completion() {
+        let dir = TempDir::new().unwrap();
+        let local = LocalStore::for_cache(dir.path());
+        let missing = Hash::compute(b"tree missing from the local cache");
+        let collecting = MissingTreeStore::new(&local);
+
+        let result = crate::codec::store_read(&collecting, &missing, None);
+
+        assert!(matches!(result, Err(Error::ObjectNotFound(_))));
+        assert_eq!(
+            collecting.missing(),
+            std::collections::HashSet::from([missing])
+        );
     }
 
     /// Regression test (design/07 "Seal invalidation"): the single-file

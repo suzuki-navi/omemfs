@@ -530,12 +530,6 @@ impl PackWriter {
         ))
     }
 
-    /// Provide access to the inner remote store (as `&dyn ObjectStore`).
-    /// Used by `push.rs::ensure_path_in_store` which needs to read from remote.
-    pub fn as_remote_store(&self) -> &dyn ObjectStore {
-        self.remote.as_ref()
-    }
-
     /// Encrypt INDEX_ROOT plaintext → nonce || ciphertext || tag. Thin
     /// wrapper over the shared `crate::codec::pack::encrypt_index_root_bytes`
     /// (also used by `commands::pack::encrypt_index_root`).

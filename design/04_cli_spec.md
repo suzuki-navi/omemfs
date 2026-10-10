@@ -57,9 +57,21 @@ Every command except `clone` locates the repository by walking up from the curre
 Because of this, all commands may be run from any subdirectory of the working tree, exactly like `git`. Two locations are distinguished internally:
 
 - **repository root** — the parent of `.omemfs/`. All tree-entry relative paths (the paths stored in objects and shown when the root is the cwd) are anchored here.
-- **current working directory (cwd)** — where the command was invoked. Relative `<path>` arguments are resolved against the cwd, then re-expressed relative to the repository root before matching against tree entries. An absolute `<path>` is used as-is. A `<path>` that resolves outside the repository root is rejected with `path '<p>' is outside the repository '<root>'`.
+- **current working directory (cwd)** — where the command was invoked. Relative `<path>` arguments are resolved against the cwd, then re-expressed relative to the repository root before matching against tree entries. An absolute `<path>` is used as-is. A `<path>` that resolves outside the repository root is rejected with `path '<p>' is outside the repository '<root>'`. The repository root and the cwd are both canonicalised (symlinks resolved) before this comparison, and so is an **absolute** `<path>`, so the same directory is accepted whichever spelling of it is used: in a repository reached through a symlink (`link -> /real/repo`), `/real/repo/a.txt` and `/…/link/a.txt` both resolve to `a.txt`. A relative `<path>` is joined onto the already-canonical cwd and is not canonicalised itself, so a symlink *inside* the repository is never followed by path resolution (that boundary belongs to `fsguard`; see `03_sync_model.md`, "Write safety"). An absolute path whose target does not exist yet is resolved through its longest existing ancestor.
 
 When the cwd is the repository root, path resolution is identical to expressing every argument relative to the root, so behaviour is unchanged from running at the root.
+
+**Reserved names are not addressable.** `push`, `pull`, `ls`, `restore`, `expand`, and `stub` reject a `<path>` any component of which is the metadata directory `.omemfs` or a name in the reserved `.omemfs-` namespace (`foo.omemfs-stub`, `a.txt.omemfs-conflict-base`, `.omemfs-tmp-…`, `d/.omemfs-stub`, or a name produced by a newer omemfs version), before touching anything, with
+
+```
+error: '<path>' is a reserved omemfs name and cannot be used as a path
+```
+
+and exit status 1. The one exception is `.omemfs-filter`, which is a tracked ordinary file and is addressable like any other. The rule is checked on every component, not only the last, so `.omemfs/config` and `d/.omemfs-stub/x` are rejected too. It applies to the resolved root-relative path, so `..` and absolute spellings cannot route around it; a component containing `.omemfs-` inside an ordinary longer name (`x.omemfs-notes`) is reserved as well, exactly as the scan already treats it (`09_reserved_names.md`).
+
+Why one rule for every command: these names are omemfs's own bookkeeping (stub markers, conflict helpers, staging files), never user content, and the scan always skips them. Before this rule, `push` uploaded whatever reserved name it was given — which put a reserved name into the remote tree, after which every later `push` and every `clone` of that remote failed on the untrusted-tree check (`09_reserved_names.md`, "Reserved names in remote tree entries") — while `restore` deleted it, and `ls`/`expand`/`stub`/`pull` answered with five different "not found" spellings. A reserved file is still *listed* by `ls` (the `Z` column shows `?`, or `S` for a stub) because listing is driven by the scan, not by the argument; only *naming* one as an argument is refused.
+
+`conflict list|clean|accept-*` are the exception: their argument is a scope to search for helper files, and the helpers themselves are what they find, so they keep accepting any path within the repository.
 
 `clone` is the sole exception: it creates a new repository at the destination directory and therefore performs no upward discovery.
 
@@ -82,6 +94,10 @@ Each remote is configured as one object under `remotes.origin` / `remotes.backup
 **`azure`** — `account`, `container`, `prefix`, and the Entra ID (Azure AD) credential fields `tenant_id`, `client_id`, `client_secret`. **Azure authenticates with Entra ID (`TokenCredential`) only — account keys and SAS tokens are not supported.** An optional `endpoint` field overrides the default blob service URL (`https://<account>.blob.core.windows.net`).
 
 All four blocks accept an optional `encryption` object (DEK). All new fields are additive and serde-optional, so existing configs keep working.
+
+### File descriptor usage
+
+`ls`, `push` and `pull` scan the working tree and keep directory fds open while walking it. The number of simultaneously open directory fds is bounded independently of how wide the tree is (default budget: 128), so these commands run under the usual `ulimit -n 1024` on arbitrarily wide trees; a subtree beyond the budget is scanned serially rather than in parallel (`03_sync_model.md`, "File descriptor budget"). omemfs does not raise `RLIMIT_NOFILE` itself. If a scan still runs out of descriptors, it fails with `error: too many open files while scanning '<path>' (RLIMIT_NOFILE soft limit: <n>); raise it with `ulimit -n`` and exit status 1.
 
 ### Parallel transfer concurrency
 
@@ -429,7 +445,7 @@ omemfs push [<path>...]
 - `<path>...`: optional path scope(s), resolved relative to the cwd. If given, only the specified paths and their contents are pushed; the rest of the tree is unchanged. If omitted, the scope defaults to the cwd: from the repository root this is a full-tree push, and from a subdirectory it is a scoped push of that subtree. When multiple paths are given, all are pushed in a single remote operation (one CAS write). If one path is a descendant of another, the ancestor path subsumes the descendant (automatic deduplication).
 
 **Options**
-- `--with-backup`: after pushing to origin, also push the current state to the `backup` remote (if configured). See backup push behaviour below.
+- `--with-backup`: after pushing to origin, also push the current state to the `backup` remote. Requires a `backup` remote to be configured: without one the command fails before doing anything (see "Backup must be configured" below). See backup push behaviour below.
 - `--dry-run`: show what would be pushed without making changes
 
 **Behaviour (full push)**
@@ -467,10 +483,13 @@ A backup push normally runs after a successful origin push, but is also attempte
 
 If the backup push fails, a warning is printed but the exit code reflects only the origin push result. The origin push is not rolled back. If the failure is specifically an upload step finding a referenced local object missing (the same failure shape as origin's L3 upload-failure recovery — design/07_stat_cache.md, "Upload-failure recovery"), backup push clears STAT_CACHE's SEALED bits exactly like origin's recovery does, and the warning says so; the next `push --with-backup` (even with an unchanged working tree, thanks to the early-return attempt above) re-verifies everything and retries.
 
+**Backup must be configured.** `--with-backup` is a request to keep a second copy, so a missing `backup` remote is a configuration error, not a soft failure: the command checks for it first, before reading the working tree or touching origin, and exits with status 1 and
+
 ```
---with-backup requires a 'backup' remote to be configured.
-Use 'omemfs config add-backup' to set one up.
+error: --with-backup requires a 'backup' remote; run 'omemfs config add-backup' first
 ```
+
+Nothing is pushed to origin in that case. `--dry-run` performs the same check and fails the same way, because a dry run that reports "Would push" for a command that cannot run would mislead; the check reads only the local config and contacts no remote. This is deliberately different from a backup push that fails *after* being attempted (network error, CAS failure): that is only a warning, because by then the origin push has succeeded and is not rolled back. The two cases differ in what the user can still do — a missing remote is detectable up front at no cost, a failed write is not.
 
 **Output example**
 
@@ -498,7 +517,7 @@ Backup remote root: c5d6e7f8
   error: remote has been updated since last sync
   Run 'omemfs pull' and retry 'omemfs push'.
   ```
-- `--with-backup` specified but no backup remote configured:
+- `--with-backup` specified but no backup remote configured (also under `--dry-run`; nothing is pushed to origin):
   ```
   error: --with-backup requires a 'backup' remote; run 'omemfs config add-backup' first
   ```
@@ -594,27 +613,107 @@ The remote check reads only tree objects reachable from the displayed paths (sho
 
 The local (`X` column) diff compares `clone_root` against the working tree, which requires reading `clone_root`'s own tree objects. After a lazy, stub-aware clone the local `objects/` cache does not hold the clone-root tree objects of stubbed subtrees (see `03_sync_model.md`, "Lazy tree reads"); it can also be missing a clone-root tree object for other reasons, e.g. a subtree the local cache never received during a prior partial/interrupted sync.
 
-When the local diff needs a clone-root tree object that is missing from the local cache, `ls` transparently fetches that single object from the `origin` remote — the same lazy tree store `pull` uses — decodes it, and writes it into the local cache as plaintext before continuing the diff. Because the fetched object lands in the local cache, a subsequent `ls`, `pull`, etc. reads it locally with no further fetch.
+Successful `ls` output always contains a **complete** local diff. A cache miss is
+therefore recoverable work, not an unknown status to print. `ls` resolves such
+misses with a local-first, batched completion loop:
 
-This self-healing is bounded by an overall timeout that covers the **whole** local diff walk, not just one object: an unclean local cache can require one remote fetch per differing/missing subtree, not a single round trip, so the budget (currently 15 seconds) is longer than the 5-second `R`-column lookup above. If the walk does not finish within the timeout, or if it fails with an error other than "this particular tree object could not be resolved" (e.g. the remote is unreachable outright, not merely slow), `ls` abandons the remote-backed attempt and falls back to a local-only diff.
+1. Walk the requested scope through the local object store. Before reading a
+   tree, compare the two known subtree hashes and prune equal subtrees as usual.
+   If a tree object is absent, record its hash and the diff continuation that
+   depends on it, then continue any independent siblings that are already
+   locally resolvable. No remote client is constructed during this discovery
+   pass.
+2. If the pass found missing trees, deduplicate their hashes and fetch that set
+   from `origin` in one concurrent multi-root batch (see `02_storage_format.md`,
+   "Multi-root batching"). Each fetched tree is decoded, verified against its
+   content hash and expected tree type, and atomically cached as plaintext in
+   `.omemfs/objects/`.
+3. Retry only the suspended diff continuations and rebuild their affected
+   ancestors. A fetched parent can reveal another missing child, so steps 2–3
+   repeat until the requested diff is complete. A pass that discovers no new
+   hash while work is still suspended is an internal/no-progress error rather
+   than an infinite retry.
 
-Either way — the remote-backed attempt or the local-only fallback — a clone-root tree object that still cannot be resolved (locally, and, when attempted, from the remote) does not abort `ls`: only the affected subtree's own status is left undetermined, shown as `?` in the `X` column (see below) instead of a status derived from the diff — never silently reported as unchanged (` `), which would misleadingly claim the path is in sync. Every other, resolvable part of the tree is diffed and shown normally; a listed ancestor directory of the affected subtree also shows `?` in place of an otherwise-unchanged ` `, since it cannot vouch for a descendant it could not resolve either (unless that ancestor already shows a genuinely detected `M`/`A`/`D` from an unrelated change, which is left as-is).
+This does not prefetch the clone-root skeleton. Only a tree whose hash is
+actually reached by the scope-pruned diff is requested, and a fully local cache
+causes no remote configuration read or remote I/O. Fetch concurrency uses the
+normal bounded transfer concurrency; identical hashes required by multiple
+paths or continuations are fetched once per pass and then shared through the
+local content-addressed cache.
+
+The local-completion loop has no `ls`-specific wall-clock deadline and no
+local-only fallback. Backend request/connect timeouts and user cancellation
+still apply, but timeout, authentication failure, missing/corrupt remote object,
+missing `origin` configuration, or any other failure that leaves a required
+tree unresolved makes `ls` print an error and exit non-zero **without emitting
+a partial listing**. Successfully returning from ordinary `ls` therefore
+guarantees that every shown `X` value, including space (unchanged), is based on
+a complete diff for the requested scope.
+
+The diagnostic identifies one required tree hash and a representative affected
+path (the root is `.`), while preserving the backend cause. Missing
+configuration is distinguished from a failed fetch:
+
+```
+error: cannot compute complete local diff: tree <hash> required for '<path>' is not cached and no 'origin' remote is configured
+```
+
+```
+error: cannot compute complete local diff: failed to fetch tree <hash> required for '<path>' from origin: <cause>
+```
+
+`--no-remote` continues to mean "do not compute the optional `R` column". It
+does not prohibit retrieval of a `clone_root`-reachable tree required to make
+the local `X` column correct. Local-diff completion reads objects by known hash;
+it never reads or advances the remote root and cannot introduce remote-side
+changes into the local diff.
+
+This guarantee applies equally to plain `ls`, `ls --dirty`, and the
+`--working`/`--clone`/`--remote` row-source variants: those options change which
+metadata a completed row displays, not whether its local status may be partial.
+In particular, `--dirty` may use the clone-root/working-root hash-equality fast
+path only after every partial-expansion merge needed to construct the working
+root has completed. If there is no `clone_root`, no clone-root diff objects are
+needed; the working scan still must resolve any recorded tree needed by an
+existing partial stub before it can claim completion.
+
+This is deliberately separate from the best-effort current-remote check above.
+The 5-second `R`-column lookup may still time out and leave `R` blank even after
+the local diff fetched clone-root objects successfully. Conversely, an `R`
+lookup succeeding does not satisfy a missing local-diff dependency: the local
+completion loop still verifies and caches every required object by hash.
 
 **Self-healing during the working-tree scan**
 
 The working-tree scan itself can need a clone-root tree object, not only the diff. A *partially expanded* directory (a `.omemfs-stub` marker that coexists with real files, see `08_stub_system.md`, "Partial expansion") is scanned by merging the stub's recorded tree with the entries found on disk (`03_sync_model.md`, "Partial-expansion merge is independent of scan root"). After a lazy, stub-aware clone that recorded tree has never been downloaded, so a plain local read of it fails.
 
-`ls` heals this read the same way as the diff above — the single missing tree object is fetched from `origin` through the lazy tree store and cached locally as plaintext — but under a time budget, so that `ls` never blocks on a slow or unreachable remote:
+The scan participates in the same local-first completion protocol as the diff:
 
-- Only the stub's recorded-tree read heals. Every other read of the scan stays local-only. Reads made while splicing a `<path>` into the clone root (`splice_entry` / `remove_entry`) are not part of this: they stay local-only. This section covers the directory that is itself partially expanded, reached by an unscoped scan, by `--dirty`, or as a `<path>` (or `<path>` ancestor) scan root. A `<path>` that lies strictly *below* a fully stubbed directory is a separate case that this healing does not change: the path exists neither on disk nor as a stub of its own, so the scoped scan currently treats it as a deletion and `ls` reports it as `D` even though the ancestor's recorded tree may still contain it (the same gap as the TODO in the scoped scan, where `push <path>` instead refuses because an ancestor is stubbed). That case is a known, separate gap and is not addressed here.
-- All fetches of one scan share one budget of 15 seconds (the same figure as the diff's). The budget starts at the scan's first fetch, not at the start of the scan, so a long local hashing phase does not use it up. Each fetch waits at most for what is left of it; a fetch still outstanding when the budget runs out is abandoned.
-- Once the budget is exhausted, or a fetch fails with anything other than "object not found" (for example the remote is unreachable), the scan makes no further fetch attempts: every remaining stub is treated as unresolved immediately, instead of each paying its own timeout.
-- `--no-remote` governs only the `R` column, exactly as it does for the local diff's self-healing above. When no `origin` is configured, no fetch is attempted: the stub's recorded tree is read from the local cache only, and a miss is unresolved as below.
-- A partially expanded directory whose recorded tree cannot be resolved — fetch failed, timed out, the remote is not configured, or the remote genuinely lacks the object — is **not merged**. For the rest of the scan it stands for its recorded tree, exactly as a fully stubbed directory does, so the real files inside it are not reflected in the working-tree hash. Its own status is reported as `?` in the `X` column, as is any listed ancestor directory that would otherwise show ` ` (see "Local diff self-healing" above for the rule), and `--dirty` lists it with `?`. `ls` still succeeds.
+- A locally-missing recorded tree suspends that partial-directory merge and
+  records the required hash. Other directory jobs may finish in parallel, but
+  neither the partial directory's final tree hash nor any ancestor tree hash is
+  finalised from an unmerged result.
+- All tree misses found by the scan pass and the subsequent diff pass are
+  deduplicated into the next concurrent fetch batch. After the batch is cached,
+  only the affected partial-directory scan jobs are retried; their ancestor
+  hashes are rebuilt from the retained sibling results. Unrelated working-tree
+  subtrees are not re-walked or re-hashed merely because one recorded tree was
+  absent.
+- The retry re-reads the affected filesystem directory and remains subject to
+  the ordinary live-tree race rules in `03_sync_model.md`; completion caching
+  must not turn an old, pre-fetch directory listing into authoritative current
+  state.
+- A fetch or decode failure aborts `ls` before output, exactly like an
+  unresolved tree in the diff. There is no unresolved-partial-stub success
+  state and no `?` local status.
 
-Nothing is reported as unchanged on the strength of a merge that did not happen, and nothing is reported as deleted: the unresolved directory keeps the entry it already had.
-
-The healing is specific to `ls`, which must stay responsive. `push` and `pull` have no budget: they fetch the recorded tree unconditionally and fail if they cannot (`03_sync_model.md`).
+Only recorded-tree reads and clone-root ancestor reads use this completion
+path; ordinary working files are still read locally. A fully stubbed directory
+does not require its recorded tree merely to preserve or display the stub row:
+its stub record already carries the entry hash and metadata, and recursive
+listing stops at that boundary. Its descendants are fetched only if a requested
+diff operation actually has to descend into that recorded tree (for example to
+enumerate a deleted subtree).
 
 **Scoped working-tree scan**
 
@@ -622,9 +721,35 @@ When one or more `<path>` arguments are given, `ls` scans **only the working-tre
 
 The splice uses the clone root as the base (or an empty tree when no clone root exists yet, e.g. immediately after a push-only init), so out-of-scope paths reuse the clone-root tree objects unchanged and incur no working-tree I/O. This is the dominant cost saving: in a repository with hundreds of thousands of files, `omemfs ls daily` only walks the `daily/` subtree instead of every file. When no `<path>` is given the scan covers the full working tree as before.
 
+Scope pruning also applies to object completion. A single scope fetches at most
+the clone-root ancestor spine needed to navigate/splice that scope plus tree
+objects reached below the scope by its requested diff; multiple scopes use the
+union of those sets. Missing ancestor objects required by `navigate`,
+`splice_entry`, or `remove_entry` join the same deduplicated completion batches.
+Out-of-scope siblings are retained by hash and are neither opened nor fetched.
+The scope-limited flatten used only as an mtime optimisation may simply omit a
+locally-unavailable entry and force that working file to be hashed; because the
+flatten does not determine status, it does not broaden the required fetch set.
+
 This scoping also bounds `--working`'s row substitution: since that substitution is resolved per displayed row (see the `--working` option above), an out-of-scope subtree is never visited for it either, whether or not `--working` is given.
 
 To keep the scope from leaking back into a whole-tree walk, the `.omemfs-filter` set for a single `<path>` is loaded scope-limited (`FilterSet::load_scoped`): only the ancestors of the path and the files inside its subtree are read, never out-of-scope siblings (see `05_ignore_and_aggregate.md` "Scope-limited filter load"). Without this, discovering filter files alone would re-walk the entire tree.
+
+A `<path>` that lies **below a fully stubbed directory** (an ancestor has a `.omemfs-stub` marker and no expanded children) is refused, exactly like `push <path>` refuses it (see `push`, "Behaviour (path-scoped push)"):
+
+```
+error: cannot ls 'big/f1.txt': an ancestor directory is stubbed (its content is deferred, not confirmed absent)
+Run 'omemfs expand' on the stubbed ancestor first, or list the stubbed directory itself.
+```
+
+Such a path never exists on disk as an independently addressable working-tree
+entry, so treating its absence as deletion would be wrong. The complete-diff
+fetch protocol does not change this scope-validation rule: fetching metadata
+does not materialise the path or move the working-tree stub frontier. Listing
+the stubbed directory itself (`ls big`) is unaffected and shows the single `S`
+row. The refusal applies to `--dirty` and `-r` too, and to every `<path>`
+argument of a multi-path `ls` (the first offending path is named; nothing is
+listed). This explicit command error is not an incomplete successful diff.
 
 If a `<path>` is itself a file or a stub, no subtree scan runs: the file is hashed directly (or the stub's recorded entry is spliced), matching `push`'s single-path handling. A `<path>` excluded by an `.omemfs-filter` ignore pattern is not scanned.
 
@@ -657,8 +782,11 @@ Status column `X` (working tree vs clone root):
   `chmod +x` / `chmod -x` with unchanged content). This matches push's notion of
   a dirty tree: the tree hash includes `mode`, so a mode-only change is pushed.
 - `D`: deleted in working tree (in clone root but absent locally)
-- `?`: local status could not be determined for this path. A clone-root tree object needed to diff this path (or a listed ancestor directory's descendant) was missing from the local cache and could not be resolved from the remote either — because the remote genuinely does not have it, the healing fetch timed out, or the remote is unreachable (see "Local diff self-healing" above). The same marker is used for a partially expanded directory whose recorded tree could not be resolved during the working-tree scan (see "Self-healing during the working-tree scan" above). Not to be confused with the `Z` column's own `?` (an unrecognised reserved `.omemfs-` file), which is a different column with a different meaning.
 - ` ` (space): unchanged
+
+There is no `X=?` success state. If any tree required to determine `X` cannot
+be resolved, `ls` fails before printing the table. The `Z` column's `?` remains
+the marker for an unrecognised reserved `.omemfs-` file and is unrelated.
 
 Stub/conflict column `Z`:
 - `!`: unresolved conflict helper files exist for this path, or (for a directory) exist for any descendant path. Conflict takes precedence over all other Z values.
@@ -674,7 +802,9 @@ Stub/conflict column `Z`:
 `<blob_count>`: number of blobs contained (1 for files; total descendant blobs for directories).
 `<mtime>`: last-modified time from the clone root tree entry. `-` if absent from clone root.
 `<wt_mtime>`: last-modified time of the working tree file (filesystem mtime). `-` for deleted files, directories, and symlinks. `-` is also shown for unchanged files to avoid noise from filesystem mtime drift.
-`<path>`: path relative to the **repository root** (the parent of `.omemfs/`). When `ls` is run from the repository root this is identical to a cwd-relative path; from a subdirectory the displayed paths remain root-anchored so they match the paths stored in tree objects. The directory itself is always shown as the first row: `.` for the working tree root (no path argument or explicit `.` argument run at the root), or `<dir>/` (root-relative) when a directory path is given or when the default cwd scope is a subdirectory.
+`<path>`: path relative to the **current working directory**, the same base every other command resolves its `<path>` arguments against. A displayed path can therefore be passed verbatim to `push`, `pull`, `restore`, `expand`, `stub`, or `ls` from the same directory. When `ls` is run from the repository root this is identical to a root-relative path (the paths stored in tree objects). The directory being listed is always shown as the first row: `.` when the listed directory is the cwd itself (no path argument, or an explicit `.`), or `<dir>/` when a directory path is given. Children are shown relative to the cwd as well, so `ls` run in `sub` shows `a.txt`, and `ls deep` run in `sub` shows `deep/` followed by `deep/b.txt`.
+
+An entry outside the cwd (reachable only through a `..` argument) is shown with the `..` segments needed to reach it from the cwd (`../top.txt`), so the display stays copy-pasteable. Only the *display* is cwd-relative: the scan, the diff, and the `R`/`X`/`Z` columns are computed on repository-root-relative paths exactly as before. `ls --dirty` uses the same display base.
 
 **Output example**
 
@@ -802,7 +932,7 @@ omemfs restore [--remote <name>] [--no-remote] [--dry-run] [<path>...]
 ```
 
 **Arguments**
-- `<path>...`: paths to restore, resolved relative to the cwd. If omitted, restore the entire working tree — unlike `push`/`pull`/`ls`, the no-argument default is always the whole tree, not the cwd subtree, because restoring is a deliberate destructive action that should not silently narrow to the current directory.
+- `<path>...`: paths to restore, resolved relative to the cwd. If omitted, the scope defaults to the cwd, exactly like `push`/`pull`/`ls`: from the repository root this restores the whole working tree, and from a subdirectory it restores only that subtree. (Earlier versions restored the whole tree regardless of the cwd. That was the one destructive command whose default was *wider* than every other command's, so a bare `restore` in a subdirectory discarded changes the user could not see from there. To restore the whole tree from a subdirectory, name the root explicitly: `omemfs restore ..` or `omemfs restore <absolute-root>`.)
   - Paths are normalised and deduplicated before the plan is built: an exact duplicate (`restore sub sub`), or one path nested inside another (`restore . sub`, `. ` being the whole tree), is collapsed to a single occurrence of its outermost ancestor. This makes the plan (and therefore its actions) independent of how many times an equivalent path was named — no directory scan or delete is ever planned twice for the same path.
 
 **Options**
@@ -1137,7 +1267,7 @@ omemfs stub <path>... [--dry-run]
 ```
 
 **Arguments**
-- `<path>...`: one or more files or directories to stub (required), resolved relative to the cwd. Directories are processed recursively — all regular files under the directory are stubbed.
+- `<path>...`: one or more files or directories to stub (required: `omemfs stub` with none is a usage error, exit status 2, and `--help` shows `<PATHS>...` without brackets), resolved relative to the cwd. Directories are processed recursively — all regular files under the directory are stubbed.
 
 **Options**
 - `--dry-run`: show what would be stubbed without making any changes
@@ -1206,7 +1336,7 @@ omemfs expand [<path>...] [-r | --recursive] [--stub-threshold <size>] [--remote
 ```
 
 **Arguments**
-- `<path>...`: paths to expand (relative to the current working directory). If omitted, all `*.omemfs-stub` files found in the working tree are considered. Explicitly named paths are always expanded regardless of `--stub-threshold`. A path nested inside an unexpanded directory stub (no on-disk stub record matches it directly) is resolved by lowering the stub frontier down to it one tree level at a time — see "Paths below the stub frontier" below.
+- `<path>...`: paths to expand (relative to the current working directory). If omitted, the scope defaults to the cwd, exactly like `push`/`pull`/`ls`/`restore`: from the repository root every stub in the working tree is considered, and from a subdirectory only the stubs at or below it. Stubs selected by the cwd default are subject to `--stub-threshold` like any other unnamed stub (only a path *named* on the command line bypasses it). Explicitly named paths are always expanded regardless of `--stub-threshold`. A path nested inside an unexpanded directory stub (no on-disk stub record matches it directly) is resolved by lowering the stub frontier down to it one tree level at a time — see "Paths below the stub frontier" below.
 
 **Options**
 - `-r`, `--recursive`: expand all stubs regardless of size. Equivalent to `--stub-threshold 0`; overrides a simultaneously-given `--stub-threshold`.
@@ -1216,7 +1346,7 @@ omemfs expand [<path>...] [-r | --recursive] [--stub-threshold <size>] [--remote
 
 **Behaviour**
 
-1. Collect all stub records matching the specified paths (or all stubs when no path is given). Stubs selected by explicit path argument are always included, regardless of size.
+1. Collect all stub records matching the specified paths (or all stubs at or below the cwd when no path is given). Stubs selected by explicit path argument are always included, regardless of size.
 2. Apply the size filter to any stubs not selected by explicit path: stubs at or above `--stub-threshold` are skipped unless `-r`/`--recursive` is set.
 3. Collect the blob hashes across all stubs to be expanded that are not yet present in the local cache, and fetch all of them from the specified remote in a single batched, concurrent transfer (via the pack index — supports inline entries, pack-file slices, and standalone objects; see `02_storage_format.md`, "Multi-root batching"), instead of downloading one blob at a time. For each fetched object, decrypt and decompress the bytes, then store them unencrypted in `.omemfs/objects/`.
 4. Write the file content to the working tree path and restore `mtime` and the executable-bit `mode` from the stub record.

@@ -384,6 +384,22 @@ enum Resolution {
     RemoteSymlink,
 }
 
+/// Read the accepted side's helper file for `base` without following a
+/// symlink at any component (design/03 "Write safety"): a symlinked helper, or
+/// one below a symlinked directory, is refused rather than read, so a planted
+/// `<path>.omemfs-conflict-remote -> /elsewhere/secret` can never be copied
+/// into the working tree.
+fn read_helper(work_dir: &Path, base: &str, side: &AcceptSide) -> Result<Vec<u8>, Error> {
+    use std::io::Read;
+    let helper_rel = format!("{}{}", base, side.suffix());
+    let (dir, name) = crate::fsguard::open_leaf(work_dir, &helper_rel, false)?;
+    let mut data = Vec::new();
+    dir.open_file(&name)?
+        .read_to_end(&mut data)
+        .map_err(Error::Io)?;
+    Ok(data)
+}
+
 /// Decide what accepting `side` means for `base`, from the sidecar's recorded
 /// `sides` (falling back to helper-file presence when none were recorded).
 /// Errs, without touching anything, when the helper file on disk contradicts
@@ -731,7 +747,7 @@ pub fn run_accept(opts: ConflictAcceptOptions) -> Result<(), Error> {
     for ((base, conflict_meta), resolution) in metas.iter().zip(&resolutions) {
         let abs_base = opts.work_dir.join(base);
 
-        if let Resolution::Helper(src_helper) = resolution {
+        if let Resolution::Helper(_) = resolution {
             // Write through a temporary sibling and rename it into place, so
             // other processes never observe a partially written resolution.
             // Preserve the previous permissions for accept-local; remote/base
@@ -743,7 +759,7 @@ pub fn run_accept(opts: ConflictAcceptOptions) -> Result<(), Error> {
             let original_permissions = std::fs::symlink_metadata(&abs_base)
                 .ok()
                 .map(|metadata| metadata.permissions());
-            let data = std::fs::read(src_helper).map_err(Error::Io)?;
+            let data = read_helper(&opts.work_dir, base, &opts.side)?;
             crate::fsguard::atomic_write_durable(&opts.work_dir, &abs_base, &data)?;
             if let Some(permissions) = original_permissions {
                 std::fs::set_permissions(&abs_base, permissions).map_err(Error::Io)?;
@@ -1122,6 +1138,37 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn read_helper_reads_a_regular_file() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.txt.omemfs-conflict-remote"), b"remote").unwrap();
+        let got = read_helper(dir.path(), "f.txt", &AcceptSide::Remote).unwrap();
+        assert_eq!(got, b"remote");
+    }
+
+    #[test]
+    fn read_helper_refuses_a_symlinked_helper_and_leaks_nothing() {
+        let dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::fs::write(outside.path().join("secret"), b"SECRET").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret"),
+            dir.path().join("f.txt.omemfs-conflict-remote"),
+        )
+        .unwrap();
+        let err = read_helper(dir.path(), "f.txt", &AcceptSide::Remote).unwrap_err();
+        assert!(matches!(err, Error::SourceChanged(_)), "{err:?}");
+    }
+
+    #[test]
+    fn read_helper_refuses_a_helper_below_a_symlinked_directory() {
+        let dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::fs::write(outside.path().join("f.txt.omemfs-conflict-remote"), b"SECRET").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("sub")).unwrap();
+        assert!(read_helper(dir.path(), "sub/f.txt", &AcceptSide::Remote).is_err());
     }
 
     #[test]

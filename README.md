@@ -161,14 +161,14 @@ See `design/` for full design documentation.
 ## CLI overview
 
 ```
-omemfs clone <remote>       # clone from a remote (creates local repository)
-omemfs push [<path>]        # compute root and upload to remote
-omemfs pull [<path>]        # fetch remote root; apply changes via 3-way merge
-omemfs ls [--dirty] [-r]    # list entries; --dirty shows uncommitted changes
+omemfs clone [--url <url>] [<dir>]  # create a local repository and populate it from a remote
+omemfs push [<path>...]     # compute root and upload to remote (default: the cwd)
+omemfs pull [<path>...]     # fetch remote root; apply changes via 3-way merge (default: the cwd)
+omemfs ls [--dirty] [-r] [<path>...]  # list entries; --dirty shows uncommitted changes (default: the cwd)
 omemfs cat <hash>[:<path>]  # print object content
-omemfs restore <path>       # rematerialise a path from the remote
-omemfs stub <path>          # replace file content with a reference stub
-omemfs expand <path>        # rehydrate a stub
+omemfs restore [<path>...]  # discard local changes: rematerialise the paths as recorded at the last sync (default: the cwd)
+omemfs stub <path>...       # replace file content with a reference stub
+omemfs expand [<path>...]   # rehydrate stubs (default: the stubs under the cwd)
 omemfs pack                 # consolidate remote storage
 omemfs stats                # remote/local storage and I/O statistics
 omemfs conflict <subcommand> # list/clean/accept-remote/accept-local/accept-base
