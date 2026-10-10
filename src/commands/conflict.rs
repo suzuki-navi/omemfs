@@ -4,7 +4,9 @@ use filetime::FileTime;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
+use crate::object::{Hash, TreeEntry};
 use crate::repo::Repo;
+use crate::tree_ops;
 
 /// Suffix of the sidecar file that records the tracked metadata (mtime and the
 /// executable-bit mode) of the base and remote sides of a conflict. `pull`
@@ -25,21 +27,62 @@ pub(crate) struct SideMeta {
     pub mode: Option<String>,
 }
 
+/// What the remote held for a conflicting path at the moment `pull` detected
+/// the conflict (design/03_sync_model.md, "Advancing clone_root on
+/// resolution"). Recorded alongside the tracked metadata so `accept-*` can
+/// splice this exact value into `clone_root`, independently of which side
+/// the user ends up accepting for the working-tree content.
+///
+/// Only the two shapes a conflicting *file* path can take on the remote are
+/// covered: a blob (`Blob`) or an absence (`Deleted`, e.g. local-add vs
+/// remote-delete). A conflicting path whose remote side is a tree, symlink,
+/// or stubbed subtree cannot occur here: `pull`'s conflict detection only
+/// ever fires on two diff entries for the *same leaf path* with different
+/// content, and only a blob-vs-blob (or blob-vs-absence) shape reaches that
+/// comparison for a single file (see `write_conflict_for_path`'s
+/// `entry_source`, which likewise only ever produces helper-file bytes for
+/// `Added`/`Modified`). `Unrecorded` exists purely as a defensive fallback
+/// for any future diff-entry shape that might reach this path but does not
+/// yet carry a splice-able hash; `accept-*` leaves `clone_root` untouched for
+/// it (the pre-fix behaviour), rather than guessing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum RemoteResolution {
+    Blob {
+        hash: Hash,
+        size: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mtime: Option<chrono::DateTime<chrono::Utc>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
+    },
+    Deleted,
+    Unrecorded,
+}
+
 /// Sidecar metadata for a conflicting path: the tracked metadata of the base
-/// and remote sides. The local side is intentionally absent — `accept-local`
-/// keeps the working-tree file as-is, so its metadata needs no restoration.
+/// and remote sides, plus the remote's resolved value for advancing
+/// `clone_root`. The local side's metadata is intentionally absent —
+/// `accept-local` keeps the working-tree file as-is, so its metadata needs
+/// no restoration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct ConflictMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<SideMeta>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<SideMeta>,
+    /// Absent when read from a sidecar written by an older omemfs version
+    /// (pre-dating this field): `accept-*` then leaves `clone_root` untouched
+    /// for the path, exactly like `Some(RemoteResolution::Unrecorded)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_resolution: Option<RemoteResolution>,
 }
 
 impl ConflictMeta {
     /// Write the sidecar JSON for the conflict whose base file is `base_path`.
-    /// A no-op when neither side carries any metadata. `work_dir` must be the
-    /// true repository root (design/03_sync_model.md, "Write safety: the
+    /// A no-op when neither side carries any metadata and there is no
+    /// clone_root advancement to record. `work_dir` must be the true
+    /// repository root (design/03_sync_model.md, "Write safety: the
     /// working-tree write boundary") -- passing a scoped subdirectory would
     /// exempt everything at or above it from the check.
     pub(crate) fn write(
@@ -47,7 +90,7 @@ impl ConflictMeta {
         work_dir: &std::path::Path,
         base_path: &std::path::Path,
     ) -> Result<(), Error> {
-        if self.base.is_none() && self.remote.is_none() {
+        if self.base.is_none() && self.remote.is_none() && self.remote_resolution.is_none() {
             return Ok(());
         }
         let meta_path = sidecar_path(base_path);
@@ -96,6 +139,8 @@ fn restore_side_meta(work_dir: &std::path::Path, abs_base: &std::path::Path, sid
 
 pub struct ConflictListOptions {
     pub work_dir: PathBuf,
+    pub current_dir: PathBuf,
+    pub paths: Vec<PathBuf>,
 }
 
 pub struct ConflictCleanOptions {
@@ -182,7 +227,9 @@ pub fn run_list(opts: ConflictListOptions) -> Result<(), Error> {
     let repo = Repo::open(&opts.work_dir)?;
     crate::progress::notify_repo_dir(&repo.work_dir);
 
-    let paths = collect_conflicting_base_paths(&opts.work_dir);
+    let scope_paths =
+        resolve_scope_paths_or_cwd(&opts.work_dir, &opts.current_dir, &opts.paths)?;
+    let paths = collect_conflicting_base_paths_scoped(&opts.work_dir, &scope_paths);
     if paths.is_empty() {
         return Ok(());
     }
@@ -214,7 +261,8 @@ pub fn run_clean(opts: ConflictCleanOptions) -> Result<(), Error> {
     // concurrent pull writing them. See design/12_locking.md.
     let _lock = repo.acquire_lock()?;
 
-    let scope_paths = resolve_scope_paths(&opts.work_dir, &opts.current_dir, &opts.paths)?;
+    let scope_paths =
+        resolve_scope_paths_or_cwd(&opts.work_dir, &opts.current_dir, &opts.paths)?;
     let helper_files = collect_helper_files(&opts.work_dir, &scope_paths);
 
     let mut out = crate::term::Output::for_stdout();
@@ -280,12 +328,13 @@ pub fn run_accept(opts: ConflictAcceptOptions) -> Result<(), Error> {
     crate::progress::notify_repo_dir(&repo.work_dir);
     let _lock = repo.acquire_lock()?;
 
-    let scope_paths = resolve_scope_paths(&opts.work_dir, &opts.current_dir, &opts.paths)?;
+    let scope_paths =
+        resolve_scope_paths_or_cwd(&opts.work_dir, &opts.current_dir, &opts.paths)?;
     let conflicting = collect_conflicting_base_paths_scoped(&opts.work_dir, &scope_paths);
 
     if conflicting.is_empty() {
         let scope_desc = if opts.paths.is_empty() {
-            "working tree".to_string()
+            "current directory".to_string()
         } else {
             opts.paths
                 .iter()
@@ -302,15 +351,16 @@ pub fn run_accept(opts: ConflictAcceptOptions) -> Result<(), Error> {
     let mut out = crate::term::Output::for_stdout();
     let mut sorted = conflicting.into_iter().collect::<Vec<_>>();
     sorted.sort();
-    let mut count = 0usize;
 
-    for base in &sorted {
-        let abs_base = opts.work_dir.join(base);
-        let src_helper = opts
-            .work_dir
-            .join(format!("{}{}", base, opts.side.suffix()));
-
-        if opts.dry_run {
+    if opts.dry_run {
+        // --dry-run makes no changes and touches `clone_root` and the remote
+        // not at all: report what each path's helper file implies without
+        // reading the metadata sidecar or building a tree store.
+        let mut count = 0usize;
+        for base in &sorted {
+            let src_helper = opts
+                .work_dir
+                .join(format!("{}{}", base, opts.side.suffix()));
             if src_helper.exists() {
                 out.writeln(&format!("  would accept {}: {}", opts.side.label(), base))?;
             } else {
@@ -321,12 +371,103 @@ pub fn run_accept(opts: ConflictAcceptOptions) -> Result<(), Error> {
                 ))?;
             }
             count += 1;
-            continue;
         }
+        out.writeln(&format!(
+            "{} conflict{} would be resolved (dry run).",
+            count,
+            if count == 1 { "" } else { "s" }
+        ))?;
+        out.finish()?;
+        return Ok(());
+    }
 
-        // Read the metadata sidecar before deleting it below, so the accepted
-        // side's tracked mtime/mode can be restored.
-        let conflict_meta = ConflictMeta::read(&abs_base);
+    // Read every path's metadata sidecar up front, before any file is
+    // touched, so phase A below can compute the fully-advanced clone_root
+    // before phase B starts changing the working tree (design/03_sync_model.md,
+    // "Advancing clone_root on resolution", "Ordering guarantee").
+    let metas: Vec<(String, Option<ConflictMeta>)> = sorted
+        .iter()
+        .map(|base| {
+            let abs_base = opts.work_dir.join(base);
+            (base.clone(), ConflictMeta::read(&abs_base))
+        })
+        .collect();
+
+    // Clone_root tree objects along a resolved path may be absent locally
+    // after a lazy clone; route splice/remove reads through the same
+    // read-through lazy tree store `pull`/`ls` use (design/03_sync_model.md,
+    // "Lazy tree reads"). Constructing the reader itself makes no remote
+    // call -- only an actual local-cache miss during splice/remove below
+    // reaches the remote -- so this keeps accept fully offline whenever
+    // every needed tree is already local.
+    let local = repo.local_store();
+    let (pack_reader, _remote, remote_key) = repo.pack_reader("origin", None)?;
+    let lazy = tree_ops::LazyTreeStore::new(&local, &pack_reader, remote_key.as_ref());
+
+    // ------------------------------------------------------------------
+    // Phase A: compute the fully advanced clone_root in memory only --
+    // no filesystem change to the working tree, no helper/sidecar removal.
+    // Any error here (e.g. a clone_root tree object unresolvable even
+    // through `lazy`) aborts with nothing changed: the sidecars read above
+    // are not yet acted on, and every helper file and sidecar is still on
+    // disk exactly as it was.
+    // ------------------------------------------------------------------
+    let mut new_clone_root = repo.read_clone_root()?;
+    let mut clone_root_advanced = false;
+
+    for (base, conflict_meta) in &metas {
+        // `Unrecorded` (defensive fallback, or a sidecar from an older
+        // omemfs version) or a missing sidecar leaves clone_root untouched
+        // for this path, the pre-fix behaviour.
+        let Some(cm) = conflict_meta else { continue };
+        match &cm.remote_resolution {
+            Some(RemoteResolution::Blob {
+                hash,
+                size,
+                mtime,
+                mode,
+            }) => {
+                let comps: Vec<&str> = base.split('/').filter(|s| !s.is_empty()).collect();
+                let leaf_name = comps.last().copied().unwrap_or(base.as_str()).to_string();
+                let new_entry = TreeEntry::Blob {
+                    name: leaf_name,
+                    hash: hash.clone(),
+                    mtime: *mtime,
+                    size: *size,
+                    mode: mode.clone(),
+                };
+                new_clone_root = Some(tree_ops::splice_entry(
+                    new_clone_root.as_ref(),
+                    &comps,
+                    new_entry,
+                    &lazy,
+                )?);
+                clone_root_advanced = true;
+            }
+            Some(RemoteResolution::Deleted) => {
+                let comps: Vec<&str> = base.split('/').filter(|s| !s.is_empty()).collect();
+                if let Some(ref cr) = new_clone_root {
+                    if let Some(new_hash) = tree_ops::remove_entry(cr, &comps, &lazy)? {
+                        new_clone_root = Some(new_hash);
+                        clone_root_advanced = true;
+                    }
+                }
+            }
+            Some(RemoteResolution::Unrecorded) | None => {}
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Phase B: apply the working-tree content change for each path.
+    // Helper files and the metadata sidecar are deliberately left in place
+    // here -- they are removed only in phase D, after clone_root has been
+    // durably advanced in phase C.
+    // ------------------------------------------------------------------
+    for (base, conflict_meta) in &metas {
+        let abs_base = opts.work_dir.join(base);
+        let src_helper = opts
+            .work_dir
+            .join(format!("{}{}", base, opts.side.suffix()));
 
         if src_helper.exists() {
             // Write through a temporary sibling and rename it into place, so
@@ -351,7 +492,7 @@ pub fn run_accept(opts: ConflictAcceptOptions) -> Result<(), Error> {
             // root — the next `push` is then a no-op rather than a needless
             // re-upload. The local side has no recorded metadata (it was never
             // changed away from the working-tree file), so nothing is restored.
-            if let Some(cm) = &conflict_meta {
+            if let Some(cm) = conflict_meta {
                 let side = match opts.side {
                     AcceptSide::Remote => cm.remote.as_ref(),
                     AcceptSide::Base => cm.base.as_ref(),
@@ -366,9 +507,29 @@ pub fn run_accept(opts: ConflictAcceptOptions) -> Result<(), Error> {
             // Accept = restore to that state = delete the file.
             crate::fsguard::remove_file_tolerant(&opts.work_dir, &abs_base)?;
         }
+    }
 
-        // Remove all helper files for this base path (whichever exist), plus the
-        // metadata sidecar. Routed through fsguard (N1/design boundary).
+    // ------------------------------------------------------------------
+    // Phase C: write the advanced clone_root once, durably. This must land
+    // before phase D removes any helper file or sidecar below (design/
+    // 03_sync_model.md, "Advancing clone_root on resolution", "Ordering
+    // guarantee") -- otherwise an interruption between the two could lose
+    // the sidecar's recorded `remote_resolution` while clone_root remains
+    // unadvanced, leaving the conflict unrecoverable.
+    // ------------------------------------------------------------------
+    if clone_root_advanced {
+        if let Some(ref cr) = new_clone_root {
+            repo.write_clone_root(cr)?;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Phase D: only now remove the helper files and the metadata sidecar
+    // for each resolved path, plus report it. Routed through fsguard
+    // (N1/design boundary).
+    // ------------------------------------------------------------------
+    let mut count = 0usize;
+    for (base, _) in &metas {
         for suffix in CONFLICT_SUFFIXES {
             let helper = opts.work_dir.join(format!("{}{}", base, suffix));
             crate::fsguard::remove_file_tolerant(&opts.work_dir, &helper)?;
@@ -382,19 +543,11 @@ pub fn run_accept(opts: ConflictAcceptOptions) -> Result<(), Error> {
         count += 1;
     }
 
-    if !opts.dry_run || count > 0 {
-        let verb = if opts.dry_run {
-            "would be resolved (dry run)"
-        } else {
-            "resolved"
-        };
-        out.writeln(&format!(
-            "{} conflict{} {}.",
-            count,
-            if count == 1 { "" } else { "s" },
-            verb
-        ))?;
-    }
+    out.writeln(&format!(
+        "{} conflict{} resolved.",
+        count,
+        if count == 1 { "" } else { "s" }
+    ))?;
     out.finish()?;
     Ok(())
 }
@@ -412,7 +565,11 @@ fn collect_conflicting_base_paths(work_dir: &PathBuf) -> std::collections::HashS
 }
 
 /// Collect conflicting base paths restricted to the given scope list.
-/// An empty scope list means the entire working tree.
+/// An empty scope list, or a list containing the empty string (the
+/// normalised form of the repository root), means the entire working tree.
+/// Callers (`run_list`/`run_accept`) never pass an empty list themselves --
+/// they first default a missing `<path>...` argument to the cwd, which
+/// normalises to `""` when the cwd is the repository root.
 ///
 /// For non-empty scopes we walk only the requested subtrees (directory scopes)
 /// or check a single base path directly (file scopes), rather than walking the
@@ -477,10 +634,13 @@ fn collect_conflicting_recursive(
 }
 
 /// Collect all helper file paths (relative to work_dir) in the given scopes.
-/// An empty scope list means the entire working tree. For non-empty scopes we
-/// walk only the requested subtrees (directory scopes) or check the helpers of
-/// a single base path directly (file scopes). The result is deduplicated so
-/// overlapping scopes do not yield the same helper twice.
+/// An empty scope list, or a list containing the empty string (the
+/// normalised form of the repository root, see
+/// `collect_conflicting_base_paths_scoped`), means the entire working tree.
+/// For non-empty scopes we walk only the requested subtrees (directory
+/// scopes) or check the helpers of a single base path directly (file
+/// scopes). The result is deduplicated so overlapping scopes do not yield
+/// the same helper twice.
 fn collect_helper_files(work_dir: &PathBuf, scopes: &[String]) -> Vec<String> {
     let mut result = Vec::new();
     if scopes.is_empty() {
@@ -586,6 +746,23 @@ fn resolve_scope_paths(
         .iter()
         .map(|path| crate::repo::normalize_path(path, work_dir, current_dir))
         .collect::<Result<_, _>>()
+}
+
+/// `resolve_scope_paths`, but first defaults an empty `paths` to the current
+/// directory, exactly like `push`/`pull` (design/04_cli_spec.md, "omemfs
+/// conflict"). If cwd == repo root, this normalizes to "" and scans the whole
+/// working tree. Shared by `run_list`, `run_clean`, and `run_accept`, which
+/// all apply this same default.
+fn resolve_scope_paths_or_cwd(
+    work_dir: &Path,
+    current_dir: &Path,
+    paths: &[PathBuf],
+) -> Result<Vec<String>, Error> {
+    if paths.is_empty() {
+        resolve_scope_paths(work_dir, current_dir, &[current_dir.to_path_buf()])
+    } else {
+        resolve_scope_paths(work_dir, current_dir, paths)
+    }
 }
 
 #[cfg(test)]

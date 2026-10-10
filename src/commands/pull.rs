@@ -793,7 +793,7 @@ fn build_conflict_meta(
     base_entry: Option<&TreeEntry>,
     remote_entry: Option<&DiffEntry>,
 ) -> crate::commands::conflict::ConflictMeta {
-    use crate::commands::conflict::{ConflictMeta, SideMeta};
+    use crate::commands::conflict::{ConflictMeta, RemoteResolution, SideMeta};
     let base = base_entry.and_then(|e| match e {
         TreeEntry::Blob { mtime, mode, .. } => Some(SideMeta {
             mtime: *mtime,
@@ -810,7 +810,42 @@ fn build_conflict_meta(
         }
         _ => None,
     });
-    ConflictMeta { base, remote }
+    // The exact value the remote held for this path when the conflict was
+    // detected (design/03_sync_model.md, "Advancing clone_root on
+    // resolution"), for `accept-*` to splice into `clone_root`. `None` here
+    // (path absent from remote_diff) cannot happen for a real conflict --
+    // `classify_conflicts` only ever produces a conflict for a path present
+    // in `remote_diff` -- so `Unrecorded` is a defensive-only fallback, never
+    // exercised by pull's own conflict-detection path.
+    let remote_resolution = Some(match remote_entry {
+        Some(DiffEntry::Added {
+            hash,
+            size,
+            mtime,
+            mode,
+        })
+        | Some(DiffEntry::Modified {
+            hash,
+            size,
+            mtime,
+            mode,
+        }) => RemoteResolution::Blob {
+            hash: hash.clone(),
+            size: *size,
+            mtime: *mtime,
+            mode: mode.clone(),
+        },
+        Some(DiffEntry::Deleted) => RemoteResolution::Deleted,
+        Some(DiffEntry::AddedEmptyDir)
+        | Some(DiffEntry::AddedTree { .. })
+        | Some(DiffEntry::Symlink { .. })
+        | None => RemoteResolution::Unrecorded,
+    });
+    ConflictMeta {
+        base,
+        remote,
+        remote_resolution,
+    }
 }
 
 /// Resolve the remote side from a diff entry (Added or Modified).

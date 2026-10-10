@@ -534,7 +534,7 @@ omemfs ls [-r] [--full-hash] [--dirty] [--no-remote] [--remote | --clone | --wor
 ```
 
 **Arguments**
-- `<path>...`: paths to list, resolved relative to the cwd (default: the cwd itself). From the repository root the default lists the whole tree root; from a subdirectory it lists that subdirectory. A directory argument first shows the directory itself as a self-entry row, then lists its immediate children; a file argument prints that file's single entry.
+- `<path>...`: paths to list, resolved relative to the cwd (default: the cwd itself). From the repository root the default lists the whole tree root; from a subdirectory it lists that subdirectory. A directory argument first shows the directory itself as a self-entry row, then lists its immediate children; a file or symlink argument prints that single entry. A symlink argument is listed exactly like a symlink reached by descending into its parent directory: no hash (`-`), no size (`-`), the entry itself displayed as a single row.
 
 **Options**
 - `-r`, `--recursive`: list all descendants recursively. Recursion stops at a stubbed directory boundary: a directory whose tree object is not present in the local store (only its `.omemfs-stub` marker exists) is listed as a single `S` row rather than descended into, since its subtree objects are not held locally. This matches the non-recursive listing, which never reads child tree objects.
@@ -572,6 +572,8 @@ This scoping also bounds `--working`'s row substitution: since that substitution
 To keep the scope from leaking back into a whole-tree walk, the `.omemfs-filter` set for a single `<path>` is loaded scope-limited (`FilterSet::load_scoped`): only the ancestors of the path and the files inside its subtree are read, never out-of-scope siblings (see `05_ignore_and_aggregate.md` "Scope-limited filter load"). Without this, discovering filter files alone would re-walk the entire tree.
 
 If a `<path>` is itself a file or a stub, no subtree scan runs: the file is hashed directly (or the stub's recorded entry is spliced), matching `push`'s single-path handling. A `<path>` excluded by an `.omemfs-filter` ignore pattern is not scanned.
+
+If a `<path>` does not exist on disk, is not a stub, but **is** present in the clone root, it is treated as a deletion: the entry is spliced out of the base with the same `remove_entry` used by `push <path>`'s scoped-delete branch (see `03_sync_model.md` "Path-scoped push"), instead of leaving the base unchanged. This makes `omemfs ls <path>` agree with what `omemfs push <path>` would actually do to the same path, and with what an ancestor-scoped or whole-tree `ls` already reports for the same subtree: the removed path's own row shows `X=M` (directories) or `X=D` (a removed file/symlink), and every descendant leaf shows `X=D` when listed with `-r`. A `<path>` absent from both the working tree and the clone root is left as before (nothing to diff; the caller reports "path not found").
 
 When `<path>` names a **partially expanded** directory instead — one where a `.omemfs-stub` marker coexists with real files (see `08_stub_system.md`, "Partial expansion") — a subtree scan does run, and it performs the same stub/real-file merge at `<path>` that an unscoped scan performs when it reaches `<path>` as a descendant while enumerating its parent (see `03_sync_model.md`, "Partial-expansion merge is independent of scan root"). The merge does not depend on whether `<path>` is the top of the scoped walk or reached partway through a whole-tree walk, so the reconstructed subtree hash at `<path>` — and therefore the `X`/`Z` columns for `<path>` and every row beneath it — is identical either way. In particular, `omemfs ls daily` and `omemfs ls daily/0420` report the same status for `daily/0420` and everything under it whenever `daily` is a partially expanded stub directory: scoping to a subpath never leaves that subpath's own stub unmerged.
 
@@ -1250,6 +1252,13 @@ This is an internal diagnostic command intended for development and operations, 
 
 By default `omemfs stats` performs NO remote I/O at all: only the local sections (3–6) are computed. The two remote-backed sections (1 and 2) are gated behind the explicit `--remote` flag, because they enumerate the remote (`list_with_sizes`) and read its small index files and Bloom filter. This keeps the default invocation cheap and offline-safe (e.g. when the remote is unreachable or its access would incur cost).
 
+**`--remote` failure reporting.** Two distinct situations can leave the two remote-backed sections empty when `--remote` is given, and they are told apart:
+
+- **The remote has genuinely never been pushed to** (no `INDEX_ROOT` recorded yet). This is a normal, expected state, not a failure — the two remote-backed sections are simply omitted, exactly as if `--remote` had not been given, with no warning.
+- **The remote check itself failed** — `origin` is not configured, the configured backend is unreachable or rejects the credentials, or the `INDEX_ROOT` object is present but cannot be read/decrypted/parsed. Because the user explicitly asked to pay for remote I/O with `--remote`, this case prints a warning to **stderr** (`warning: --remote check failed: <error>; showing local-only stats`) rather than being silently swallowed into the same empty output as "never pushed" — an empty Remote section must never be mistaken for "zero orphans, nothing to see." The command still exits 0 and prints every local-only section (3–6) normally; only the two remote-backed sections (1 and 2) are omitted.
+
+This distinction exists only for `--remote`; without the flag, no remote I/O is attempted at all (see above), so there is nothing to fail and no warning is ever printed.
+
 **Units.** All human-readable byte sizes are formatted with binary (IEC) units — `B`, `KiB` (1024 B), `MiB` (1024 KiB), `GiB` (1024 MiB) — at one decimal place (e.g. `12.4 MiB`). The compact form (`fmt_size_compact`, used inside the Recent I/O table) is identical but drops the space (`12.4MiB`). JSON output is unaffected: it always reports raw integer byte counts. Integer object/operation counts are printed with thousands separators (e.g. `1,773`).
 
 **Section 0 — Summary panel and group banners.** Before any section, a Summary panel is printed: a title line (`omemfs stats — origin` when `--remote` resolves a remote, else `omemfs stats`) followed by a heavy rule and these lines:
@@ -1588,7 +1597,7 @@ Manage and resolve conflict helper files created by `pull` when the same path wa
 omemfs conflict <subcommand> [--dry-run] [<path>...]
 ```
 
-`<path>` scopes the operation to a specific file or directory subtree. When omitted, the entire working tree is scanned.
+`<path>` scopes the operation to a specific file or directory subtree, resolved relative to the cwd. If omitted, the scope defaults to the cwd, exactly like `push`/`pull`: a full-tree scan from the repository root, a scoped scan of that subtree from a subdirectory.
 
 **Subcommands**
 
@@ -1604,11 +1613,14 @@ omemfs conflict <subcommand> [--dry-run] [<path>...]
 
 #### omemfs conflict list
 
-List all file paths that currently have unresolved conflict helper files. No path argument; no `--dry-run`.
+List all file paths that currently have unresolved conflict helper files. No `--dry-run` (the command makes no changes).
 
 ```
-omemfs conflict list
+omemfs conflict list [<path>...]
 ```
+
+**Arguments**
+- `<path>...`: optional path scope(s), resolved relative to the cwd. If given, only conflicts under the specified paths are listed. If omitted, the scope defaults to the cwd (see "omemfs conflict" above).
 
 Output: one path per line (the base file path, not the helper file name), followed by a summary count.
 
@@ -1619,7 +1631,7 @@ $ omemfs conflict list
 2 paths with unresolved conflicts.
 ```
 
-If there are no conflicts, prints nothing and exits 0.
+If there are no conflicts in scope, prints nothing and exits 0.
 
 ---
 
@@ -1630,6 +1642,9 @@ Delete conflict helper files (`<path>.omemfs-conflict-{base,local,remote}`). The
 ```
 omemfs conflict clean [--dry-run] [<path>...]
 ```
+
+**Arguments**
+- `<path>...`: optional path scope(s), resolved relative to the cwd. If omitted, the scope defaults to the cwd (see "omemfs conflict" above).
 
 **Behaviour**
 
@@ -1668,11 +1683,16 @@ Adopt the remote version for each conflicting path and remove the helper files.
 omemfs conflict accept-remote [--dry-run] [<path>...]
 ```
 
-**Behaviour** for each conflicting path `<p>`:
+**Arguments**
+- `<path>...`: optional path scope(s), resolved relative to the cwd. If omitted, the scope defaults to the cwd (see "omemfs conflict" above).
 
-1. If `<p>.omemfs-conflict-remote` exists: overwrite `<p>` with its contents, then restore the remote side's tracked `mtime` and `mode` from the conflict metadata sidecar (if present) so the result is idempotent — a subsequent `push` does not re-upload an unchanged file.
-2. If `<p>.omemfs-conflict-remote` does not exist (local-add vs remote-delete conflict): delete `<p>`.
-3. Delete all three helper files for `<p>` (whichever exist), plus the `<p>.omemfs-conflict-meta` sidecar.
+**Behaviour** for all conflicting paths `<p>` in scope, in this order (see `03_sync_model.md`, "Advancing clone_root on resolution", "Ordering guarantee"):
+
+1. Compute the advanced `clone_root` for every `<p>` (splicing in the value observed on the remote when the conflict was detected) and write it once, durably, before touching any helper file or sidecar. Reading the intermediate clone_root tree objects needed for this may transparently fetch a locally-missing one from the remote through the same lazy tree store `pull`/`ls` use (`03_sync_model.md`, "Lazy tree reads").
+2. For each `<p>`: if `<p>.omemfs-conflict-remote` exists, overwrite `<p>` with its contents, then restore the remote side's tracked `mtime` and `mode` from the conflict metadata sidecar (if present) so the result is idempotent — a subsequent `push` does not re-upload an unchanged file. If `<p>.omemfs-conflict-remote` does not exist (local-add vs remote-delete conflict), delete `<p>`.
+3. Only after step 1's `clone_root` write has succeeded: delete all three helper files for `<p>` (whichever exist), plus the `<p>.omemfs-conflict-meta` sidecar.
+
+For `accept-remote`, the advancement in step 1 matches what the working tree already holds, so it changes nothing observable on its own — it is applied for consistency with `accept-local`/`accept-base` and so a later `pull` does not re-detect the same conflict.
 
 **Output example**
 
@@ -1696,11 +1716,14 @@ Adopt the local working tree version for each conflicting path and remove the he
 omemfs conflict accept-local [--dry-run] [<path>...]
 ```
 
-**Behaviour** for each conflicting path `<p>`:
+**Arguments**
+- `<path>...`: optional path scope(s), resolved relative to the cwd. If omitted, the scope defaults to the cwd (see "omemfs conflict" above).
 
-1. If `<p>.omemfs-conflict-local` exists: overwrite `<p>` with its contents.
-2. If `<p>.omemfs-conflict-local` does not exist (local-delete vs remote-modify conflict): delete `<p>`.
-3. Delete all three helper files for `<p>` (whichever exist).
+**Behaviour** for all conflicting paths `<p>` in scope, in this order (see `03_sync_model.md`, "Advancing clone_root on resolution", "Ordering guarantee"):
+
+1. Compute the advanced `clone_root` for every `<p>` (splicing in the value observed on the remote when the conflict was detected) and write it once, durably, before touching any helper file or sidecar. Reading the intermediate clone_root tree objects needed for this may transparently fetch a locally-missing one from the remote through the same lazy tree store `pull`/`ls` use (`03_sync_model.md`, "Lazy tree reads"). Without this advancement, a subsequent `push` would be rejected as a lost update — the accepted local content deliberately differs from the remote's conflicting version — and a subsequent `pull` would re-detect the same conflict.
+2. For each `<p>`: if `<p>.omemfs-conflict-local` exists, overwrite `<p>` with its contents. If `<p>.omemfs-conflict-local` does not exist (local-delete vs remote-modify conflict), delete `<p>`.
+3. Only after step 1's `clone_root` write has succeeded: delete all three helper files for `<p>` (whichever exist), plus the `<p>.omemfs-conflict-meta` sidecar.
 
 **Output example**
 
@@ -1720,11 +1743,14 @@ Adopt the base (clone root) version for each conflicting path and remove the hel
 omemfs conflict accept-base [--dry-run] [<path>...]
 ```
 
-**Behaviour** for each conflicting path `<p>`:
+**Arguments**
+- `<path>...`: optional path scope(s), resolved relative to the cwd. If omitted, the scope defaults to the cwd (see "omemfs conflict" above).
 
-1. If `<p>.omemfs-conflict-base` exists: overwrite `<p>` with its contents, then restore the base side's tracked `mtime` and `mode` from the conflict metadata sidecar (if present) so the result matches the clone-root state.
-2. If `<p>.omemfs-conflict-base` does not exist (both sides added a new file): delete `<p>` — the base state is absence of the file.
-3. Delete all three helper files for `<p>` (whichever exist), plus the `<p>.omemfs-conflict-meta` sidecar.
+**Behaviour** for all conflicting paths `<p>` in scope, in this order (see `03_sync_model.md`, "Advancing clone_root on resolution", "Ordering guarantee"):
+
+1. Compute the advanced `clone_root` for every `<p>` (splicing in the value observed on the remote when the conflict was detected) and write it once, durably, before touching any helper file or sidecar. Reading the intermediate clone_root tree objects needed for this may transparently fetch a locally-missing one from the remote through the same lazy tree store `pull`/`ls` use (`03_sync_model.md`, "Lazy tree reads"). Without this advancement, a subsequent `push` would be rejected as a lost update — the restored base content deliberately differs from the remote's conflicting version — and a subsequent `pull` would re-detect the same conflict.
+2. For each `<p>`: if `<p>.omemfs-conflict-base` exists, overwrite `<p>` with its contents, then restore the base side's tracked `mtime` and `mode` from the conflict metadata sidecar (if present) so the result matches the clone-root state. If `<p>.omemfs-conflict-base` does not exist (both sides added a new file), delete `<p>` — the base state is absence of the file.
+3. Only after step 1's `clone_root` write has succeeded: delete all three helper files for `<p>` (whichever exist), plus the `<p>.omemfs-conflict-meta` sidecar.
 
 **Output example**
 
@@ -1738,7 +1764,7 @@ $ omemfs conflict accept-base docs/readme.md
 
 #### Relationship to other commands
 
-- **`push`**: errors out if any conflict helper files exist in the working tree. Resolve all conflicts before pushing.
+- **`push`**: errors out if any conflict helper files exist in the working tree. Resolve all conflicts before pushing. Once resolved, `conflict accept-*`'s `clone_root` advancement (see each subcommand's Behaviour above, and `03_sync_model.md`, "Advancing clone_root on resolution") lets the resolved paths pass `push`'s CAS precheck even when the accepted content deliberately differs from the remote's conflicting version — unless the remote has advanced again since the conflict was detected, in which case CAS correctly fails again as a new divergence. If `accept-*` is interrupted or fails partway (e.g. a `clone_root` write error), the ordering guarantee above means the helper files and sidecar for any not-yet-durably-advanced path are still present, so `conflict list` still reports it and a plain re-run of the same `accept-*` recovers and lets the following `push` succeed — see `03_sync_model.md`, "Advancing clone_root on resolution", "Ordering guarantee".
 - **`restore <path>`**: discards local changes and also removes any conflict helper files, and the metadata sidecar, for the restored paths — including when restoring a single conflicted path, not only on a whole-tree restore. Both are omemfs-internal bookkeeping rather than user content, so this removal is never reported as a `deleted:` line and never counted in the summary, matching how an orphaned stub file is already handled.
 - **`ls`**: the `Z` column shows `!` for files (and their ancestor directories) that have conflict helper files.
 

@@ -696,6 +696,70 @@ teardown() {
     [[ "$dir_line" == ?M*"subdir/"* ]]
 }
 
+@test "ls: scoped ls of a deleted directory shows D, matching push --dry-run" {
+    mkdir subdir
+    echo "a" > subdir/a.txt
+    echo "b" > subdir/b.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    rm -rf subdir
+    run "$OMEMFS" ls subdir
+    [ "$status" -eq 0 ]
+    dir_line=$(echo "$output" | grep "subdir/")
+    [[ -n "$dir_line" ]]
+    # The directory's own row must show M (it contains deleted content),
+    # matching the rule that directories never show D themselves.
+    [[ "$dir_line" == ?M*"subdir/"* ]]
+
+    run "$OMEMFS" ls -r subdir
+    [ "$status" -eq 0 ]
+    a_line=$(echo "$output" | grep "subdir/a.txt")
+    [[ "$a_line" == ?D* ]]
+    b_line=$(echo "$output" | grep "subdir/b.txt")
+    [[ "$b_line" == ?D* ]]
+}
+
+@test "ls: scoped ls of a deleted file shows D" {
+    echo "content" > file.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    rm file.txt
+    run "$OMEMFS" ls file.txt
+    [ "$status" -eq 0 ]
+    [[ "$output" == ?D* ]]
+}
+
+@test "ls: scoped ls of a deleted path agrees with ls from the parent" {
+    mkdir subdir
+    echo "a" > subdir/a.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    rm -rf subdir
+    run "$OMEMFS" ls
+    [ "$status" -eq 0 ]
+    parent_line=$(echo "$output" | grep "subdir/")
+    run "$OMEMFS" ls subdir
+    [ "$status" -eq 0 ]
+    scoped_line=$(echo "$output" | grep "subdir/")
+    # Both must report the same R/X/Z status columns for subdir/ itself.
+    parent_status="${parent_line:0:3}"
+    scoped_status="${scoped_line:0:3}"
+    [[ "$parent_status" == "$scoped_status" ]]
+}
+
+@test "ls: scoped --dirty on a deleted path lists it, matching unscoped --dirty" {
+    mkdir subdir
+    echo "a" > subdir/a.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    rm -rf subdir
+    run "$OMEMFS" ls --dirty subdir
+    [ "$status" -eq 0 ]
+    scoped_line=$(echo "$output" | grep "subdir/a.txt")
+    [[ -n "$scoped_line" ]]
+    [[ "$scoped_line" == ?D* ]]
+}
+
 # ---------------------------------------------------------------------------
 # Remote status column (R) tests — require two-clone setup
 # ---------------------------------------------------------------------------
@@ -1589,6 +1653,21 @@ setup_two_clones_for_ls() {
     [[ "$output" == *"pkg/a.txt"* ]]
     [[ "$output" != *"pkg/b.txt"* ]]
     [[ "$output" != *"pkg/c.txt"* ]]
+}
+
+@test "ls: scoped listing of a symlink path lists it instead of erroring" {
+    # Regression test: a symlink TreeEntry has no hash (design/04 "<path>...").
+    # resolve_entry_meta used to treat a missing hash as "path not found" for
+    # every entry kind, so a scoped `ls <symlink>` always failed even though
+    # the same symlink is listed fine by an unscoped `ls`.
+    echo "target content" > target.txt
+    ln -s target.txt link.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    run "$OMEMFS" ls link.txt
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"link.txt"* ]]
 }
 
 @test "ls: scoped listing preserves out-of-scope STAT_CACHE entries" {

@@ -442,10 +442,14 @@ impl PackWriter {
         crate::codec::pack::decrypt_index_root_bytes(raw, self.remote_key.as_ref())
     }
 
-    /// Resolve whether `hash` is already present on the remote by consulting the
-    /// push-start index snapshot (delta → hot → cold). Returns `Ok(true)` only
-    /// when an index entry is found; standalone objects are not recorded as
-    /// resolvable here (they are confirmed via `remote.exists` in `exists()`).
+    /// Resolve whether `hash` has a published index entry in the push-start
+    /// snapshot (delta → hot → cold). Returns `Ok(true)` only when an index
+    /// entry is found -- this covers inline, pack, AND standalone entries
+    /// alike, since all three live inside the same index files, searched by
+    /// hash regardless of variant. A hash whose bytes merely sit on the
+    /// remote under its storage key, with no index entry anywhere, is NOT
+    /// resolvable here and must not be treated as present by the caller (see
+    /// `exists()`).
     ///
     /// A `None` snapshot (no INDEX_ROOT at push start) means nothing is indexed
     /// yet, so this returns `Ok(false)`.
@@ -667,25 +671,37 @@ impl ObjectStore for PackWriter {
         if !self.bloom.lock().unwrap().may_contain(hash) {
             return Ok(false);
         }
-        // "Maybe present" → consult the locally cached snapshot index FIRST
+        // "Maybe present" → consult the locally cached snapshot index
         // (delta → hot → cold via load_index_file, which serves immutable index
         // files from the local cache with no remote I/O on a cache hit). The
         // index records inline, pack, AND standalone entries from every push
         // captured by the snapshot, so it answers for the vast majority of
         // already-present objects.
         //
-        // Only on an index miss do we issue a remote HEAD, to catch a standalone
-        // object written to objects/<storage_key> by an earlier push that the
-        // snapshot index does not yet record. Probing the remote first would, in
-        // the common steady state (after a `pack`, where every prior object lives
-        // in the index rather than as a loose objects/<storage_key>), issue a
-        // HEAD per sibling object in any touched directory that always 404s and
-        // then falls through to the index anyway — a wasted remote round-trip
-        // each. See design/02 "Membership test semantics".
+        // An index miss is reported as absent, UNCONDITIONALLY -- even though
+        // a standalone object with this exact hash might already sit on the
+        // remote under its storage key (e.g. left behind by an earlier push
+        // that uploaded the bytes but was interrupted before its `finish()`
+        // published the corresponding index entry -- writing the bytes and
+        // publishing the entry are not atomic within one push). Reporting
+        // "present" here used to be a wasted-round-trip optimisation (a remote
+        // `HEAD`, skipped in favour of the index answer), but it was also a
+        // permanent-orphan bug: it let `route()` -- the only place that
+        // appends an index entry -- never run for such a hash, so it stayed
+        // unindexed and unresolvable through SnapshotOnly reads forever, no
+        // matter how many later pushes touched it. See design/02 "Membership
+        // test semantics" for the full rationale.
+        //
+        // Reporting "absent" instead never causes a redundant re-upload:
+        // route()'s underlying write (`ObjectsBackend::write_stream` /
+        // `CloudObjects::write_stream`) is itself content-addressed and
+        // idempotent, skipping the actual PUT/file-write when the bytes are
+        // already there. So the only cost is always publishing the index
+        // entry -- exactly the guarantee a push must make.
         if self.index_contains(hash)? {
             return Ok(true);
         }
-        self.remote.exists(hash)
+        Ok(false)
     }
 
     fn open_read(&self, hash: &Hash) -> Result<Box<dyn io::Read>, Error> {
@@ -1125,10 +1141,107 @@ mod tests {
 
         let mut cursor = io::Cursor::new(&data);
         writer.write_from(&hash, &mut cursor).unwrap();
-        // After insert, bloom says maybe-present; remote.exists is checked for confirmation.
-        // Since inline entries aren't written to remote.objects/, exists() returns false
-        // from remote but bloom returns true — the current impl checks remote.exists() after bloom.
-        // This is acceptable: inline entries will be found via the index on read path.
+        // After insert, bloom says maybe-present, and the hash is now in this
+        // writer's own in-flight delta, so exists() answers true from the first
+        // check (in-flight delta) without needing the bloom/index path at all.
+        assert!(writer.exists(&hash).unwrap());
+    }
+
+    #[test]
+    fn exists_ignores_unindexed_remote_bytes() {
+        // Reproduces the orphan bug (design/02 "Membership test semantics
+        // (push path)"): a standalone object's raw bytes can land on the
+        // remote (via `route()`'s direct write) without the delta index file
+        // that would record it ever being written, if the push that uploaded
+        // them is interrupted before `finish()`. A later push must still
+        // treat that hash as absent -- never as "already present" -- or the
+        // object stays permanently unindexed and unresolvable through
+        // SnapshotOnly reads no matter how many further pushes touch it.
+        let tmp = TempDir::new().unwrap();
+        let (remote, base) = setup_remote(&tmp);
+
+        // Simulate the orphan: bytes physically present under the storage key
+        // for `orphan_hash`, written directly (bypassing PackWriter/route()
+        // entirely, exactly like an interrupted earlier push's standalone
+        // write would leave them), with NO index entry anywhere.
+        let orphan_payload = vec![0xAB; PACK_THRESHOLD + 1];
+        let orphan_hash = make_hash_from_data(&orphan_payload);
+        remote
+            .write_from(&orphan_hash, &mut io::Cursor::new(orphan_payload.clone()))
+            .unwrap();
+
+        // Build a Bloom filter that reports "maybe present" for `orphan_hash`
+        // (this is what a real saturated/false-positive-prone filter would
+        // also do; forcing a real insert here makes the test deterministic
+        // rather than relying on a coincidental collision) and an otherwise
+        // EMPTY hot index -- no index tier records `orphan_hash` at all.
+        let mut bloom = BloomFilter::new(100, 0.01, bloom::DEFAULT_NUM_HASH_FUNCTIONS);
+        bloom.insert(&orphan_hash);
+        let bloom_bytes = bloom.serialise();
+        let bloom_hash = Hash::compute(&bloom_bytes);
+        remote
+            .write_from(&bloom_hash, &mut io::Cursor::new(bloom_bytes))
+            .unwrap();
+
+        let empty_hot = IndexFile::new();
+        let hot_bytes = empty_hot.serialise().unwrap();
+        let hot_hash = Hash::compute(&hot_bytes);
+        remote
+            .write_from(&hot_hash, &mut io::Cursor::new(hot_bytes))
+            .unwrap();
+
+        let mut index_root = IndexRoot::new_empty();
+        index_root.remote_root = *Hash::compute(b"some-prior-root").as_bytes_array();
+        index_root.hot_hash = *hot_hash.as_bytes_array();
+        index_root.bloom_hash = *bloom_hash.as_bytes_array();
+        std::fs::write(
+            base.join(crate::codec::pack::INDEX_ROOT_FILE),
+            index_root.serialise().unwrap(),
+        )
+        .unwrap();
+
+        // A fresh writer (a later, independent push) must NOT report this
+        // hash as present just because raw bytes already sit on the remote:
+        // only an index entry makes it resolvable.
+        let mut writer = PackWriter::new(
+            Box::new(LocalStore::for_remote(&base)),
+            Box::new(LocalRootPointer::new(base.clone(), None)),
+            LocalStore::for_cache(tmp.path().join("objcache")),
+            None,
+        )
+        .unwrap();
+        assert!(
+            !writer.exists(&orphan_hash).unwrap(),
+            "an unindexed hash must be reported absent even though its bytes \
+             already exist on the remote under its storage key"
+        );
+
+        // End-to-end: routing it now (as the real recovery/retry push does)
+        // must publish an index entry. The underlying remote write is
+        // idempotent (`RemoteObjectsDir::write_stream` no-ops when the path
+        // already exists), so this also exercises "no redundant re-upload"
+        // for the bytes already sitting there from the simulated orphan.
+        writer
+            .write_from(&orphan_hash, &mut io::Cursor::new(orphan_payload.clone()))
+            .unwrap();
+        writer.finish(&Hash::compute(b"some-new-root")).unwrap();
+
+        let final_raw = std::fs::read(base.join(crate::codec::pack::INDEX_ROOT_FILE)).unwrap();
+        let final_root = IndexRoot::deserialise(&final_raw).unwrap();
+        let delta_hash = final_root
+            .delta_hashes_as_hashes()
+            .into_iter()
+            .next()
+            .expect("finish() must have written a new delta index");
+        let remote_for_check = LocalStore::for_remote(&base);
+        let mut r = remote_for_check.open_read(&delta_hash).unwrap();
+        let mut delta_bytes = Vec::new();
+        r.read_to_end(&mut delta_bytes).unwrap();
+        let delta_index = IndexFile::deserialise(&delta_bytes).unwrap();
+        assert!(
+            delta_index.find(&orphan_hash).is_some(),
+            "the previously-orphaned hash must now have a published index entry"
+        );
     }
 
     /// Verify that `load_index_file` fetches from the remote exactly ONCE, even
@@ -1513,12 +1626,16 @@ mod tests {
         );
     }
 
-    /// The remote `HEAD` fallback is still exercised for a standalone object that
-    /// was written to `objects/` since the snapshot index was built (i.e. not yet
-    /// recorded in any index file the second writer can see). The index lookup
-    /// misses and `exists()` must fall through to a remote `HEAD` to confirm it.
+    /// A standalone object physically written to `objects/` since the snapshot
+    /// index was built (i.e. not yet recorded in any index file the second
+    /// writer can see) must be reported ABSENT, never confirmed present via a
+    /// remote `HEAD` -- see `exists_ignores_unindexed_remote_bytes` above and
+    /// design/02 "Membership test semantics" for why: an earlier version of
+    /// this method issued exactly that `HEAD` and reported "present" on a
+    /// hit, which let such an object stay permanently unindexed (this test
+    /// used to pin that behavior; it now pins its replacement).
     #[test]
-    fn exists_falls_back_to_remote_head_for_unindexed_standalone() {
+    fn exists_does_not_confirm_unindexed_standalone_via_remote_head() {
         use crate::store::stats::{IoRecord, StatsStore};
         use std::sync::Arc;
         use std::sync::atomic::Ordering::Relaxed;
@@ -1570,13 +1687,18 @@ mod tests {
 
         let heads_before = record.exists_found.load(Relaxed) + record.exists_miss.load(Relaxed);
         assert!(
-            w2.exists(&standalone_hash).unwrap(),
-            "an unindexed standalone in objects/ must be confirmed present via remote HEAD"
+            !w2.exists(&standalone_hash).unwrap(),
+            "an unindexed standalone must be reported absent even though its bytes \
+             already exist in objects/ -- it has no index entry, so it is not \
+             resolvable, and must never be short-circuited to \"present\" via a \
+             raw remote HEAD"
         );
         let heads_after = record.exists_found.load(Relaxed) + record.exists_miss.load(Relaxed);
-        assert!(
-            heads_after > heads_before,
-            "exists() must fall back to a remote HEAD when the index lookup misses"
+        assert_eq!(
+            heads_before, heads_after,
+            "exists() must never issue a remote HEAD at all now that an index \
+             miss is answered from the index alone (issued {} HEAD(s))",
+            heads_after - heads_before
         );
     }
 

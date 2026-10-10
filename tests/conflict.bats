@@ -64,6 +64,26 @@ make_conflict() {
     [[ "$output" != *".omemfs-conflict-remote"* ]]
 }
 
+@test "conflict list: scoped to a path lists only that subtree" {
+    make_conflict file.txt
+    make_conflict src/main.rs
+    run "$OMEMFS" conflict list src/
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"src/main.rs"* ]]
+    [[ "$output" != *"file.txt"* ]]
+}
+
+@test "conflict list: rejects an outside scope" {
+    local outside
+    outside="$(mktemp -d)"
+    make_conflict file.txt
+
+    run "$OMEMFS" conflict list "$outside"
+    [ "$status" -ne 0 ]
+
+    rm -rf "$outside"
+}
+
 # ---------------------------------------------------------------------------
 # omemfs conflict clean
 # ---------------------------------------------------------------------------
@@ -321,6 +341,44 @@ make_conflict() {
     [ ! -f file.txt.omemfs-conflict-remote ]
 }
 
+@test "conflict list: with no path argument, defaults to the cwd subtree, not the repo root" {
+    make_conflict file.txt
+    make_conflict src/main.rs
+
+    cd src
+    run "$OMEMFS" conflict list
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"src/main.rs"* ]]
+    [[ "$output" != *"file.txt"* ]]
+}
+
+@test "conflict clean: with no path argument, defaults to the cwd subtree, not the repo root" {
+    make_conflict file.txt
+    make_conflict src/main.rs
+
+    cd src
+    run "$OMEMFS" conflict clean
+    [ "$status" -eq 0 ]
+    [ ! -f "main.rs.omemfs-conflict-base" ]
+    # file.txt helper files (outside cwd) must remain untouched.
+    [ -f "../file.txt.omemfs-conflict-base" ]
+    [ -f "../file.txt.omemfs-conflict-local" ]
+    [ -f "../file.txt.omemfs-conflict-remote" ]
+}
+
+@test "conflict accept-remote: with no path argument, defaults to the cwd subtree, not the repo root" {
+    make_conflict file.txt
+    make_conflict src/main.rs
+
+    cd src
+    run "$OMEMFS" conflict accept-remote
+    [ "$status" -eq 0 ]
+    [ "$(cat main.rs)" = "remote change" ]
+    [ ! -f "main.rs.omemfs-conflict-remote" ]
+    # file.txt (outside cwd) must remain an unresolved conflict.
+    [ -f "../file.txt.omemfs-conflict-remote" ]
+    [ "$(cat ../file.txt)" = "hello" ]
+}
 
 # ---------------------------------------------------------------------------
 # Symlink traversal safety
@@ -427,4 +485,349 @@ make_conflict() {
     [ "$status" -eq 0 ]
 
     rm loop
+}
+
+# ---------------------------------------------------------------------------
+# clone_root advancement on resolution (design/03_sync_model.md, "Advancing
+# clone_root on resolution"; design/04_cli_spec.md accept-*'s step 4).
+#
+# A genuine pull conflict (not `make_conflict`'s synthetic helpers) leaves
+# clone_root pinned at the pre-conflict base. Resolving with accept-local,
+# accept-remote, or accept-base must advance clone_root's entry for the
+# resolved path to the value observed on the remote when the conflict was
+# detected, so a subsequent push is recognized as an intentional
+# supersession rather than a lost update.
+# ---------------------------------------------------------------------------
+
+@test "conflict accept-local: advances clone_root so the following push succeeds" {
+    local clone2
+    clone2="$(mktemp -d)"
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" "$clone2"
+    [ "$status" -eq 0 ]
+
+    echo "local change" > file.txt
+    (cd "$clone2" && echo "remote change" > file.txt && "$OMEMFS" push)
+
+    run "$OMEMFS" pull
+    [ "$status" -ne 0 ]
+    [ -f file.txt.omemfs-conflict-local ]
+
+    run "$OMEMFS" conflict accept-local file.txt
+    [ "$status" -eq 0 ]
+    [[ "$(cat file.txt)" == "local change" ]]
+
+    # Without the clone_root advancement this push is wrongly rejected as a
+    # lost update, even though the accepted content is a considered response
+    # to the remote state that caused the conflict.
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" clone_chk
+    [ "$status" -eq 0 ]
+    [[ "$(cat clone_chk/file.txt)" == "local change" ]]
+
+    rm -rf "$clone2"
+}
+
+@test "conflict accept-local: a later pull does not re-detect the same conflict" {
+    local clone2
+    clone2="$(mktemp -d)"
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" "$clone2"
+    [ "$status" -eq 0 ]
+
+    echo "local change" > file.txt
+    (cd "$clone2" && echo "remote change" > file.txt && "$OMEMFS" push)
+
+    run "$OMEMFS" pull
+    [ "$status" -ne 0 ]
+
+    run "$OMEMFS" conflict accept-local file.txt
+    [ "$status" -eq 0 ]
+
+    # A pull before pushing must not re-report file.txt as conflicting: the
+    # advancement records that this remote state was already acknowledged.
+    run "$OMEMFS" pull
+    [ "$status" -eq 0 ]
+    [ ! -f file.txt.omemfs-conflict-local ]
+    [[ "$(cat file.txt)" == "local change" ]]
+
+    rm -rf "$clone2"
+}
+
+@test "conflict accept-remote: advances clone_root so the following push is a clean no-op" {
+    local clone2
+    clone2="$(mktemp -d)"
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" "$clone2"
+    [ "$status" -eq 0 ]
+
+    echo "local change" > file.txt
+    (cd "$clone2" && echo "remote change" > file.txt && "$OMEMFS" push)
+
+    run "$OMEMFS" pull
+    [ "$status" -ne 0 ]
+
+    run "$OMEMFS" conflict accept-remote file.txt
+    [ "$status" -eq 0 ]
+    [[ "$(cat file.txt)" == "remote change" ]]
+
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    run "$OMEMFS" pull
+    [ "$status" -eq 0 ]
+    [ ! -f file.txt.omemfs-conflict-remote ]
+
+    rm -rf "$clone2"
+}
+
+@test "conflict accept-base: advances clone_root so the following push succeeds" {
+    local clone2
+    clone2="$(mktemp -d)"
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" "$clone2"
+    [ "$status" -eq 0 ]
+
+    echo "local change" > file.txt
+    (cd "$clone2" && echo "remote change" > file.txt && "$OMEMFS" push)
+
+    run "$OMEMFS" pull
+    [ "$status" -ne 0 ]
+
+    run "$OMEMFS" conflict accept-base file.txt
+    [ "$status" -eq 0 ]
+    [[ "$(cat file.txt)" == "hello" ]]
+
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" clone_chk
+    [ "$status" -eq 0 ]
+    [[ "$(cat clone_chk/file.txt)" == "hello" ]]
+
+    rm -rf "$clone2"
+}
+
+@test "conflict accept-local: only the resolved path advances, an unrelated dirty path is unaffected" {
+    local clone2
+    clone2="$(mktemp -d)"
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" "$clone2"
+    [ "$status" -eq 0 ]
+
+    echo "local change" > file.txt
+    echo "unrelated local change" > src/main.rs
+    (cd "$clone2" && echo "remote change" > file.txt && "$OMEMFS" push)
+
+    run "$OMEMFS" pull
+    [ "$status" -ne 0 ]
+
+    run "$OMEMFS" conflict accept-local file.txt
+    [ "$status" -eq 0 ]
+
+    # src/main.rs was never part of the conflict; it must still push as an
+    # ordinary local modification once file.txt's own conflict is resolved.
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" clone_chk
+    [ "$status" -eq 0 ]
+    [[ "$(cat clone_chk/file.txt)" == "local change" ]]
+    [[ "$(cat clone_chk/src/main.rs)" == "unrelated local change" ]]
+
+    rm -rf "$clone2"
+}
+
+@test "conflict accept-local: if the remote advances again before push, push is correctly rejected as a new divergence" {
+    local clone2
+    clone2="$(mktemp -d)"
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" "$clone2"
+    [ "$status" -eq 0 ]
+
+    echo "local change" > file.txt
+    (cd "$clone2" && echo "remote change" > file.txt && "$OMEMFS" push)
+
+    run "$OMEMFS" pull
+    [ "$status" -ne 0 ]
+
+    run "$OMEMFS" conflict accept-local file.txt
+    [ "$status" -eq 0 ]
+
+    # Someone else pushes again while this conflict is being resolved -- the
+    # remote value the advancement recorded is now stale.
+    (cd "$clone2" && "$OMEMFS" pull && echo "remote change v2" > file.txt && "$OMEMFS" push)
+
+    run "$OMEMFS" push
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"remote has been updated since last sync"* ]]
+
+    rm -rf "$clone2"
+}
+
+# ---------------------------------------------------------------------------
+# Ordering guarantee: helpers/sidecar survive a clone_root-write failure
+# (design/03_sync_model.md, "Advancing clone_root on resolution", "Ordering
+# guarantee").
+#
+# Fault injection: after a genuine pull conflict on a nested path
+# (sub/inner/file.txt, so an intermediate tree must be spliced/rebuilt), make
+# the `.omemfs/` directory itself unwritable (chmod 555, not the
+# `clone_root` file: a chmod 000 on the file would instead fail
+# `read_clone_root`'s *read*, before either the old or the new code has done
+# anything path-specific, which would not distinguish the two).
+# `repo.write_clone_root` (src/repo.rs) writes via a temp-file-then-rename
+# inside `.omemfs/`, so an unwritable `.omemfs/` fails exactly that write
+# while every prior read (including `read_clone_root` and the sidecar reads)
+# still succeeds. `accept-local` must then fail while writing the advanced
+# clone_root, and -- because the fix computes and durably writes clone_root
+# BEFORE removing any helper file or sidecar -- every helper file and the
+# metadata sidecar must still be present afterward, and `conflict list` must
+# still report the path.
+#
+# On the pre-fix old code this reliably fails even for this single path: the
+# old per-path loop deleted that path's three helper files and its
+# `.omemfs-conflict-meta` sidecar (which alone carries the recorded
+# `remote_resolution`) BEFORE `write_clone_root` was ever called -- that call
+# happened once, only after the whole loop, outside it. So the moment
+# `write_clone_root` fails here, the helpers/sidecar for this exact path are
+# already gone with no way to recompute `remote_resolution`, and `conflict
+# list` no longer reports the path even though `clone_root` was never
+# advanced -- exactly the unrecoverable state this fix closes (verified by
+# hand against the pre-fix binary: it prints "accepted local:
+# sub/inner/file.txt", deletes every helper/sidecar, then fails on the
+# clone_root write; afterward `conflict list` prints nothing and `push`
+# fails with "remote has been updated since last sync", with no path listed
+# to explain why). Removing the fault and re-running the same
+# `accept-local` must then succeed and let the following `push` succeed
+# too.
+# ---------------------------------------------------------------------------
+
+@test "conflict accept-local: a clone_root write failure leaves helpers/sidecar intact and is recoverable" {
+    mkdir -p sub/inner
+    echo "one" > sub/inner/file.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    local clone2
+    clone2="$(mktemp -d)"
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" "$clone2"
+    [ "$status" -eq 0 ]
+
+    echo "local change" > sub/inner/file.txt
+    (cd "$clone2" && echo "remote change" > sub/inner/file.txt && "$OMEMFS" push)
+
+    run "$OMEMFS" pull
+    [ "$status" -ne 0 ]
+    [ -f sub/inner/file.txt.omemfs-conflict-local ]
+    [ -f sub/inner/file.txt.omemfs-conflict-remote ]
+    [ -f sub/inner/file.txt.omemfs-conflict-meta ]
+
+    chmod 555 .omemfs
+
+    run "$OMEMFS" conflict accept-local sub/inner/file.txt
+    chmod 755 .omemfs  # restore before any cleanup/rm -rf
+    [ "$status" -ne 0 ]
+
+    # Nothing was removed: the helpers, the sidecar, and the original
+    # (still local-content) file are all exactly as before the failed
+    # attempt.
+    [ -f sub/inner/file.txt.omemfs-conflict-base ]
+    [ -f sub/inner/file.txt.omemfs-conflict-local ]
+    [ -f sub/inner/file.txt.omemfs-conflict-remote ]
+    [ -f sub/inner/file.txt.omemfs-conflict-meta ]
+
+    run "$OMEMFS" conflict list
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"sub/inner/file.txt"* ]]
+
+    # Recovery: with the fault removed, a plain re-run of the same
+    # `accept-local` succeeds (re-splicing the same recorded
+    # remote_resolution is idempotent), and the following push succeeds.
+    run "$OMEMFS" conflict accept-local sub/inner/file.txt
+    [ "$status" -eq 0 ]
+    [[ "$(cat sub/inner/file.txt)" == "local change" ]]
+    [ ! -f sub/inner/file.txt.omemfs-conflict-local ]
+    [ ! -f sub/inner/file.txt.omemfs-conflict-meta ]
+
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" clone_chk
+    [ "$status" -eq 0 ]
+    [[ "$(cat clone_chk/sub/inner/file.txt)" == "local change" ]]
+
+    rm -rf "$clone2"
+}
+
+# ---------------------------------------------------------------------------
+# Lazy tree reads: a clone_root tree object missing from the local cache
+# after a lazy clone is fetched transparently through the same LazyTreeStore
+# `pull`/`ls` already use (design/03_sync_model.md, "Lazy tree reads";
+# "Advancing clone_root on resolution", "Lazy tree reads" paragraph).
+#
+# Fault injection: delete the LOCAL cache copy of sub/inner/'s clone-root
+# tree object (it remains on the remote) before resolving a conflict on
+# sub/inner/file.txt. splice_entry/remove_entry must rebuild the
+# intermediate sub/inner/ tree, which requires reading that tree object --
+# on the pre-fix code (routed through `repo.local_store()` alone, with no
+# remote fallback) this fails with ObjectNotFound; after the fix (routed
+# through LazyTreeStore) the miss is fetched from the remote on demand and
+# accept-local succeeds, healing the local cache as a side effect.
+# ---------------------------------------------------------------------------
+
+@test "conflict accept-local: a clone_root tree object missing locally is fetched transparently from the remote" {
+    mkdir -p sub/inner
+    echo "one" > sub/inner/file.txt
+    echo "untouched" > top.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    # Locate sub/inner's clone-root tree hash.
+    run "$OMEMFS" ls -r --full-hash --clone
+    [ "$status" -eq 0 ]
+    inner_line=$(echo "$output" | grep 'sub/inner/$')
+    [[ -n "$inner_line" ]]
+    inner_hash=$(echo "$inner_line" | grep -oE '[0-9a-f]{64}')
+    [[ -n "$inner_hash" ]]
+
+    local clone2
+    clone2="$(mktemp -d)"
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" "$clone2"
+    [ "$status" -eq 0 ]
+
+    echo "local change" > sub/inner/file.txt
+    (cd "$clone2" && echo "remote change" > sub/inner/file.txt && "$OMEMFS" push)
+
+    run "$OMEMFS" pull
+    [ "$status" -ne 0 ]
+    [ -f sub/inner/file.txt.omemfs-conflict-local ]
+
+    # Delete sub/inner's clone-root tree object from the LOCAL cache only
+    # (adaptive-depth shard layout, src/store/objects_dir.rs -- see the
+    # matching comment in tests/ls.bats's local-diff self-healing fixtures
+    # for why a suffix match is used). It remains on the remote.
+    obj_path=$(find .omemfs/objects -type f -name "*${inner_hash: -40}" | head -1)
+    [ -n "$obj_path" ]
+    [ -f "$obj_path" ]
+    rm -f "$obj_path"
+
+    # accept-local must still succeed: splicing sub/inner/file.txt's new
+    # clone_root entry requires rebuilding the sub/inner/ intermediate tree,
+    # which requires reading the now-locally-missing object above -- routed
+    # through LazyTreeStore, this is healed from the remote rather than
+    # failing.
+    run "$OMEMFS" conflict accept-local sub/inner/file.txt
+    [ "$status" -eq 0 ]
+    [[ "$(cat sub/inner/file.txt)" == "local change" ]]
+    [ ! -f sub/inner/file.txt.omemfs-conflict-local ]
+
+    # Healed as a side effect: the object is cached locally again.
+    [ -f "$obj_path" ]
+
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" clone_chk
+    [ "$status" -eq 0 ]
+    [[ "$(cat clone_chk/sub/inner/file.txt)" == "local change" ]]
+    [[ "$(cat clone_chk/top.txt)" == "untouched" ]]
+
+    rm -rf "$clone2"
 }

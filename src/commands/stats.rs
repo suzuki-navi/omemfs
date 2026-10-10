@@ -180,22 +180,32 @@ fn collect_known_keys(remote: &LocalStore, index_root: &IndexRoot) -> KnownKeys 
 }
 
 /// Classify the remote via a single cheap LIST plus the known storage-key sets.
-/// Returns `None` if the remote has no index root (never pushed).
 ///
 /// The second element of the returned tuple is the list of all object sizes
 /// (including the unencrypted index root when stat-ed separately) to be used
 /// for the remote-object size histogram — no additional remote I/O is needed.
+///
+/// Returns `Ok(None)` only for the legitimate "never pushed" case (no
+/// `INDEX_ROOT` recorded on the remote yet) -- every other failure (remote
+/// unreachable, credentials rejected, `INDEX_ROOT` present but unreadable/
+/// undecryptable/malformed, or the object LIST itself failing) is an `Err`,
+/// so the caller can tell "nothing to show" apart from "the check failed"
+/// and warn accordingly (design/04_cli_spec.md, "omemfs stats" -> "--remote
+/// failure reporting").
 fn classify_remote(
     remote: &LocalStore,
     root_pointer: Box<dyn crate::codec::pack::root_pointer::RootPointer>,
     packcache: LocalStore,
-) -> Option<(RemoteStorage, Vec<u64>)> {
+) -> Result<Option<(RemoteStorage, Vec<u64>)>, Error> {
     // Read the raw index-root bytes once through the backend-pluggable root
     // pointer. Its length is the index-root object size used below (backend-
     // neutral: no filesystem path assumption). `None` => the remote has never
-    // been pushed.
-    let ir_raw = root_pointer.read().ok()?.0;
-    let index_root_size = ir_raw.as_ref().map(|b| b.len() as u64);
+    // been pushed -- the only case that returns `Ok(None)` rather than
+    // propagating an error.
+    let Some(ir_raw) = root_pointer.read()?.0 else {
+        return Ok(None);
+    };
+    let index_root_size = Some(ir_raw.len() as u64);
 
     // Read the index root via the pack reader (cheap: one small object).
     let pack_reader = PackReader::new(
@@ -208,15 +218,27 @@ fn classify_remote(
         root_pointer,
         remote.encrypt_key.clone(),
     );
-    let index_root = pack_reader.read_index_root().ok().flatten()?;
+    // The root pointer just proved an INDEX_ROOT exists, so a failure to
+    // decode it now (decrypt/deserialise) is a genuine error, not "never
+    // pushed" -- propagate it rather than treating it the same as absence.
+    let Some(index_root) = pack_reader.read_index_root()? else {
+        return Err(Error::Other(
+            "INDEX_ROOT was read but the pack reader reports it absent \
+             (unexpected: the root pointer just found it)"
+                .to_string(),
+        ));
+    };
 
     let known = collect_known_keys(remote, &index_root);
 
     let mut rs = RemoteStorage::default();
     let mut all_sizes: Vec<u64> = Vec::new();
 
-    // Single cheap enumeration of objects/ (sizes only — no GET).
-    let listing = remote.list_with_sizes().unwrap_or_default();
+    // Single cheap enumeration of objects/ (sizes only — no GET). Propagated
+    // rather than swallowed: a LIST failure here would otherwise silently
+    // report every class (including orphans) as empty, which reads as "zero
+    // objects on the remote" -- actively misleading rather than merely absent.
+    let listing = remote.list_with_sizes()?;
     for (key, size) in listing {
         all_sizes.push(size);
         if known.pack.contains(&key) {
@@ -246,7 +268,7 @@ fn classify_remote(
         rs.index_root.add(ir_size);
     }
 
-    Some((rs, all_sizes))
+    Ok(Some((rs, all_sizes)))
 }
 
 // ---------------------------------------------------------------------------
@@ -636,20 +658,38 @@ pub fn run(opts: StatsOptions) -> Result<(), Error> {
         // single paginated LIST plus small index/bloom GETs, mirroring the
         // local directory walk.
         //
-        // Failures here (no remote configured, unreachable backend, missing
-        // credentials) are swallowed to None so the default invocation stays
-        // offline-safe and the local-only sections still print.
+        // `--remote` was explicitly requested, so a genuine failure here (no
+        // remote configured, unreachable backend, rejected credentials, or a
+        // corrupt/undecryptable INDEX_ROOT) is warned about on stderr instead
+        // of being silently folded into the same empty output as "this
+        // remote has genuinely never been pushed to" -- see
+        // design/04_cli_spec.md, "omemfs stats" -> "--remote failure
+        // reporting". Either way the local-only sections still print: only
+        // sections 1 and 2 are affected.
         match (
             repo.remote_store("origin"),
             repo.remote_root_pointer("origin"),
         ) {
             (Ok(remote), Ok(root_pointer)) => {
                 match classify_remote(&remote, root_pointer, repo.packcache_store()) {
-                    Some((rs, sizes)) => (Some(rs), sizes),
-                    None => (None, Vec::new()),
+                    Ok(Some((rs, sizes))) => (Some(rs), sizes),
+                    Ok(None) => (None, Vec::new()),
+                    Err(e) => {
+                        eprintln!(
+                            "warning: --remote check failed: {}; showing local-only stats",
+                            e
+                        );
+                        (None, Vec::new())
+                    }
                 }
             }
-            _ => (None, Vec::new()),
+            (Err(e), _) | (_, Err(e)) => {
+                eprintln!(
+                    "warning: --remote check failed: {}; showing local-only stats",
+                    e
+                );
+                (None, Vec::new())
+            }
         }
     } else {
         (None, Vec::new())
@@ -2106,5 +2146,55 @@ mod tests {
         );
         assert_eq!(format_pack_cell(0, &[]), "—");
         assert_eq!(format_pack_cell(2, &[1_048_576, 1_048_576]), "2×2.0MiB");
+    }
+
+    // -------------------------------------------------------------------------
+    // classify_remote — distinguishing "never pushed" from a genuine failure
+    // (design/04_cli_spec.md, "omemfs stats" -> "--remote failure reporting").
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn classify_remote_returns_ok_none_when_never_pushed() {
+        use crate::codec::pack::root_pointer::LocalRootPointer;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().to_path_buf();
+        std::fs::create_dir_all(base.join("objects")).unwrap();
+        // No INDEX_ROOT file written at all: a legitimately never-pushed remote.
+
+        let remote = LocalStore::for_remote(&base);
+        let root_pointer = Box::new(LocalRootPointer::new(base.clone(), None));
+        let packcache = LocalStore::for_cache(tmp.path().join("packcache"));
+
+        let result = classify_remote(&remote, root_pointer, packcache);
+        assert!(
+            matches!(result, Ok(None)),
+            "a remote with no INDEX_ROOT must be Ok(None) (never pushed), not an error: {result:?}"
+        );
+    }
+
+    #[test]
+    fn classify_remote_returns_err_on_corrupt_index_root() {
+        use crate::codec::pack::root_pointer::LocalRootPointer;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().to_path_buf();
+        std::fs::create_dir_all(base.join("objects")).unwrap();
+        // An INDEX_ROOT file exists but its bytes are not a valid IndexRoot --
+        // this must surface as a genuine error, never be swallowed into the
+        // same "never pushed" Ok(None) an absent file produces.
+        std::fs::write(base.join(crate::codec::pack::INDEX_ROOT_FILE), b"not an index root").unwrap();
+
+        let remote = LocalStore::for_remote(&base);
+        let root_pointer = Box::new(LocalRootPointer::new(base.clone(), None));
+        let packcache = LocalStore::for_cache(tmp.path().join("packcache"));
+
+        let result = classify_remote(&remote, root_pointer, packcache);
+        assert!(
+            result.is_err(),
+            "a present but corrupt INDEX_ROOT must be reported as an error, not Ok(None): {result:?}"
+        );
     }
 }

@@ -210,10 +210,13 @@ enum Command {
 #[derive(Subcommand)]
 enum ConflictCommand {
     /// List all paths with unresolved conflict helper files
-    List,
+    List {
+        /// Paths to scope the operation (default: cwd)
+        paths: Vec<PathBuf>,
+    },
     /// Delete conflict helper files without modifying the originals
     Clean {
-        /// Paths to scope the operation (default: entire working tree)
+        /// Paths to scope the operation (default: cwd)
         paths: Vec<PathBuf>,
         /// Show what would be deleted without making changes
         #[arg(long)]
@@ -221,7 +224,7 @@ enum ConflictCommand {
     },
     /// Adopt the remote version and remove helper files
     AcceptRemote {
-        /// Paths to resolve (default: entire working tree)
+        /// Paths to resolve (default: cwd)
         paths: Vec<PathBuf>,
         /// Show what would happen without making changes
         #[arg(long)]
@@ -229,7 +232,7 @@ enum ConflictCommand {
     },
     /// Adopt the local version and remove helper files
     AcceptLocal {
-        /// Paths to resolve (default: entire working tree)
+        /// Paths to resolve (default: cwd)
         paths: Vec<PathBuf>,
         /// Show what would happen without making changes
         #[arg(long)]
@@ -237,7 +240,7 @@ enum ConflictCommand {
     },
     /// Adopt the base (clone root) version and remove helper files
     AcceptBase {
-        /// Paths to resolve (default: entire working tree)
+        /// Paths to resolve (default: cwd)
         paths: Vec<PathBuf>,
         /// Show what would happen without making changes
         #[arg(long)]
@@ -523,8 +526,12 @@ fn main() {
         }),
 
         Command::Conflict { subcommand } => match subcommand {
-            ConflictCommand::List => {
-                conflict_cmd::run_list(conflict_cmd::ConflictListOptions { work_dir })
+            ConflictCommand::List { paths } => {
+                conflict_cmd::run_list(conflict_cmd::ConflictListOptions {
+                    work_dir,
+                    current_dir: cwd.clone(),
+                    paths,
+                })
             }
             ConflictCommand::Clean { paths, dry_run } => {
                 conflict_cmd::run_clean(conflict_cmd::ConflictCleanOptions {

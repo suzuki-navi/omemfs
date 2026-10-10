@@ -501,8 +501,11 @@ pub fn run(mut opts: LsOptions) -> Result<(), Error> {
         // Populated for tree targets; None for blobs or the root (handled separately).
         let mut self_dir_meta: Option<(u64, u64, Option<DateTime<Utc>>)> = None;
         // found_in_clone: true when the path was resolved from clone root (not working tree).
+        // `hash` is `None` only when the resolved entry is a symlink (which has
+        // no hash by design, see design/01_object_model.md); every other entry
+        // kind always carries one.
         let (hash, is_blob, found_in_clone) = if parts.is_empty() {
-            (root_hash.clone(), false, true)
+            (Some(root_hash.clone()), false, true)
         } else {
             // Resolve the target entry. The clone root always wins; otherwise
             // the precedence between a remote-only added entry and the working
@@ -535,7 +538,7 @@ pub fn run(mut opts: LsOptions) -> Result<(), Error> {
             };
             let entry =
                 entry.ok_or_else(|| Error::Other(format!("path not found: {}", rel_str)))?;
-            let (h, is_blob, meta) = resolve_entry_meta(&entry, &rel_str)?;
+            let (h, is_blob, meta) = resolve_entry_meta(&entry);
             self_dir_meta = meta;
             (h, is_blob, in_clone)
         };
@@ -548,17 +551,25 @@ pub fn run(mut opts: LsOptions) -> Result<(), Error> {
                 .get(rel_str.as_ref())
                 .copied()
                 .unwrap_or(' ');
+            let hash_str = match &hash {
+                Some(h) => format_hash(h, opts.full_hash),
+                // Symlink: no hash (design/04 "<hash>: ... `-` for symlinks").
+                None => "-".repeat(if opts.full_hash { 64 } else { 8 }),
+            };
             rows.push(Row {
                 status,
                 remote_status: rs,
                 z: ' ',
-                hash_str: format_hash(&hash, opts.full_hash),
+                hash_str,
                 size: None,
                 blob_count: 1,
                 mtime: None,
                 path: rel_str.to_string(),
             });
         } else {
+            // This branch is only reached for a Tree entry (or the root), never
+            // a symlink (is_blob is true for those), so `hash` is always `Some`.
+            let hash = hash.expect("non-blob ls target always has a hash");
             // Emit a self-row for the target directory itself before its children.
             if parts.is_empty() {
                 // Root self-row: aggregate stats by reading root tree entries once.
@@ -1261,10 +1272,25 @@ fn scan_scoped_for_ls(
             continue;
         }
 
-        // A path that does not exist on disk and is not a stub: leave the base
-        // unchanged. The path is then resolved from the clone root by the caller
-        // (or reported as not found if absent there too).
+        // A path that does not exist on disk and is not a stub: if it is present
+        // in the clone root, treat it as a deletion by removing it from the base
+        // -- mirroring push's scoped-delete handling (`push.rs`'s `is_delete`
+        // branch / `remove_entry` calls) so `ls` accurately previews what a
+        // `push` of this path would do. If it is not present in the clone root
+        // either, there is nothing to diff; leave the base unchanged (matches
+        // the previous behaviour for a genuinely nonexistent path).
+        //
+        // TODO: a path nested under a marker-based (fully-stubbed, i.e. a
+        // `.omemfs-stub` file with no expanded children) ancestor directory can
+        // still be misclassified as a deletion by this same `!abs.exists()`
+        // check, since such a path never exists on disk either. This mirrors a
+        // pre-existing, unverified edge case in `push_scoped`'s analogous check
+        // and is out of scope here.
         if !abs.exists() {
+            if let Some(new_hash) = crate::tree_ops::remove_entry(&root_hash, &components, store)?
+            {
+                root_hash = new_hash;
+            }
             continue;
         }
 
@@ -1410,22 +1436,18 @@ fn navigate_working(
 
 /// Extract the hash, blob-ness, and directory self-row metadata from a resolved
 /// entry. `self_dir_meta` is `Some` for trees (size, blob_count, mtime) and
-/// `None` for blobs/symlinks. Errors when a tree entry carries no hash.
+/// `None` for blobs/symlinks. A symlink entry has no hash (design/01_object_model.md),
+/// so the returned hash is `None` for it; every other entry kind always has one.
 fn resolve_entry_meta(
     entry: &TreeEntry,
-    rel_str: &str,
-) -> Result<(Hash, bool, Option<(u64, u64, Option<DateTime<Utc>>)>), Error> {
+) -> (Option<Hash>, bool, Option<(u64, u64, Option<DateTime<Utc>>)>) {
     let is_blob = matches!(entry, TreeEntry::Blob { .. } | TreeEntry::Symlink { .. });
     let meta = if is_blob {
         None
     } else {
         Some((entry.size(), entry.blob_count(), entry.mtime().copied()))
     };
-    let hash = entry
-        .hash()
-        .cloned()
-        .ok_or_else(|| Error::Other(format!("path not found: {}", rel_str)))?;
-    Ok((hash, is_blob, meta))
+    (entry.hash().cloned(), is_blob, meta)
 }
 
 // ---------------------------------------------------------------------------
@@ -2635,6 +2657,50 @@ mod tests {
              nobody changed"
         );
         assert_eq!(sf.hash, hash);
+    }
+
+    /// Regression test for the "scoped ls of a deleted path" bug: when
+    /// `<path>` does not exist on disk and is not a stub, but IS present in
+    /// the clone root, `scan_scoped_for_ls` must splice it out of the base
+    /// via `tree_ops::remove_entry`, not leave the base unchanged -- leaving
+    /// it unchanged made the subsequent diff see no difference at all and
+    /// misreport a genuine deletion as unchanged.
+    #[test]
+    fn scan_scoped_for_ls_deleted_dir_removes_entry_from_clone_root() {
+        let dir = TempDir::new().unwrap();
+        let work = dir.path();
+        let store = LocalStore::for_cache(dir.path().join("objects"));
+
+        // Build a clone-root tree: root -> "dir" -> "file.txt".
+        let dir_hash = store_tree(vec![blob_entry("file.txt", b"content")], &store);
+        let clone_root_hash = store_tree(vec![tree_entry("dir", dir_hash)], &store);
+
+        // "dir" is never created on disk, so `dir/file.txt` is absent from
+        // the working tree -- a genuine deletion, not a stub.
+        let stat_cache = StatCache::default();
+        let result = scan_scoped_for_ls(
+            work,
+            &[work.join("dir")],
+            Some(&clone_root_hash),
+            None,
+            &store,
+            &stat_cache,
+        )
+        .unwrap();
+
+        let navigated =
+            crate::tree_ops::navigate_entry(&result.root_hash, &["dir", "file.txt"], &store)
+                .unwrap();
+        assert!(
+            navigated.is_none(),
+            "a deleted, non-stub scoped path must be spliced out of the base \
+             via remove_entry, not left in place as if nothing had changed"
+        );
+        assert_ne!(
+            result.root_hash, clone_root_hash,
+            "the returned root hash must differ from the clone root once \
+             the deleted subtree has been removed"
+        );
     }
 
     /// This is the crux of the fix: a `base` (clone-root) subtree whose own
