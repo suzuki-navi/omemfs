@@ -226,7 +226,7 @@ impl Repo {
         Ok(Repo { work_dir })
     }
 
-    fn omemfs_dir(&self) -> PathBuf {
+    pub(crate) fn omemfs_dir(&self) -> PathBuf {
         self.work_dir.join(OMEMFS_DIR)
     }
 

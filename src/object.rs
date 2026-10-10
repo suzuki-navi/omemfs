@@ -313,6 +313,58 @@ pub fn is_reserved_name(name: &str) -> bool {
     name.contains(".omemfs-")
 }
 
+// ---------------------------------------------------------------------------
+// Conflict-artifact filename suffixes
+// ---------------------------------------------------------------------------
+
+/// Suffixes of the three `omemfs conflict` resolution-aid helper files
+/// (`<path>.omemfs-conflict-{base,local,remote}`).
+///
+/// Defined here (not in `commands::conflict`) for the same reason
+/// [`is_reserved_name`] is defined here rather than in `scan.rs`: `scan.rs`
+/// (a low-level module) needs this list to exclude conflict-helper files from
+/// a working-tree scan, and a dependency from `scan.rs` onto a specific
+/// command module (`commands::conflict`) would be backwards -- `scan.rs`
+/// should not need to know which *command* consumes these files, only that
+/// they are not user content. `commands::conflict` re-exports this under its
+/// existing name (`pub(crate) use`) so none of its own call sites need to
+/// change.
+pub(crate) const CONFLICT_SUFFIX_BASE: &str = ".omemfs-conflict-base";
+pub(crate) const CONFLICT_SUFFIX_LOCAL: &str = ".omemfs-conflict-local";
+pub(crate) const CONFLICT_SUFFIX_REMOTE: &str = ".omemfs-conflict-remote";
+pub(crate) const CONFLICT_SUFFIXES: &[&str] = &[
+    CONFLICT_SUFFIX_BASE,
+    CONFLICT_SUFFIX_LOCAL,
+    CONFLICT_SUFFIX_REMOTE,
+];
+
+/// Suffix of the `omemfs conflict` metadata sidecar
+/// (`<path>.omemfs-conflict-meta`). See `commands::conflict::CONFLICT_META_
+/// SUFFIX`'s own doc comment (re-exported from here) for what it records.
+pub(crate) const CONFLICT_META_SUFFIX: &str = ".omemfs-conflict-meta";
+
+/// L6: every filename suffix that identifies a piece of omemfs-internal
+/// conflict bookkeeping alongside a base path -- the three resolution-aid
+/// helpers ([`CONFLICT_SUFFIXES`]) plus the [`CONFLICT_META_SUFFIX`] metadata
+/// sidecar. None of these are user content: they exist only to support
+/// `omemfs conflict`. Anything that needs to recognise/remove "any conflict
+/// residue for this path" should use this list -- or [`is_conflict_artifact`]
+/// -- rather than keeping its own separate copy that can silently drift out
+/// of sync with this one.
+pub(crate) const CONFLICT_ARTIFACT_SUFFIXES: &[&str] = &[
+    CONFLICT_SUFFIX_BASE,
+    CONFLICT_SUFFIX_LOCAL,
+    CONFLICT_SUFFIX_REMOTE,
+    CONFLICT_META_SUFFIX,
+];
+
+/// Returns `true` if `name` ends with any suffix in
+/// [`CONFLICT_ARTIFACT_SUFFIXES`] -- i.e. `name` is omemfs-internal conflict
+/// bookkeeping (a helper or the metadata sidecar), never user content.
+pub(crate) fn is_conflict_artifact(name: &str) -> bool {
+    CONFLICT_ARTIFACT_SUFFIXES.iter().any(|s| name.ends_with(s))
+}
+
 /// Validate a single tree-entry name before it is ever joined onto a
 /// filesystem path (e.g. `base_dir.join(entry.name())` in `pull`/`tree_ops`).
 ///
@@ -440,6 +492,32 @@ impl Tree {
         out
     }
 
+    /// Lightweight "is this a tree object?" check: tests only for the `ED F1`
+    /// type-tag prefix, with no JSON parsing at all (design/01_object_model.md,
+    /// "Tree/blob discrimination"; D13).
+    ///
+    /// This exists for the handful of call sites that need to decide "tree or
+    /// blob?" for an object of otherwise-unknown type -- `cat`, `stats`,
+    /// `pull`'s git-dir check, and `transfer`'s child-discovery walk -- before
+    /// D13 those call sites answered that question by checking whether
+    /// `Tree::deserialise` happened to succeed, which conflates two different
+    /// things: "does this have the tree tag" and "does the JSON after the tag
+    /// parse." An ordinary blob whose *content* happens to be well-formed tree
+    /// JSON (e.g. a file literally containing `{"kind":"normal","entries":[]}`)
+    /// has no `ED F1` tag but still parses successfully via `Tree::deserialise`
+    /// (which deliberately accepts data with or without the tag, for callers
+    /// that already know they are reading a tree) -- `Tree::deserialise`
+    /// alone cannot tell that object apart from a real tree. `is_tree_bytes`
+    /// can, because a blob's stored bytes can never legitimately begin with an
+    /// untagged `ED F1` (`serialise_blob` escapes any blob content that would
+    /// otherwise start with an `ED Fx` byte pair, see `blob_needs_escape`
+    /// above), so the tag alone is a sound discriminator. Callers still route
+    /// a tag-confirmed tree through `Tree::deserialise` afterwards to actually
+    /// parse it (and to reject a tagged-but-corrupt tree, exactly as before).
+    pub fn is_tree_bytes(data: &[u8]) -> bool {
+        data.starts_with(&TYPE_TAG_TREE)
+    }
+
     /// Deserialise from stored bytes (with or without ED F1 prefix).
     ///
     /// Validates every entry name (see [`validate_entry_name`]) before
@@ -537,6 +615,60 @@ mod tests {
         let bytes = t.serialise();
         let t2 = Tree::deserialise(&bytes).unwrap();
         assert!(matches!(t2, Tree::Normal { .. }));
+    }
+
+    // -----------------------------------------------------------------------
+    // `Tree::is_tree_bytes` (D13, design/01_object_model.md "Tree/blob
+    // discrimination"): a lightweight ED F1-tag-only check, with no JSON
+    // parsing, used by the four "is this a tree?" discriminator call sites
+    // (cat.rs, stats.rs, pull.rs, transfer.rs) instead of inferring the
+    // answer from whether `Tree::deserialise` happens to succeed.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_tree_bytes_true_for_properly_tagged_tree() {
+        let t = Tree::Normal { entries: vec![] };
+        let bytes = t.serialise();
+        assert!(Tree::is_tree_bytes(&bytes));
+    }
+
+    #[test]
+    fn is_tree_bytes_false_for_untagged_json_that_parses_as_a_tree() {
+        // The exact false-positive `Tree::deserialise` alone cannot rule
+        // out: this is ordinary blob content (no ED F1 tag) whose bytes
+        // happen to be valid tree JSON. `Tree::deserialise` on this data
+        // succeeds (it accepts data with or without the tag), but
+        // `is_tree_bytes` must say "not a tree" -- it is the presence of
+        // the tag, not whether the JSON parses, that answers the
+        // discrimination question (D13's fix for the "referenced local
+        // object is missing" permanent push failure).
+        let data = br#"{"kind":"normal","entries":[]}"#;
+        assert!(
+            Tree::deserialise(data).is_ok(),
+            "sanity check: this data must still parse as a tree via deserialise"
+        );
+        assert!(!Tree::is_tree_bytes(data));
+    }
+
+    #[test]
+    fn is_tree_bytes_false_for_untagged_non_json_content() {
+        assert!(!Tree::is_tree_bytes(b"hello, world"));
+    }
+
+    #[test]
+    fn is_tree_bytes_false_for_empty_data() {
+        assert!(!Tree::is_tree_bytes(b""));
+    }
+
+    #[test]
+    fn is_tree_bytes_false_for_a_single_byte_matching_only_the_first_tag_byte() {
+        assert!(!Tree::is_tree_bytes(&[0xED]));
+    }
+
+    #[test]
+    fn is_tree_bytes_false_for_a_different_ed_fx_tag() {
+        // ED F0 is the blob escape tag (TYPE_TAG_BLOB), not the tree tag.
+        assert!(!Tree::is_tree_bytes(&TYPE_TAG_BLOB));
     }
 
     #[test]

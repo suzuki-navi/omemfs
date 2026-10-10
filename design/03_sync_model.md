@@ -442,20 +442,44 @@ The same lazy tree store backs:
   and the remote root,
 - `mark_deleted_tree` over a clone-root subtree deleted on the remote,
 - the conflict-helper "base" side, which resolves a single clone-root blob hash,
+- **both `push`'s and `pull`'s own working-tree scan** (`scan_and_store_with_cache`
+  and, for a scoped pull's leaf path, `scan_file_as_tree`): a partial-expansion
+  directory (`08_stub_system.md`, "Partial expansion") merges its `.omemfs-stub`
+  record's recorded tree object with the real files found on disk, and that
+  recorded tree object is a clone-root-rooted object subject to the exact same
+  lazy-clone gap as any other clone-root read — it may never have been
+  downloaded if the directory was stubbed as a whole. Routing the scan itself
+  through the lazy tree store (not just the diff that runs after it) is what
+  lets `push`/`pull` succeed the first time a user adds a file directly inside
+  a stubbed directory, without requiring an intervening `expand`. `push_full`
+  constructs a `PackReader`/lazy tree store for this purpose before scanning
+  (previously it had no reader at all, only acquiring one later to upload);
+  `push_scoped` moves its existing construction earlier, from just before the
+  remote-divergence check to before the per-path scan loop. Constructing a
+  `PackReader` for this scan and constructing the `PackWriter` used later for
+  the actual upload/CAS are independent: the reader never reads the writer's
+  CAS snapshot and vice versa (see "Push → Steps" below), so building the
+  reader earlier introduces no ordering dependency on the writer,
 - `ls`'s local (clone-root vs working-tree) diff (see `04_cli_spec.md`, "Local
   diff self-healing") — the one other command that reads clone-root tree
-  objects the same way pull does,
+  objects the same way pull does. (`ls`'s own working-tree *scan* does not yet
+  route the equivalent partial-expansion read through this store, unlike
+  push/pull now do — see `04_cli_spec.md`, "Local diff self-healing", for why
+  this is left as an open item rather than folded into this fix: `ls`'s design
+  intent is to never block on the remote, and a scan's side effects are harder
+  to cleanly abandon mid-way than a pure diff read's.)
 - `restore`'s plan-phase walk of `clone_root` against the working tree (see
   `04_cli_spec.md`, "omemfs restore"), when that walk hits a clone-root tree
   object the local cache does not hold.
 
 This is a shared abstraction (`tree_ops::LazyTreeStore`, `pub(crate)`), not
 pull-exclusive: pull's own uses above are unbounded (pull's entire purpose is
-to talk to the remote, so it always waits out a fetch), while `ls` wraps its
-use in an overall timeout and falls back to a local-only, per-subtree-tolerant
-diff on timeout or an unrecoverable remote error, since `ls` is meant to stay
-responsive rather than block on, or abort because of, a slow or unreachable
-remote.
+to talk to the remote, so it always waits out a fetch), and push's scan use is
+unbounded for the same reason (push already unconditionally needs a working
+remote connection to complete at all), while `ls` wraps its use in an overall
+timeout and falls back to a local-only, per-subtree-tolerant diff on timeout or
+an unrecoverable remote error, since `ls` is meant to stay responsive rather
+than block on, or abort because of, a slow or unreachable remote.
 
 The bounded memory guarantee is preserved: the lazy store never holds a whole
 skeleton in memory — each fetched object is cached to the local store as
@@ -509,6 +533,10 @@ A conflict occurs when the same path is modified both locally (working tree vs. 
 
 An executable-bit-only (chmod) change counts as a modification on either side. For example, a local `chmod +x` overlapping with a remote content change to the same path is a conflict. The one exception: when both sides hold the **same content hash**, the overlap is resolved without conflict by applying the remote metadata (mtime/mode).
 
+A remote `AddedTree` (an auto-stubbed new directory, reported at the directory's own path — see "Diff algorithm" below) is also a conflict when the working tree has a local change at any path beneath it, even though the two sides' diff maps have no key in common: if the remote adds a large directory `d/` as a single `AddedTree("d")` while the working tree already has an untracked file `d/untracked.txt` (a local `Added("d/untracked.txt")`), pull detects this as conflicting on `d` rather than silently letting the `AddedTree` through. There is no meaningful per-content comparison to fall back on across a directory/file granularity mismatch.
+
+The one exception is a local change beneath a `.git` entry (`d/.git/...`): a pre-existing local Git worktree at the `AddedTree`'s path is the case design/08 ("Stubs and Git repositories") already handles by materialising into it instead of stubbing, so it is not treated as a conflict. A local change beside the `.git` entry (`d/notes.txt`) is still a conflict.
+
 ### Conflict helper files
 
 For each conflicting path `<path>`, pull writes three helper files alongside the original:
@@ -531,6 +559,8 @@ src/main.rs.omemfs-conflict-remote
 The original file (`src/main.rs`) is **not modified** — the local working tree content is preserved as-is.
 
 When a conflict is detected, pull is **fully aborted**: no changes are applied to the working tree, and `clone_root` is **not** updated. Even non-conflicting remote changes are held back until all conflicts are resolved. This atomic-abort policy applies to all pull variants (full, single-path, multi-path).
+
+`<path>` above is always the repo-root-relative path (`src/main.rs`), not a path relative to some scoped subtree. This matters for a multi-path scoped pull: each specified path's own diff maps are keyed relative to that path's own scoped subtree root, so pulling `a` and `b` together, a conflict on `f` under each is the key `f` in both `a`'s and `b`'s diff — but the conflict set pull tracks across all specified paths, and the helper files it writes, are keyed on the repo-relative path (`a/f` and `b/f` as two distinct conflicts), never on the bare scoped-relative key. See `04_cli_spec.md`, "Behaviour (path-scoped pull)", for the full detail.
 
 ### Advancing clone_root on resolution
 
@@ -558,6 +588,27 @@ Resolve conflicts and push:
 ### Missing sides
 
 If a conflicting path was added by one side (absent at `clone_root`) or deleted by one side, the corresponding helper file for the absent side is not written. Only the sides that have content produce a helper file.
+
+**Clearing stale residue before writing.** Before writing any of the (up to three) helper files and the metadata sidecar for a path, `pull` first removes every existing `.omemfs-conflict-*` artifact (all three helpers plus the sidecar, i.e. `conflict::CONFLICT_ARTIFACT_SUFFIXES`) for that exact path, then writes only the sides that currently have content. This matters because a conflict on the same path can recur: the user leaves an earlier conflict unresolved, the remote advances again in the meantime (e.g. the remote side that used to be a blob is now deleted, or vice versa), and the next `pull` re-detects the same path as conflicting with a different shape on one or more sides. Without clearing first, a side that is a "missing side" (no helper written) in the *new* conflict would silently keep the helper file left over from the *previous* one — stale content with no connection to the diff `pull` just computed. `conflict accept-remote`/`accept-local`/`accept-base` decide what to apply purely from "does the helper file for this side exist" (see "Advancing clone_root on resolution" above), so a stale helper is indistinguishable from a genuine one and gets applied as if it were current, silently reintroducing content the remote (or local, or base) side no longer holds. Clearing first closes this gap: a "missing side" in the new conflict is guaranteed to have no helper file, exactly as if this were the first time the path conflicted.
+
+### Remote side is a symlink
+
+A conflicting path's remote side is not always a blob or an absence: the remote can also have turned the path into a symlink (`DiffEntry::Symlink` in the diff `pull` computed against `clone_root`) while the local working tree independently modified the same path's content. This is a real, reachable conflict shape, not merely theoretical — a local edit to a plain file racing a remote `ln -s` (or `mv`-onto-symlink) at the same path reaches it directly.
+
+`pull` writes no `<path>.omemfs-conflict-remote` helper file for this case (design/08_stub_system.md: a symlink's "content" is just its target string, not a blob suited to a diff-able helper file), matching the "Missing sides" rule above for a remote side with nothing blob-shaped to show. The metadata sidecar's `remote_resolution`, however, does record this shape explicitly (`RemoteResolution::Symlink { target, mtime }`, alongside the existing `Blob`/`Deleted`/`Unrecorded` variants) rather than falling back to `Unrecorded`, so `accept-remote` (and, for consistency, `accept-local`/`accept-base`) can still resolve the path correctly:
+
+- `accept-remote` creates the symlink itself (`fsguard::write_symlink`, replacing whatever is at the path — file, dangling symlink, or a leftover empty directory — exactly as `pull`'s own `DiffEntry::Symlink` application does), restores its own `mtime` via `lutimes` (symlinks have no executable-bit `mode` to restore), and advances `clone_root`'s entry for the path to a `TreeEntry::Symlink` built from the recorded `target`/`mtime` — the same "splice the remote's exact recorded value" treatment `Blob` and `Deleted` already get (see "Advancing clone_root on resolution" above).
+- `accept-local`/`accept-base` advance `clone_root` the same way (a `TreeEntry::Symlink` splice), since that advancement only needs to agree with what the remote actually holds, independent of which side's *content* ends up in the working tree.
+
+Before this was recorded, `accept-remote` on this conflict shape deleted the file (the generic "no helper file for this side" branch) without ever creating the symlink, and left `clone_root` unadvanced (the `Unrecorded` fallback) — so the resolved working tree matched neither the remote (missing symlink) nor `clone_root` (still pointing at the pre-conflict state), and every subsequent `push`/`pull` kept failing: `push` saw a local delete that did not match the remote's symlink and was rejected by the CAS precheck (`clone_root` still disagreeing with the actual remote state), while `pull` re-diffed the same unresolved symlink change every time.
+
+### Pruning directories emptied by conflict resolution
+
+`omemfs conflict accept-remote`/`accept-local`/`accept-base` resolve one conflicting *file* path at a time. When the accepted side has no content for that path (e.g. `accept-remote` on a local-edit-vs-remote-delete conflict), the working-tree file is deleted (see "Missing sides" above). If that deletion leaves the file's parent directory (and, transitively, any now-empty ancestor directory up to but not including the repository root) with no remaining entries, `accept-*` removes those now-empty directories from the working tree as part of resolving the path.
+
+This is deliberately different from `tree_ops::remove_entry`'s own policy (`design/01_object_model.md`, "Empty directories"): `remove_entry` keeps an intermediate tree that becomes empty as a genuine empty-tree object, because a directory a user created and pushed on purpose (with no files in it) must survive being spliced through unrelated deletions elsewhere in the tree — `remove_entry` has no way to tell that case apart from "this delete happened to empty out this directory". `accept-*`'s per-path resolution is a narrower context: it is unwinding the working-tree side of exactly one path that the remote has deleted (whole subtree or otherwise), so a directory left empty by that specific deletion is never one the user is deliberately keeping — it is scaffolding for the file that is being removed. Pruning it here keeps the working tree consistent with a directory that no longer exists at `clone_root`/`remote_root`, and prevents a later `push` from re-adding an empty directory that neither side actually has (see "Advancing clone_root on resolution" above: `clone_root`'s own entry for the path is already advanced/removed by the same `accept-*` call, so an unpruned empty directory on disk is the only remaining place the deletion could otherwise resurface from).
+
+A directory that already existed as an intentionally-empty directory in the working tree *before* this resolution (i.e. it was empty for a reason unrelated to the path being resolved) is not a case `accept-*` can produce: the directory this pruning walk considers is always an ancestor of the one file path just deleted, and the walk stops pruning as soon as it reaches a directory that still has a remaining entry (its own `.omemfs-conflict-*` helper files for the same path are removed first, in the same `accept-*` call, before this walk runs — see "Advancing clone_root on resolution", "Ordering guarantee" — so they never keep a would-be-empty directory alive).
 
 ### Resolving a conflict
 
@@ -609,6 +660,72 @@ diff(base_hash, target_hash):
             if both are trees and hash differs: recurse into diff(base[path].hash, target[path].hash)
             if type changed:   emit deleted(path) + added(path)
 ```
+
+`emit deleted(path)` for a type change is not a single entry when the old
+side at `path` was a tree: it expands to a `deleted` for every blob/symlink
+reachable under that old tree (recursively, the same expansion `diff` already
+performs for a path removed outright — "if path only in base: emit
+deleted(path)" above, when `base[path]` is itself a tree). This matters
+because a type change can go either direction:
+
+- Old side is a tree, new side is a blob or symlink: every entry that used to
+  live under the old tree must be reported `deleted` (not silently dropped),
+  in addition to the single `added(path)` for the new blob/symlink. Otherwise
+  the receiving side is left with an on-disk directory it can no longer make
+  sense of, and applying the `added` blob on top of that directory fails.
+- Old side is a blob or symlink, new side is a tree: the old blob/symlink
+  itself must be reported `deleted(path)`, in addition to `added` for every
+  entry of the new tree (recursively). Otherwise the receiving side keeps the
+  stale file in place instead of removing it before the new directory is
+  materialised.
+- This holds identically when the new tree is large enough to be auto-stubbed
+  (design/08_stub_system.md, "Threshold rules") instead of recursed into: the
+  new side is then reported as a single `AddedTree(path)` rather than being
+  recursed into. `diff` is keyed one entry per `path`, so this `AddedTree`
+  necessarily lands at the very same key the old blob/symlink's
+  `deleted(path)` was just reported at, and a second write to that key
+  overwrites the first -- there is no way for both to survive as separate
+  map entries. The `deleted(path)` emission is therefore for this one case
+  informational only (it never reaches `apply_diff`); `apply_diff`'s
+  `AddedTree` handling must be unconditionally self-contained about removing
+  whatever currently occupies `path` (file, symlink, or stub) before
+  creating the directory and writing the directory stub, the same way its
+  `Symlink` handling already removes any stale stub/entry before
+  materialising the link, rather than relying on a separate `Deleted` entry
+  at the same path to have cleared it first.
+
+#### Whole-root absence
+
+The pseudo-code above assumes `diff` is called with two tree hashes already
+known to exist, and only ever recurses into an entry missing on *one* side
+*within* an otherwise-existing tree (`base[path]` or `target[path]`). A
+caller may also need to diff two sides where the **entire root** being
+compared is absent — not a path missing inside a tree, but there being no
+tree at all on one side. `diff_trees` (`src/commands/pull.rs`) models this by
+taking `base`/`target` as `Option<&Hash>` rather than `&Hash`:
+
+- `target` absent, `base` present: every entry reachable from `base`
+  (recursively) is `deleted`. This is the same expansion as "path only in
+  base: emit deleted(path)" above, applied to the whole root instead of to
+  one entry within a tree — `mark_deleted_tree` performs exactly this walk
+  and is reused for it.
+- `target` absent, `base` also absent: the diff is empty. Nothing existed on
+  either side, so there is nothing to report.
+- `target` present: proceed with the algorithm above (`base` absent is
+  already handled by `load_tree(base_hash) = {}` when recursing).
+
+This matters for path-scoped `pull`'s local-diff computation (see
+"Path-scoped pull" below): when `<path>` still exists at `clone_root` but has
+been removed from the working tree entirely, the working-tree side of the
+scoped diff has no tree to navigate to (`target` is absent), and the correct
+local diff is "every path under `clone_root`'s `<path>` was deleted locally"
+— exactly the first case above — not an empty diff. Treating a wholly-absent
+target as "nothing to compare, so no local changes" would hide a local
+deletion from conflict detection: a full pull always has a working-tree root
+hash to diff against (the working-tree scan always produces some hash, even
+the empty-tree hash, for the top-level scan), so this whole-root-absence case
+is specific to a scoped `<path>` that a full pull's own local diff never
+encounters.
 
 ### Change application
 
@@ -711,6 +828,15 @@ Path-scoped operations apply only to the specified path (file or directory subtr
 ### Path-scoped push
 
 1. Scan `<path>` in the working tree and build a new subtree. Before reading any content, every path component from `work_dir` down to (and including) `<path>` is verified to be symlink-free (see "Write safety: the working-tree write boundary" above) — a symlinked ancestor is refused rather than followed, so a scoped push can never read (and upload) content that actually lives outside `work_dir` by walking through a symlink planted along `<path>`.
+
+    **Deletion detection.** A scoped push must tell "`<path>` was intentionally removed from the working tree" apart from "`<path>` merely could not be observed", since only the former is safe to splice into the remote as a deletion. `<path>` is treated as a deletion intent **only** when a direct `symlink_metadata` lookup on it reports `io::ErrorKind::NotFound` (nothing exists there at all — not even a symlink or a stub marker). Every other case that keeps the working tree from being read is a hard error that aborts the whole push before any object is uploaded or the index root is touched — the remote is left exactly as it was:
+    - `<path>` itself is a stub (file or directory): this is not a deletion at all — handled separately by splicing the stub's recorded `TreeEntry`, never treated as absence (design/08_stub_system.md, "Interaction with push").
+    - `<path>` sits below a directory that is itself dir-stubbed (an ancestor of `<path>`, not `<path>` itself, carries a `.omemfs-stub` marker): the path is unreachable, not confirmed absent — the ancestor's real content has been deferred, and `<path>` may or may not exist inside it. Push aborts with an error rather than guessing.
+    - `symlink_metadata` fails with any `io::ErrorKind` other than `NotFound` — most importantly `PermissionDenied` (an unreadable ancestor or the path itself, e.g. `EACCES`) — leaves existence genuinely unknown; push aborts rather than assume deletion.
+    - A symlink at `<path>` whose target does not exist ("dangling symlink") is not a deletion either: `symlink_metadata` (which does not follow the final symlink) reports the link itself as present, so this case is naturally excluded from the `NotFound` test above and is scanned like any other symlink entry.
+
+1c. **Unchanged-path skip.** After scanning `<path>` (step 1), a path whose freshly-scanned entry already matches `clone_root`'s recorded entry at that same path is skipped entirely — it needs no splice, no upload, and does not count toward "something to push" (mirroring step 3's whole-tree "nothing to push" check, scoped to this one path). For a blob leaf, "matches" means both the content hash **and** the executable-bit `mode` are equal — same rule as "Diff output" above (a mode-only change, e.g. `chmod +x`, is a real modification even when the hash is unchanged) and as `ls --dirty`'s dirty detection. Comparing only the hash here would silently treat a mode-only change as "nothing to push" and, if a remote-side mode-only change to the same path exists, would let this push's splice overwrite it without ever reading or preserving it. For a directory subtree, "matches" is a single tree-hash comparison, since `mode` is not a field of `TreeEntry::Tree` and any mode change to a file inside the subtree already changes that subtree's hash.
+
 2. Read the index root and extract the current remote root hash; record the raw index root bytes for the CAS check.
 2b. Per-path divergence check (the scoped analogue of step 4b above): for each pushed `<path>`, compare the remote's subtree at `<path>` — as observed in the snapshot read in step 2 — against `clone_root`'s subtree at the same `<path>`. If any pushed path's subtree differs, fail immediately with the same "remote has been updated since last sync" error, scoped to that path, without uploading any objects or touching the index root. Remote changes **outside** every pushed `<path>` must **not** block the push — they are preserved by the splice logic below, which only ever touches the pushed paths and leaves the rest of the remote root tree untouched.
 
@@ -718,6 +844,8 @@ Path-scoped operations apply only to the specified path (file or directory subtr
     - If `<path>`'s freshly-scanned new subtree already matches the remote's current subtree at `<path>`, the push proceeds for that path regardless of `clone_root`'s staleness there — same rationale as step 4b (a push right after `omemfs conflict accept-remote <path>` for a scoped path).
     - Deleting a `<path>` that is already absent on the remote is always allowed, matching the existing "already absent on remote" no-op handling below — there being nothing there means there is nothing to lose, regardless of what `clone_root` still records for it.
     - The empty-root normalization from step 4b (a missing path on either side, an absent `clone_root`, and the empty-tree hash all equivalent to "nothing here yet") applies wherever a whole root is being compared.
+
+    When `<path>` names a blob leaf directly (not a directory), "the remote's subtree at `<path>`" and "`clone_root`'s subtree at `<path>`" must each be compared by content hash **and** `mode` together, for the same reason as step 1c: a `Blob` entry's own `hash` field is its content hash alone and does not change when only its `mode` changes, so a hash-only comparison here would miss a remote-side or clone-root-side mode-only change to the exact leaf being pushed. This does not apply when `<path>` names a directory: a `Tree` entry's hash already covers every descendant's `mode`, so a tree-hash comparison alone is sufficient there.
 3. Splice the new `<path>` subtree into a copy of the **remote root tree** (use the remote root as the base for the rest of the tree). Compute the new root tree hash.
 4. Upload objects missing from the remote (only those reachable from the new `<path>` subtree).
 5. Update the index root with a CAS conditioned on the raw bytes read in step 2.
@@ -739,6 +867,30 @@ missing from the map is simply re-hashed by the scan. Scoped push variants
 that never scan a directory — deleting a path, splicing in a stub, or pushing
 a single file — build no flatten map at all.
 
+This flatten never crosses a stub boundary: if `<path>`'s own clone-root entry
+is a `Tree` whose object is not present in the local cache (`<path>` itself is
+a whole-stubbed directory a lazy clone never downloaded — `08_stub_system.md`,
+"Stub threshold"), it is not descended into, matching the same guard the
+whole-tree scoped flatten's recursive step already applies to every deeper
+subtree it walks. Before this guard existed (D15), scoping a push directly at
+a stubbed directory (`omemfs push <stubbed-dir>`) unconditionally tried to
+read that directory's tree object for the pre-filter map and failed with
+`ObjectNotFound`, even though pushing the same content via an ancestor scope
+or a whole-tree push never hit this failure — the map miss this guard produces
+instead is always safe, exactly as it is for every other case above.
+
+The scan itself (step 1) reads a partial-expansion directory's `.omemfs-stub`
+record (`08_stub_system.md`, "Partial expansion") through the same
+`LazyTreeStore` `pull`'s working-tree scan uses (see "Lazy tree reads" above)
+rather than the local-only store: that record's `hash` field may name a tree
+object never downloaded by a lazy clone. This is deliberately a SEPARATE store
+argument from the plain local store used for everything else in the scan
+(writing new objects, and every `.exists()`-based local-presence decision,
+most importantly the sealed-blob verification a blob-writing scan performs) —
+routing those through the same remote-fetching store would silently launder a
+genuine local miss (e.g. a blob deleted from the local cache that must be
+recaptured) into a false "still present".
+
 A single-path scoped push also loads STAT_CACHE in scope-limited form
 (`read_scoped` / `write_scoped_merge`, restricted to `<path>`'s prefix); a
 multi-path scoped push falls back to a full STAT_CACHE read. See
@@ -753,7 +905,7 @@ After the operation:
 
 1. Read the index root and extract the remote root hash.
 2. Compare the remote root's `<path>` subtree against the clone root's `<path>` subtree. If they are equal, exit (already up to date for `<path>`).
-3. Compare the working tree's `<path>` against the clone root's `<path>` to detect local changes.
+3. Compare the working tree's `<path>` against the clone root's `<path>` to detect local changes. If `<path>` is entirely absent from the working tree (removed since the last sync) while the clone root's `<path>` still has content, this is a local deletion of everything under `<path>` — see "Whole-root absence" above — and must be diffed as such, not as an empty local diff, so that a remote change to a path local deleted is still detected as a conflict in step 4 (matching a full pull's own handling of a locally-deleted path).
 4. Check for conflicts within `<path>` (same logic as full pull). If any conflict is found, abort.
 5. Apply remote changes within `<path>` to the working tree. Paths outside `<path>` in the working tree are untouched.
 6. Update `clone_root` by splicing the remote root's `<path>` subtree into a copy of the **current clone root tree**. Paths outside `<path>` in clone root are unchanged.
@@ -763,6 +915,40 @@ subtree. Its add, modification, or deletion is applied only to that entry, and
 the corresponding clone-root leaf is replaced or removed. If that leaf has a
 whole-file conflict, its conflict helper files are written alongside the leaf
 itself, exactly as for a full pull; the file-scope path is not prefixed again.
+
+**Leaf-scope type changes.** Whether `<path>` is treated as a leaf entry
+depends on the entry *kind* on each side (remote root's `<path>` and clone
+root's `<path>`), not on which side happens to be present. `<path>` is a leaf
+scope whenever the remote-side entry, the clone-root-side entry, or both, is
+a blob or symlink (i.e. whenever at least one existing side is *not* a tree).
+This includes the case where the two sides disagree in kind — e.g. `<path>`
+was a regular file at the last sync and is now a directory on the remote (or
+vice versa). Such a type change is diffed the same way an unchanged-kind leaf
+is: both sides are wrapped in a synthetic one-entry tree (so `<path>`'s own
+name is the sole entry) and compared with the ordinary tree-diff algorithm,
+which already has a rule for a same-path kind change ("Diff algorithm",
+above) — the old side's full content is reported `deleted` (expanded
+recursively when it is a tree) and the new side's content is reported
+`added` (recursed into when it is a tree, subject to the same stub
+threshold). Only when the entries present on *both* sides that exist are
+trees is `<path>` treated as an ordinary subtree, compared by navigating each
+side to `<path>`'s tree hash directly (no wrapper needed). Treating any
+non-tree side as sufficient to select the leaf/wrapper path (rather than
+requiring agreement between the two sides) is what lets a type change be
+diffed at all: navigating both sides to `<path>` and diffing the two hashes
+directly, as if both were tree hashes, fails once one of them is actually a
+blob hash, since the tree-diff algorithm reads its `base`/`target` hashes as
+tree objects unconditionally.
+
+The working tree's on-disk entity at `<path>` (used for the local-change
+check in step 3) is wrapped the same way, by its OWN actual on-disk kind --
+which need not match the leaf/subtree classification above, since that
+classification is driven only by the remote and clone-root sides. When
+`<path>` is a leaf scope (by the rule above) but the working tree still has a
+real directory on disk at `<path>` (e.g. the type change has not yet been
+pulled locally either), that directory is scanned as an ordinary subtree and
+the resulting tree hash is wrapped in the same one-entry synthetic tree,
+rather than being read as file content.
 
 After the operation:
 - The working tree's `<path>` matches the remote root.

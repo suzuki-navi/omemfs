@@ -47,6 +47,19 @@ pub enum RemoteIntent {
 
 pub fn run(opts: CloneOptions) -> Result<(), Error> {
     if opts.directory.exists() {
+        // Highest-priority check, ahead of the empty-directory check below:
+        // an existing `.omemfs/` directory must never be overwritten, even
+        // with --force. `--force` is only meant to permit cloning into a
+        // non-empty directory that is NOT already an omemfs repository; its
+        // existing config may hold a remote's DEK (for an encrypted remote),
+        // and Repo::init below would silently overwrite that config. See
+        // design/04_cli_spec.md, "--force" and "Errors".
+        if opts.directory.join(".omemfs").exists() {
+            return Err(Error::Other(format!(
+                "directory '{}' already contains an .omemfs/ repository; refusing to overwrite it (even with --force)",
+                opts.directory.display()
+            )));
+        }
         let is_empty = opts
             .directory
             .read_dir()
@@ -196,7 +209,7 @@ pub fn run(opts: CloneOptions) -> Result<(), Error> {
     })();
 
     if result.is_ok() {
-        let omemfs_dir = opts.directory.join(".omemfs");
+        let omemfs_dir = repo.omemfs_dir();
         let duration_ms = started.elapsed().as_millis() as u64;
         io_stats::append_record(&omemfs_dir, "clone", origin_name, &io_record, duration_ms);
     }
@@ -1170,7 +1183,7 @@ fn expand_or_stub(
                                 &hash.as_str()[..8]
                             )));
                         }
-                        crate::commands::push::transfer_objects(
+                        crate::commands::transfer::transfer_objects(
                             src, local, &hash, remote_key, false,
                         )?;
                     }

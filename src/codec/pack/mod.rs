@@ -90,6 +90,42 @@ pub fn decrypt_index_root_bytes(raw: &[u8], key: Option<&EncryptKey>) -> Result<
     crate::codec::encrypt::decrypt(ciphertext.to_vec(), Some(key), &pseudo_hash)
 }
 
+/// Serialise and encrypt `root` into the on-disk INDEX_ROOT layout: plaintext
+/// unchanged when `key` is `None`, or `nonce (12B) || AES-256-GCM ciphertext
+/// || tag` when `key` is set. The matching decrypt side is
+/// `decrypt_index_root_bytes` above.
+///
+/// INDEX_ROOT content is mutable, so unlike content objects it cannot use a
+/// content hash as the nonce source. Instead a random 12-byte nonce is
+/// generated here and smuggled into `codec::encrypt::encrypt()` via a
+/// "pseudo hash": a 32-byte array whose first 12 bytes are the nonce and
+/// whose remaining 20 bytes are zero.
+///
+/// Single shared implementation for `PackWriter::encrypt_index_root` and
+/// `commands::pack::encrypt_index_root`, which were byte-identical.
+pub fn encrypt_index_root_bytes(
+    root: &crate::codec::pack::index_root::IndexRoot,
+    key: Option<&EncryptKey>,
+) -> Result<Vec<u8>, Error> {
+    let plaintext = root.serialise()?;
+    let Some(key) = key else {
+        return Ok(plaintext);
+    };
+
+    use rand::RngCore;
+    let mut nonce = [0u8; 12];
+    rand::rng().fill_bytes(&mut nonce);
+
+    let mut pseudo_hash = [0u8; 32];
+    pseudo_hash[..12].copy_from_slice(&nonce);
+
+    let encrypted = crate::codec::encrypt::encrypt(plaintext, Some(key), &pseudo_hash);
+    let mut out = Vec::with_capacity(12 + encrypted.len());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&encrypted);
+    Ok(out)
+}
+
 /// Fetch a content-addressed L6 object (delta / hot / cold shard index file,
 /// or Bloom filter) as plaintext, consulting `objcache` first and falling
 /// back to fetching + decrypting from `remote` on a miss (caching the

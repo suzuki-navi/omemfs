@@ -16,7 +16,14 @@ use crate::tree_ops;
 /// file with a fresh mtime, so its tree-entry hash (which includes mtime and
 /// mode) would differ from the remote/clone root and the next `push` would
 /// needlessly re-upload it. See design/04_cli_spec.md (conflict).
-pub(crate) const CONFLICT_META_SUFFIX: &str = ".omemfs-conflict-meta";
+///
+/// Re-exported from `object.rs` (not defined here) so that `scan.rs` (a
+/// low-level module) can recognise conflict-artifact filenames without
+/// depending on this command module -- see `object::CONFLICT_META_SUFFIX`'s
+/// own doc comment. Kept as a `pub(crate) use` rather than switched to a
+/// direct reference at every call site, so every existing caller of
+/// `conflict::CONFLICT_META_SUFFIX` is unchanged.
+pub(crate) use crate::object::CONFLICT_META_SUFFIX;
 
 /// Tracked metadata for one side of a conflict.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -33,18 +40,22 @@ pub(crate) struct SideMeta {
 /// splice this exact value into `clone_root`, independently of which side
 /// the user ends up accepting for the working-tree content.
 ///
-/// Only the two shapes a conflicting *file* path can take on the remote are
-/// covered: a blob (`Blob`) or an absence (`Deleted`, e.g. local-add vs
-/// remote-delete). A conflicting path whose remote side is a tree, symlink,
-/// or stubbed subtree cannot occur here: `pull`'s conflict detection only
-/// ever fires on two diff entries for the *same leaf path* with different
-/// content, and only a blob-vs-blob (or blob-vs-absence) shape reaches that
-/// comparison for a single file (see `write_conflict_for_path`'s
-/// `entry_source`, which likewise only ever produces helper-file bytes for
-/// `Added`/`Modified`). `Unrecorded` exists purely as a defensive fallback
-/// for any future diff-entry shape that might reach this path but does not
-/// yet carry a splice-able hash; `accept-*` leaves `clone_root` untouched for
-/// it (the pre-fix behaviour), rather than guessing.
+/// Three shapes a conflicting *file* path can take on the remote are
+/// covered: a blob (`Blob`), an absence (`Deleted`, e.g. local-add vs
+/// remote-delete), or a symlink (`Symlink`, e.g. local-edit vs the remote
+/// having turned the path into a symlink -- design/03_sync_model.md, "Remote
+/// side is a symlink"). A conflicting path whose remote side is a tree or a
+/// stubbed subtree cannot occur here: `pull`'s conflict detection only ever
+/// fires on two diff entries for the *same leaf path* with different
+/// content, and only a blob-vs-blob, blob-vs-absence, or blob-vs-symlink
+/// shape reaches that comparison for a single file (see
+/// `write_conflict_for_path`'s `entry_source`, which produces helper-file
+/// bytes for `Added`/`Modified` and, for `Symlink`, no helper file at all --
+/// "Missing sides" -- but the shape is still captured here). `Unrecorded`
+/// exists purely as a defensive fallback for any future diff-entry shape
+/// that might reach this path but does not yet carry a splice-able value;
+/// `accept-*` leaves `clone_root` untouched for it (the pre-fix behaviour
+/// this whole enum replaces), rather than guessing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum RemoteResolution {
@@ -57,6 +68,13 @@ pub(crate) enum RemoteResolution {
         mode: Option<String>,
     },
     Deleted,
+    /// The remote turned the path into a symlink (design/03_sync_model.md,
+    /// "Remote side is a symlink"). Symlinks have no executable-bit `mode`.
+    Symlink {
+        target: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mtime: Option<chrono::DateTime<chrono::Utc>>,
+    },
     Unrecorded,
 }
 
@@ -185,38 +203,40 @@ impl AcceptSide {
 // Shared with pull.rs (writes these), restore.rs (removes these), and
 // scan.rs (recognises/excludes these from the working-tree scan) --
 // previously each had its own copy of these literals (refactor-instructions.md D3).
-pub(crate) const CONFLICT_SUFFIX_BASE: &str = ".omemfs-conflict-base";
-pub(crate) const CONFLICT_SUFFIX_LOCAL: &str = ".omemfs-conflict-local";
-pub(crate) const CONFLICT_SUFFIX_REMOTE: &str = ".omemfs-conflict-remote";
-pub(crate) const CONFLICT_SUFFIXES: &[&str] = &[
-    CONFLICT_SUFFIX_BASE,
-    CONFLICT_SUFFIX_LOCAL,
-    CONFLICT_SUFFIX_REMOTE,
-];
+// Re-exported from `object.rs` -- see this module's `CONFLICT_META_SUFFIX`
+// re-export above for why, and `object::CONFLICT_SUFFIXES`'s own doc comment.
+pub(crate) use crate::object::{
+    CONFLICT_ARTIFACT_SUFFIXES, CONFLICT_SUFFIX_BASE, CONFLICT_SUFFIX_LOCAL,
+    CONFLICT_SUFFIX_REMOTE, CONFLICT_SUFFIXES, is_conflict_artifact,
+};
 
-/// L6: every filename suffix that identifies a piece of omemfs-internal
-/// conflict bookkeeping alongside a base path -- the three resolution-aid
-/// helpers (`CONFLICT_SUFFIXES`) plus the `CONFLICT_META_SUFFIX` metadata
-/// sidecar. None of these are user content: they exist only to support
-/// `omemfs conflict`. Anything that needs to recognise/remove "any conflict
-/// residue for this path" (restore's per-path cleanup, and the working-tree
-/// scan's exclusion of internal files) should use this list -- or
-/// [`is_conflict_artifact`] -- rather than keeping its own separate copy that
-/// can silently drift out of sync with this one (the metadata sidecar being
-/// missing from restore's old copy of `CONFLICT_SUFFIXES` is exactly the bug
-/// this constant exists to prevent from recurring).
-pub(crate) const CONFLICT_ARTIFACT_SUFFIXES: &[&str] = &[
-    CONFLICT_SUFFIX_BASE,
-    CONFLICT_SUFFIX_LOCAL,
-    CONFLICT_SUFFIX_REMOTE,
-    CONFLICT_META_SUFFIX,
-];
-
-/// Returns `true` if `name` ends with any suffix in
-/// [`CONFLICT_ARTIFACT_SUFFIXES`] -- i.e. `name` is omemfs-internal conflict
-/// bookkeeping (a helper or the metadata sidecar), never user content.
-pub(crate) fn is_conflict_artifact(name: &str) -> bool {
-    CONFLICT_ARTIFACT_SUFFIXES.iter().any(|s| name.ends_with(s))
+/// Remove every artifact in [`CONFLICT_ARTIFACT_SUFFIXES`] (the three helper
+/// files and the metadata sidecar) for `base_path`, tolerating any that are
+/// already absent. Routed through `fsguard::remove_file_tolerant`
+/// (design/03_sync_model.md, "Write safety: the working-tree write
+/// boundary") rather than a bare `fs::remove_file`.
+///
+/// The single removal primitive behind both call sites that need "clear all
+/// conflict residue for this path": `pull` calls it right before writing a
+/// path's fresh helpers/sidecar, so a helper left over from an earlier,
+/// differently-shaped conflict on the same path can never be mistaken for
+/// part of the conflict `pull` just detected (design/03_sync_model.md,
+/// "Missing sides", "Clearing stale residue before writing" -- this was
+/// D8's root cause: `accept-*` decides what to apply purely from whether a
+/// helper file exists, so a stale one is indistinguishable from a genuine
+/// one). `restore`'s own per-path cleanup (`remove_conflict_helpers`) uses it
+/// too, so both write paths for "remove all conflict artifacts here" share
+/// one implementation instead of two copies that could drift apart.
+pub(crate) fn remove_all_conflict_artifacts(
+    work_dir: &Path,
+    base_path: &Path,
+) -> Result<(), Error> {
+    let s = base_path.to_string_lossy();
+    for suffix in CONFLICT_ARTIFACT_SUFFIXES {
+        let p = PathBuf::from(format!("{}{}", s, suffix));
+        crate::fsguard::remove_file_tolerant(work_dir, &p)?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -456,6 +476,26 @@ pub fn run_accept(opts: ConflictAcceptOptions) -> Result<(), Error> {
                     }
                 }
             }
+            Some(RemoteResolution::Symlink { target, mtime }) => {
+                // Advance clone_root to the remote's exact symlink value,
+                // independently of which side's content ends up in the
+                // working tree (design/03_sync_model.md, "Remote side is a
+                // symlink") -- the same treatment `Blob` gets above.
+                let comps: Vec<&str> = base.split('/').filter(|s| !s.is_empty()).collect();
+                let leaf_name = comps.last().copied().unwrap_or(base.as_str()).to_string();
+                let new_entry = TreeEntry::Symlink {
+                    name: leaf_name,
+                    target: target.clone(),
+                    mtime: *mtime,
+                };
+                new_clone_root = Some(tree_ops::splice_entry(
+                    new_clone_root.as_ref(),
+                    &comps,
+                    new_entry,
+                    &lazy,
+                )?);
+                clone_root_advanced = true;
+            }
             Some(RemoteResolution::Unrecorded) | None => {}
         }
     }
@@ -465,7 +505,15 @@ pub fn run_accept(opts: ConflictAcceptOptions) -> Result<(), Error> {
     // Helper files and the metadata sidecar are deliberately left in place
     // here -- they are removed only in phase D, after clone_root has been
     // durably advanced in phase C.
+    //
+    // `deleted_paths` records which resolved paths took the "missing side"
+    // branch (the file was removed, not overwritten) -- these are the only
+    // paths whose parent directory can end up newly emptied by this
+    // resolution, so phase D's directory-pruning walk (design/03_sync_model.md,
+    // "Pruning directories emptied by conflict resolution") only starts from
+    // them.
     // ------------------------------------------------------------------
+    let mut deleted_paths: Vec<&str> = Vec::new();
     for (base, conflict_meta) in &metas {
         let abs_base = opts.work_dir.join(base);
         let src_helper = opts
@@ -505,10 +553,27 @@ pub fn run_accept(opts: ConflictAcceptOptions) -> Result<(), Error> {
                     restore_side_meta(&opts.work_dir, &abs_base, side);
                 }
             }
+        } else if matches!(opts.side, AcceptSide::Remote)
+            && let Some(cm) = conflict_meta
+            && let Some(RemoteResolution::Symlink { target, mtime }) = &cm.remote_resolution
+        {
+            // No `.omemfs-conflict-remote` helper is ever written for this
+            // shape (design/03_sync_model.md, "Missing sides", "Remote side
+            // is a symlink") -- the remote side has no blob content, only a
+            // symlink target string. `accept-remote` must still materialise
+            // that symlink itself, replacing whatever is currently at the
+            // path (a plain file here, but `write_symlink` -- via
+            // `replace_symlink` -- also handles a stale empty directory or a
+            // dangling symlink left at the path, exactly like `pull`'s own
+            // `DiffEntry::Symlink` application), and restore its own mtime
+            // via lutimes (symlinks have no executable-bit mode to restore).
+            crate::fsguard::write_symlink(&opts.work_dir, &abs_base, target)?;
+            crate::fsmeta::restore_symlink_mtime(&abs_base, mtime);
         } else {
             // Missing side means this side had no content (deleted or not-yet-created).
             // Accept = restore to that state = delete the file.
             crate::fsguard::remove_file_tolerant(&opts.work_dir, &abs_base)?;
+            deleted_paths.push(base.as_str());
         }
     }
 
@@ -544,6 +609,31 @@ pub fn run_accept(opts: ConflictAcceptOptions) -> Result<(), Error> {
 
         out.writeln(&format!("  accepted {}: {}", opts.side.label(), base))?;
         count += 1;
+    }
+
+    // Prune directories newly emptied by this resolution (design/03_sync_model.md,
+    // "Pruning directories emptied by conflict resolution"). Only run now, after
+    // every helper file and sidecar above has been removed, so a path's own
+    // `.omemfs-conflict-*` residue never masks its parent directory as
+    // non-empty. Only starts from a path that was actually deleted in phase B
+    // (`deleted_paths`) -- a path whose content was overwritten in place never
+    // empties its parent. Walk each such path's ancestor chain up to (but not
+    // including) the repository root, deepest first, stopping at the first
+    // directory that still has content (which also naturally stops at a
+    // directory shared with an unrelated, still-populated path).
+    for base in deleted_paths {
+        let mut cur = Path::new(base);
+        while let Some(parent) = cur.parent() {
+            let parent_str = parent.to_string_lossy();
+            if parent_str.is_empty() {
+                break;
+            }
+            let abs_parent = opts.work_dir.join(parent);
+            if !crate::fsguard::remove_dir_if_empty(&opts.work_dir, &abs_parent)? {
+                break;
+            }
+            cur = parent;
+        }
     }
 
     out.writeln(&format!(

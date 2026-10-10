@@ -29,6 +29,12 @@ const MAGIC_PLAIN_ZSTD: [u8; 2] = [0xED, 0xDF];
 const MAGIC_ESCAPED_RAW: [u8; 2] = [0xED, 0xD0];
 const ZSTD_LEVEL: i32 = 3;
 
+/// Maximum permitted decompressed output size (see design/02_storage_format.md,
+/// "Untrusted-remote validation: decompression output size limit"). Four
+/// times `CDC_MAX` (`src/codec/chunk.rs`), which bounds every legitimately
+/// stored object; the multiplier is headroom, not an expected size.
+const DECOMPRESS_MAX: u64 = 64 * 1024 * 1024;
+
 /// Embedded tree-dict v1, trained by build.rs from representative tree JSON.
 static TREE_DICT_V1: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tree_dict_v1.bin"));
 
@@ -124,19 +130,43 @@ fn compress_zstd_bytes(data: &[u8], dict: Option<&[u8]>) -> Vec<u8> {
 }
 
 /// Decompress `data` compressed with zstd. If `dict` is `Some`, use the same dictionary.
+///
+/// Untrusted-remote validation (see design/02_storage_format.md,
+/// "Untrusted-remote validation: decompression output size limit"): on an
+/// unencrypted or compromised remote, `data` is not authenticated before
+/// this runs, so a hostile/corrupted small payload could otherwise expand
+/// to an unbounded output (a decompression bomb). Reads are capped at
+/// `DECOMPRESS_MAX + 1` bytes via `Read::take` -- one byte more than the
+/// limit, so that successfully reading that extra byte distinguishes "the
+/// stream had more data past the limit" (reject) from "the stream ended
+/// exactly at the limit" (accept) -- instead of `read_to_end` with no bound.
 fn decompress_zstd_bytes(data: &[u8], dict: Option<&[u8]>) -> Result<Vec<u8>, Error> {
     let cursor = std::io::Cursor::new(data);
     let mut out = Vec::new();
-    match dict {
+    let read = match dict {
         Some(d) => {
             let mut decoder =
                 zstd::stream::Decoder::with_dictionary(cursor, d).map_err(Error::Io)?;
-            decoder.read_to_end(&mut out).map_err(Error::Io)?;
+            decoder
+                .by_ref()
+                .take(DECOMPRESS_MAX + 1)
+                .read_to_end(&mut out)
+                .map_err(Error::Io)?
         }
         None => {
             let mut decoder = zstd::stream::Decoder::new(cursor).map_err(Error::Io)?;
-            decoder.read_to_end(&mut out).map_err(Error::Io)?;
+            decoder
+                .by_ref()
+                .take(DECOMPRESS_MAX + 1)
+                .read_to_end(&mut out)
+                .map_err(Error::Io)?
         }
+    };
+    if read as u64 > DECOMPRESS_MAX {
+        return Err(Error::InvalidObject(format!(
+            "decompressed output exceeds the {} byte limit",
+            DECOMPRESS_MAX
+        )));
     }
     Ok(out)
 }
@@ -335,6 +365,77 @@ mod tests {
                 magic,
             );
         }
+    }
+
+    // Security regression: a hostile or corrupted remote (unencrypted, no
+    // GCM tag) can supply a small zstd payload that expands to an
+    // arbitrarily large output -- a decompression bomb. Build one directly
+    // with the zstd crate (a highly repetitive input compresses to a tiny
+    // frame) and verify `decompress` rejects it instead of allocating the
+    // full expanded size via an unbounded `read_to_end`.
+    #[test]
+    fn decompress_rejects_output_exceeding_size_limit() {
+        // 128 MiB of zeros compresses to well under 1 KiB with zstd, and is
+        // far larger than any legitimate stored object (CDC_MAX ~= 16 MiB).
+        let huge_input = vec![0u8; 128 * 1024 * 1024];
+        let payload = compress_zstd_bytes(&huge_input, None);
+        // Sanity: the compressed payload really is tiny relative to the
+        // decompressed size -- otherwise this test would not actually be
+        // exercising a decompression bomb.
+        assert!(
+            payload.len() < 8192,
+            "expected a highly-compressible payload, got {} bytes",
+            payload.len()
+        );
+
+        let mut stored = Vec::new();
+        stored.extend_from_slice(&MAGIC_PLAIN_ZSTD);
+        stored.extend_from_slice(&payload);
+
+        let result = decompress(&stored);
+        assert!(
+            result.is_err(),
+            "decompression bomb (128 MiB output from a {}-byte payload) must be rejected",
+            payload.len()
+        );
+    }
+
+    // A dict-compressed decompression bomb must be rejected the same way as
+    // a plain-zstd one -- the size limit applies regardless of which zstd
+    // variant produced the output.
+    #[test]
+    fn decompress_rejects_dict_zstd_output_exceeding_size_limit() {
+        let huge_input = vec![0u8; 128 * 1024 * 1024];
+        let payload = compress_zstd_bytes(&huge_input, Some(TREE_DICT_V1));
+        assert!(
+            payload.len() < 8192,
+            "expected a highly-compressible payload, got {} bytes",
+            payload.len()
+        );
+
+        let mut stored = Vec::new();
+        stored.extend_from_slice(&MAGIC_DICT_ZSTD);
+        stored.extend_from_slice(&payload);
+
+        let result = decompress(&stored);
+        assert!(
+            result.is_err(),
+            "dict-zstd decompression bomb must be rejected"
+        );
+    }
+
+    // A legitimate object at the largest size the write path ever produces
+    // (~CDC_MAX, see src/codec/chunk.rs) must still decompress successfully
+    // -- the size limit must not be so tight that it rejects real data.
+    #[test]
+    fn decompress_accepts_output_at_legitimate_max_size() {
+        // Use CDC_MAX-sized, moderately compressible content (not all-zero,
+        // so this also exercises a realistic compression ratio) comfortably
+        // within the DECOMPRESS_MAX bound.
+        let data: Vec<u8> = (0u8..255).cycle().take(16 * 1024 * 1024).collect();
+        let stored = compress(&data);
+        let out = decompress(&stored).unwrap();
+        assert_eq!(out, data);
     }
 
     #[test]

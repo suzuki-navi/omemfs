@@ -736,3 +736,21 @@ print(sum(1 for h in d['chunks'] if not re.fullmatch(r'[0-9a-f]{64}', h)))
 
     rm -rf "$donor_dir" "$donor_remote" out.json err.txt
 }
+
+@test "cat: a blob whose content is well-formed tree JSON is printed raw, not pretty-printed as a tree" {
+    # D13 (design/01_object_model.md "Tree/blob discrimination"): this
+    # object has no ED F1 tag -- it is an ordinary blob -- but its content
+    # happens to be valid tree JSON. Before Tree::is_tree_bytes, cat's "is
+    # this a tree?" check (Tree::deserialise succeeding) misidentified it
+    # as a tree and pretty-printed the parsed Tree value instead of
+    # streaming the blob's actual bytes.
+    printf '{"kind":"normal","entries":[]}' > tree_shaped.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    local hash
+    hash="$("$OMEMFS" ls --full-hash tree_shaped.txt | awk '{print $1}')"
+    run "$OMEMFS" cat "$hash"
+    [ "$status" -eq 0 ]
+    [ "$output" = '{"kind":"normal","entries":[]}' ]
+}

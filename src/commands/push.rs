@@ -3,11 +3,12 @@ use std::sync::Arc;
 
 use crate::codec;
 use crate::codec::pack::writer::PackWriter;
+use crate::commands::transfer::{deduplicate_paths, post_clone_sync_guard};
 use crate::error::Error;
 use crate::io_stats;
 use crate::object::{Hash, TreeEntry};
 use crate::repo::Repo;
-use crate::scan::{refresh_stat_cache, scan_and_store_with_cache};
+use crate::scan::{refresh_stat_cache, scan_and_store_with_stub_store};
 use crate::stat_cache::StatCache;
 use crate::store::ObjectStore;
 use crate::store::stats::IoRecord;
@@ -51,7 +52,7 @@ pub fn run(opts: PushOptions) -> Result<(), Error> {
         Arc::clone(&io_record),
     );
     if result.is_ok() && !opts.dry_run {
-        let omemfs_dir = repo.work_dir.join(".omemfs");
+        let omemfs_dir = repo.omemfs_dir();
         let duration_ms = started.elapsed().as_millis() as u64;
         io_stats::append_record(&omemfs_dir, "push", remote_name, &io_record, duration_ms);
     }
@@ -71,11 +72,29 @@ fn push_full(
     io_record: Arc<IoRecord>,
 ) -> Result<(), Error> {
     let clone_root = repo.read_clone_root()?;
+    // Read-through store used ONLY to read a partial-expansion directory's
+    // `.omemfs-stub` record during the scan below (design/08_stub_system.md,
+    // "Partial expansion", D15): that record names a clone-root-rooted tree
+    // object a lazy, stub-aware clone may never have downloaded (the whole
+    // directory was stubbed as a unit). Deliberately NOT used for
+    // `flatten_tree_entries_for_push` (below) or anything else in this scan:
+    // both that flatten's stub-boundary `.exists()` check and the scan's own
+    // sealed-blob verification (`blob_fully_cached`, since this is a
+    // `write_blobs = true` scan) must stay strictly local-only -- see
+    // `scan_and_store_with_stub_store`'s doc comment for why routing those
+    // through a remote-fetching store is a correctness bug, not just an
+    // unnecessary fetch. Unbounded, like every other push/pull use of
+    // `LazyTreeStore`: push already needs a working remote connection to
+    // complete at all.
+    let local_concrete = repo.local_store();
+    let (pack_reader, _remote_raw, remote_key_reader) =
+        repo.pack_reader(remote_name, Some(&io_record))?;
+    let lazy = tree_ops::LazyTreeStore::new(&local_concrete, &pack_reader, remote_key_reader.as_ref());
     let clone_root_flat = match clone_root.as_ref() {
         Some(hash) => Some(tree_ops::flatten_tree_entries_for_push(hash, local)?),
         None => None,
     };
-    let omemfs_dir = repo.work_dir.join(".omemfs");
+    let omemfs_dir = repo.omemfs_dir();
     let mut stat_cache = StatCache::read(&omemfs_dir);
     // push is always a blob-writing scan: compute seal trust once, right after
     // loading, before any file is scanned (design/07 "Implementation notes").
@@ -83,10 +102,11 @@ fn push_full(
     let (new_root_hash, conflict_paths, unstable_paths) = {
         let phase = crate::progress::begin_phase("Scan working tree");
         let _t = dtimer_l1!("scan working tree");
-        let scan_result = scan_and_store_with_cache(
+        let scan_result = scan_and_store_with_stub_store(
             &repo.work_dir,
             &repo.work_dir,
             local,
+            &lazy,
             clone_root_flat.as_ref(),
             &stat_cache,
             true, // push needs blob objects in the local store for upload
@@ -156,6 +176,20 @@ fn push_full(
     .map_err(|e| recover_from_missing_object_if_applicable(&omemfs_dir, e))?;
     repo.write_clone_root(&new_root_hash)?;
 
+    // Reconcile every stub in the working tree against the just-advanced
+    // clone_root (design/08_stub_system.md, "Partial expansion": "After
+    // push, the stub's hash field is updated to reflect the merged tree.").
+    // Reuses pull's own reconcile step -- push does not duplicate the
+    // decision logic, only triggers it at a different point. Placed strictly
+    // after `write_clone_root` succeeds so a push that fails earlier (CAS
+    // rejection, upload failure) never touches a stub record.
+    crate::commands::pull::reconcile_stubs(
+        &new_root_hash,
+        &repo.work_dir,
+        &repo.work_dir,
+        &local_concrete,
+    )?;
+
     {
         let mut out = Output::for_stdout();
         let colored = out.colored();
@@ -224,7 +258,7 @@ fn push_scoped(
     }
 
     let clone_root = repo.read_clone_root()?;
-    let omemfs_dir = repo.work_dir.join(".omemfs");
+    let omemfs_dir = repo.omemfs_dir();
 
     // Construct the writer first so the INDEX_ROOT snapshot is captured at push
     // start; the remote root used for all splices below comes from that same
@@ -232,6 +266,24 @@ fn push_scoped(
     let (mut writer, remote_key) = repo.pack_writer(remote_name, &io_record)?;
     post_clone_sync_guard(clone_root.as_ref(), writer.index_root_present())?;
     let remote_root = writer.remote_root_snapshot()?;
+
+    // Pack-aware read-through store over the remote root: the remote's tree
+    // objects (including the root itself) may live inline in another push's
+    // delta index rather than as loose objects, so a raw, non-pack-aware
+    // store cannot resolve them -- see design/03_sync_model.md, "Path-scoped
+    // push". This mirrors how `pull` reads the remote root (`PackReader` /
+    // `LazyTreeStore`). Constructed here, before the per-path scan loop
+    // below, so the loop's own stub-merge reads (a partial-expansion
+    // directory's recorded tree object may not be in the local cache after a
+    // lazy clone -- design/08_stub_system.md, "Partial expansion") can fetch
+    // on demand too, not just the later per-path divergence check and splice
+    // loop that already used this store. Uses the writer's own `remote_key`
+    // (rather than the reader's own copy of the same value) so both handles
+    // are keyed by the same value.
+    let (pack_reader, _remote_raw, _remote_key_reader) =
+        repo.pack_reader(remote_name, Some(&io_record))?;
+    let local_concrete = repo.local_store();
+    let lazy = tree_ops::LazyTreeStore::new(&local_concrete, &pack_reader, remote_key.as_ref());
 
     // STAT_CACHE scope-limited load (design/07 "Read optimisation: scope-limited
     // load"): a single scoped path parses only that path's slice of STAT_CACHE
@@ -301,13 +353,15 @@ fn push_scoped(
             // to push for it (matches push_scoped's single-path short-circuit;
             // refactor-instructions.md Phase 8 E7 -- without this check a
             // multi-path push always re-spliced and re-CAS-wrote an unchanged
-            // stub instead of leaving it out of scoped_results).
-            let existing_hash = if let Some(ref cr) = clone_root {
-                tree_ops::navigate(cr, &components, local)?
-            } else {
-                None
-            };
-            if existing_hash.as_ref() == Some(&scoped_hash) {
+            // stub instead of leaving it out of scoped_results). Compared by
+            // full entry (hash + mode), not bare hash, so a stub recording a
+            // mode-only change is never mistaken for "unchanged" (design/03
+            // "Path-scoped push" step 1c; D14).
+            let existing_entry = navigate_entry_opt(clone_root.as_ref(), &components, &lazy)?;
+            if existing_entry
+                .as_ref()
+                .is_some_and(|e| tree_entries_equal(e, &stub_entry))
+            {
                 continue;
             }
             let is_dir = matches!(stub_entry, TreeEntry::Tree { .. });
@@ -322,19 +376,58 @@ fn push_scoped(
             continue;
         }
 
-        if !abs_path.exists() {
-            // Deletion intent. Whether this is a real removal or a no-op (the
-            // path is already absent on the remote) is decided later, in the
-            // splice loop, against the remote-root snapshot — see the is_delete
-            // branch there. Record the intent here regardless.
-            scoped_results.push(ScopedResult {
-                rel: rel.clone(),
-                components: components.iter().map(|s| s.to_string()).collect(),
-                scoped_hash: Hash::compute(b""),
-                abs_path_is_dir: false,
-                is_delete: true,
-            });
-            continue;
+        // `rel` itself is not a stub (checked above). Before treating an
+        // unreadable `abs_path` as "deleted", rule out the case where `rel`
+        // is merely unreachable because one of its ANCESTORS is
+        // dir-stubbed: the ancestor's real content was deferred, not
+        // removed, so `rel` may or may not still exist inside it. Guessing
+        // "deleted" here would silently drop that content from the remote
+        // (design/03_sync_model.md, "Path-scoped push", "Deletion
+        // detection"). This is deliberately the minimal safe response
+        // (abort) rather than resolving the path through the stub's
+        // recorded subtree.
+        if crate::stub::deepest_ancestor_stub(&repo.work_dir, rel)?.is_some() {
+            return Err(Error::Other(format!(
+                "cannot push '{}': an ancestor directory is stubbed (its content is deferred, not confirmed absent)\n\
+                 Run 'omemfs expand' on the stubbed ancestor first, or push the stubbed directory itself.",
+                rel
+            )));
+        }
+
+        // Deletion intent requires a direct NotFound on `abs_path` itself --
+        // nothing there at all, not even a symlink (design/03_sync_model.md,
+        // "Path-scoped push", "Deletion detection"). `symlink_metadata` (not
+        // `Path::exists`, which silently maps every stat failure, including
+        // a permission error, to `false`) is used so any other I/O error
+        // (most importantly `PermissionDenied`) is distinguished from
+        // "confirmed absent" and aborts the whole push instead of being
+        // mistaken for a deletion.
+        match std::fs::symlink_metadata(&abs_path) {
+            Ok(_) => {
+                // Path exists (as of this check) -- fall through to the scan
+                // branch below.
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Deletion intent. Whether this is a real removal or a no-op
+                // (the path is already absent on the remote) is decided
+                // later, in the splice loop, against the remote-root
+                // snapshot — see the is_delete branch there. Record the
+                // intent here regardless.
+                scoped_results.push(ScopedResult {
+                    rel: rel.clone(),
+                    components: components.iter().map(|s| s.to_string()).collect(),
+                    scoped_hash: Hash::compute(b""),
+                    abs_path_is_dir: false,
+                    is_delete: true,
+                });
+                continue;
+            }
+            Err(e) => {
+                return Err(Error::Other(format!(
+                    "cannot stat '{}': {} — aborting push rather than risk treating it as deleted",
+                    rel, e
+                )));
+            }
         }
 
         let phase = crate::progress::begin_phase(format!("Scan {}", rel));
@@ -342,16 +435,27 @@ fn push_scoped(
             // Scoped flatten (design/03 "Path-scoped push"): build the mtime
             // pre-filter map from only `rel`'s subtree of the clone root,
             // instead of flattening the whole clone root for every path.
+            // Local-only (`local`, not `lazy`): this flatten's stub-boundary
+            // `.exists()` check (never descend into a stubbed subtree) must
+            // stay local-only for the same reason `push_full`'s equivalent
+            // flatten does -- see `scan_and_store_with_stub_store`'s doc
+            // comment.
             let scoped_flat = match clone_root.as_ref() {
                 Some(hash) => Some(tree_ops::flatten_tree_entries_scoped_for_push(
                     hash, rel, local,
                 )?),
                 None => None,
             };
-            let scan_result = match scan_and_store_with_cache(
+            // `stub_store: &lazy` for the same reason as `push_full`'s scan
+            // (D15): a partial-expansion directory's stub record may name a
+            // tree object not yet in the local cache after a lazy clone.
+            // `store: local` keeps the sealed-blob check and tree/blob writes
+            // strictly local-only.
+            let scan_result = match scan_and_store_with_stub_store(
                 &repo.work_dir,
                 &abs_path,
                 local,
+                &lazy,
                 scoped_flat.as_ref(),
                 &stat_cache,
                 true, // push needs blob objects in the local store for upload
@@ -400,17 +504,30 @@ fn push_scoped(
             hash
         };
 
-        // Skip a path whose freshly scanned hash already matches clone_root:
+        // Skip a path whose freshly scanned entry already matches clone_root:
         // nothing to push for it (matches push_scoped's single-path
         // short-circuit; refactor-instructions.md Phase 8 E7 -- without this
         // check a multi-path push of N unchanged paths always performed a
-        // full write cycle instead of reporting "Nothing to push.").
-        let existing_hash = if let Some(ref cr) = clone_root {
-            tree_ops::navigate(cr, &components, local)?
+        // full write cycle instead of reporting "Nothing to push."). Compared
+        // by full entry (hash + mode for a blob leaf), not bare hash, so a
+        // mode-only change (e.g. `chmod +x`) is never mistaken for
+        // "unchanged" (design/03 "Path-scoped push" step 1c; D14). For a
+        // directory subtree the freshly scanned root hash already reflects
+        // every descendant's mode, so a plain `Tree` entry (mode is not one
+        // of its fields) is sufficient to compare by.
+        let existing_entry = navigate_entry_opt(clone_root.as_ref(), &components, &lazy)?;
+        let is_unchanged = if let Some(fresh_blob) = captured_entries.get(rel) {
+            // A scanned file: compare the full entry (hash + mode).
+            existing_entry
+                .as_ref()
+                .is_some_and(|e| tree_entries_equal(e, fresh_blob))
         } else {
-            None
+            // A scanned directory subtree: `mode` is not a `Tree` field, so
+            // the subtree's own root hash already reflects every
+            // descendant's mode -- a hash comparison is sufficient here.
+            existing_entry.as_ref().and_then(|e| e.hash()) == Some(&scoped_hash)
         };
-        if existing_hash.as_ref() == Some(&scoped_hash) {
+        if is_unchanged {
             continue;
         }
 
@@ -479,21 +596,12 @@ fn push_scoped(
         return Ok(());
     }
 
-    // Pack-aware read-through store over the remote root: the remote's tree
-    // objects (including the root itself) may live inline in another push's
-    // delta index rather than as loose objects, so a raw, non-pack-aware
-    // store (as `writer.as_remote_store()` used to be used here) cannot
-    // resolve them -- see design/03_sync_model.md, "Path-scoped push". This
-    // mirrors how `pull` reads the remote root (`PackReader` /
-    // `LazyTreeStore`), and serves both the per-path divergence check below
-    // and the splice loop further down, which no longer needs a separate
-    // `ensure_path_in_store` pre-fetch: reads and writes through this store
-    // fetch missing objects from the remote on demand and cache them into
-    // `local` (the same underlying `.omemfs/objects/` directory).
-    let (pack_reader, _remote_raw, _remote_key_reader) =
-        repo.pack_reader(remote_name, Some(&io_record))?;
-    let local_concrete = repo.local_store();
-    let lazy = tree_ops::LazyTreeStore::new(&local_concrete, &pack_reader, remote_key.as_ref());
+    // `lazy`/`local_concrete` were already constructed above, before the
+    // per-path scan loop -- reused here for the per-path divergence check
+    // and the splice loop below (reads and writes through `lazy` fetch
+    // missing objects from the remote on demand and cache them into `local`,
+    // the same underlying `.omemfs/objects/` directory `local_concrete`
+    // addresses).
 
     // Per-path divergence check (design/03 "Path-scoped push" step 2b): a
     // scoped push must reject only when one of ITS OWN pushed paths has
@@ -504,28 +612,47 @@ fn push_scoped(
     // final CAS is conditioned on.
     for sr in &scoped_results {
         let comps: Vec<&str> = sr.components.iter().map(|s| s.as_str()).collect();
-        let remote_at_path = navigate_opt(remote_root.as_ref(), &comps, &lazy)?;
+        let remote_entry_at_path = navigate_entry_opt(remote_root.as_ref(), &comps, &lazy)?;
 
         if sr.is_delete {
             // Deleting a path already absent on the remote can never lose an
             // update -- it is the documented no-op case handled later in the
             // splice loop ("already absent on remote"), regardless of how
             // stale clone_root is for this path.
-            if remote_at_path.is_none() {
+            if remote_entry_at_path.is_none() {
                 continue;
             }
-        } else if remote_at_path.as_ref() == Some(&sr.scoped_hash) {
+        } else {
             // This path's own new content already matches what's on the
             // remote: pushing it changes nothing there, so it cannot lose
             // anyone's update no matter how stale clone_root is for this
             // path. This is what makes a scoped push right after `omemfs
             // conflict accept-remote <path>` a safe no-op even though a
             // conflicting pull never advanced clone_root for that path.
-            continue;
+            // Compared by full entry (hash + mode for a blob leaf), not bare
+            // hash -- see design/03 "Path-scoped push" step 2b (D14): a
+            // hash-only comparison would treat a mode-only remote change to
+            // this exact leaf as "already matches" and let it be silently
+            // overwritten by this push's own (different-mode) splice below.
+            let already_matches = if let Some(fresh_blob) = captured_entries.get(&sr.rel) {
+                remote_entry_at_path
+                    .as_ref()
+                    .is_some_and(|e| tree_entries_equal(e, fresh_blob))
+            } else {
+                remote_entry_at_path.as_ref().and_then(|e| e.hash()) == Some(&sr.scoped_hash)
+            };
+            if already_matches {
+                continue;
+            }
         }
 
-        let clone_at_path = navigate_opt(clone_root.as_ref(), &comps, local)?;
-        if remote_at_path != clone_at_path {
+        let clone_entry_at_path = navigate_entry_opt(clone_root.as_ref(), &comps, local)?;
+        let entries_match = match (&remote_entry_at_path, &clone_entry_at_path) {
+            (None, None) => true,
+            (Some(r), Some(c)) => tree_entries_equal(r, c),
+            _ => false,
+        };
+        if !entries_match {
             return Err(Error::CasFailed);
         }
     }
@@ -673,6 +800,35 @@ fn push_scoped(
     .map_err(|e| recover_from_missing_object_if_applicable(&omemfs_dir, e))?;
     repo.write_clone_root(&new_clone_root)?;
 
+    // Reconcile each pushed path's stub (if any) against the just-advanced
+    // clone_root (design/08_stub_system.md, "Partial expansion": "After
+    // push, the stub's hash field is updated to reflect the merged tree.").
+    // Placed strictly after `write_clone_root` succeeds, matching
+    // `push_full`. A deleted path never has a stub reconciled: nothing in
+    // this function's own delete branch touches a stub marker at a deleted
+    // path, and `reconcile_leaf_stub`/`reconcile_stubs` on an absent path is
+    // a safe no-op in any case -- skipped explicitly for clarity.
+    for sr in &scoped_results {
+        if sr.is_delete {
+            continue;
+        }
+        if sr.abs_path_is_dir {
+            crate::commands::pull::reconcile_stubs(
+                &new_clone_root,
+                &repo.work_dir.join(&sr.rel),
+                &repo.work_dir,
+                &local_concrete,
+            )?;
+        } else {
+            crate::commands::pull::reconcile_leaf_stub(
+                &new_clone_root,
+                &sr.rel,
+                &repo.work_dir,
+                &local_concrete,
+            )?;
+        }
+    }
+
     {
         let mut out = Output::for_stdout();
         let colored = out.colored();
@@ -706,24 +862,6 @@ fn push_scoped(
     }
 
     Ok(())
-}
-
-/// Remove paths that are descendants of another path in the list.
-/// Input paths are repo-relative forward-slash strings (no leading slash).
-pub fn deduplicate_paths(mut paths: Vec<String>) -> Vec<String> {
-    paths.sort();
-    paths.dedup();
-    let prefixes: Vec<String> = paths.iter().map(|p| format!("{}/", p)).collect();
-    let mut result: Vec<String> = Vec::new();
-    'outer: for (i, path) in paths.iter().enumerate() {
-        for (j, prefix) in prefixes.iter().enumerate() {
-            if i != j && path.starts_with(prefix.as_str()) {
-                continue 'outer;
-            }
-        }
-        result.push(path.clone());
-    }
-    result
 }
 
 // ---------------------------------------------------------------------------
@@ -918,7 +1056,7 @@ fn push_to_backup(repo: &Repo, local: &dyn ObjectStore, clone_root_hash: &Hash) 
         // returns a message describing the recovery; any other error passes
         // through unchanged. Either way this is a warning only -- backup
         // failure never affects the exit code (design/04).
-        let omemfs_dir = repo.work_dir.join(".omemfs");
+        let omemfs_dir = repo.omemfs_dir();
         let reported = recover_from_missing_object_if_applicable(&omemfs_dir, e);
         eprintln!("warning: backup upload failed: {reported}");
         return;
@@ -934,125 +1072,6 @@ fn push_to_backup(repo: &Repo, local: &dyn ObjectStore, clone_root_hash: &Hash) 
     let _ = out.writeln("Pushed to backup.");
     let _ = out.writeln(&format!("Backup remote root: {}", hash_str));
     let _ = out.finish();
-}
-
-/// Transfer all objects reachable from `root_hash` that are absent in `dst`.
-/// Reads from `src` (using `src_key` for decryption) and writes to `dst`.
-/// `src_key` is `None` when `src` is unencrypted.
-///
-/// `dst` is always the unencrypted local cache in every current caller (push
-/// uploads local->remote through a different path; this function is only used
-/// for the reverse, remote/cache->local direction), so writes to `dst` are
-/// never encrypted here. If a future caller needs to transfer into an
-/// encrypted `dst`, add the key parameter back rather than assuming `None`.
-///
-/// When `traverse_existing` is `false`, objects already present in `dst` are
-/// skipped along with their entire subtree (fast path for upload/clone).
-/// When `true`, existing objects in `dst` are still traversed so their
-/// children can be checked — use this when `dst` may be partially populated
-/// (e.g. after a partial pull).
-pub fn transfer_objects(
-    src: &dyn crate::store::ObjectStore,
-    dst: &dyn crate::store::ObjectStore,
-    root_hash: &Hash,
-    src_key: Option<&crate::codec::encrypt::EncryptKey>,
-    traverse_existing: bool,
-) -> Result<(), Error> {
-    transfer_objects_many(
-        src,
-        dst,
-        std::slice::from_ref(root_hash),
-        src_key,
-        traverse_existing,
-    )
-}
-
-/// Multi-root counterpart of [`transfer_objects`]: transfer all objects
-/// reachable from **any** of `root_hashes` that are absent in `dst`, in one
-/// walk with dedup shared across every root.
-///
-/// Semantics per root are identical to calling [`transfer_objects`] once per
-/// root; the difference is scheduling. One walk seeded with the whole batch
-/// gives the worker pool parallel work from the start, whereas a per-root loop
-/// of single-node BFS walks (the common case for leaf blobs below the CDC
-/// chunking threshold) has no work to divide and therefore no concurrency at
-/// all. It also means an object referenced by several roots is fetched once
-/// rather than once per root. See `design/02_storage_format.md`, "Multi-root
-/// batching (Improvement B)".
-///
-/// An empty `root_hashes` slice is a no-op, so callers can pass their collected
-/// batch unconditionally.
-pub fn transfer_objects_many(
-    src: &dyn crate::store::ObjectStore,
-    dst: &dyn crate::store::ObjectStore,
-    root_hashes: &[Hash],
-    src_key: Option<&crate::codec::encrypt::EncryptKey>,
-    traverse_existing: bool,
-) -> Result<(), Error> {
-    if root_hashes.is_empty() {
-        return Ok(());
-    }
-    // Bound the total size of object buffers held resident across all workers,
-    // independently of the worker count (design/02 "Two independent knobs").
-    let budget = crate::commands::transfer::ByteBudget::new(
-        crate::commands::transfer::resolve_memory_budget(),
-    );
-
-    // Process one node: copy it to `dst` if missing (or read it back when
-    // already present and we are traversing existing objects), and return the
-    // bytes whose children should be walked next (`None` to walk nothing).
-    let process = |hash: &Hash| -> Result<Option<Vec<u8>>, Error> {
-        if dst.exists(hash)? {
-            if !traverse_existing {
-                return Ok(None);
-            }
-            // Already in dst; read locally to traverse children without
-            // re-writing. A read miss here is tolerated (skip its subtree).
-            // Reserve budget for the read-back buffer (size hint from dst).
-            let hint = dst.size(hash).unwrap_or(0);
-            let _permit = budget.acquire(hint);
-            return Ok(codec::store_read(dst, hash, None).ok());
-        }
-        // Do not issue a source-side stat merely to obtain a scheduling hint.
-        // For PackReader a logical packed hash has no loose remote object, so
-        // that stat is an S3 HEAD which always 404s. An unknown size has always
-        // been permitted by ByteBudget; preserve that bounded-object behaviour
-        // without adding a network round trip to every download.
-        let _permit = budget.acquire(0);
-        let serialised = codec::store_read(src, hash, src_key)?;
-        codec::store_write(dst, hash, &serialised, None)?;
-        Ok(Some(serialised))
-    };
-
-    // Resolve from whichever side is network-bound: push copies local->cloud
-    // (dst is cloud), while clone/pull/expand copy cloud->local (src is cloud).
-    // Taking the max lets the cloud side drive parallelism in either direction.
-    let workers = crate::commands::transfer::resolve_concurrency(src)
-        .max(crate::commands::transfer::resolve_concurrency(dst));
-    if workers >= 2 {
-        return crate::commands::transfer::parallel_bfs(root_hashes, workers, &process);
-    }
-
-    // Serial path (default for local backends) — byte-identical to the
-    // pre-Phase-5 loop, except that the queue is seeded with every root so
-    // dedup spans all of them (one walk, not one walk per root).
-    use std::collections::{HashSet, VecDeque};
-    let mut queue: VecDeque<Hash> = VecDeque::new();
-    let mut visited: HashSet<Hash> = HashSet::new();
-    queue.extend(root_hashes.iter().cloned());
-    while let Some(hash) = queue.pop_front() {
-        // Skip hashes we have already processed; shared subtrees and duplicate
-        // blobs (identical content under multiple paths) only need handling once.
-        if !visited.insert(hash.clone()) {
-            continue;
-        }
-        if let Some(data) = process(&hash)? {
-            for child in crate::commands::transfer::child_hashes(&data) {
-                queue.push_back(child);
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Upload all objects reachable from `root_hash` that are absent from `remote`.
@@ -1287,37 +1306,6 @@ pub(crate) fn resolve_scoped_stub(work_dir: &std::path::Path, rel: &str) -> Opti
     None
 }
 
-/// Post-clone sync guard (design/03). Returns an error when the local clone has
-/// sync history (clone_root is present and not the empty-tree hash) but the
-/// origin index root is absent — an absent index root would otherwise be
-/// silently interpreted as "empty remote" and corrupt the clone.
-///
-/// An absent index root is allowed only when this clone has never synced any
-/// content: clone_root is missing (None) or equals the empty-tree hash. The
-/// guard applies to the origin remote only; backup push is exempt.
-pub fn post_clone_sync_guard(
-    clone_root: Option<&Hash>,
-    index_root_present: bool,
-) -> Result<(), Error> {
-    if index_root_present {
-        return Ok(());
-    }
-    let never_synced = match clone_root {
-        None => true,
-        Some(h) => *h == crate::object::Tree::empty_tree_hash(),
-    };
-    if never_synced {
-        Ok(())
-    } else {
-        Err(Error::Other(
-            "index root not found on remote\n\
-             The remote appears empty, but this clone has sync history.\n\
-             Possible causes: wrong encryption key, wrong URL/prefix, or the remote was reset."
-                .to_string(),
-        ))
-    }
-}
-
 /// `None` (no root recorded) and `Some(empty_tree_hash)` both mean "nothing
 /// has been pushed to this remote yet" — equivalent states for the lost-
 /// update precheck below (design/03 "Push → Steps" step 4b).
@@ -1369,19 +1357,52 @@ fn require_remote_not_advanced(
     Err(Error::CasFailed)
 }
 
-/// `tree_ops::navigate`, tolerating a missing root (`None` means "nothing at
-/// this path" without even touching `store`). Used by the per-path
-/// divergence precheck in `push_scoped`, where either side's root may
-/// legitimately be absent (a fresh remote, or a clone that has never
+/// `tree_ops::navigate_entry`, tolerating a missing root (`None` means
+/// "nothing at this path" without even touching `store`). Used by the
+/// per-path divergence precheck in `push_scoped`, where either side's root
+/// may legitimately be absent (a fresh remote, or a clone that has never
 /// synced).
-fn navigate_opt(
+///
+/// Returns the full `TreeEntry` (not just its `Hash`) because a `Blob`
+/// entry's `hash` field alone does not capture an executable-bit-only
+/// (mode) change (design/03_sync_model.md, "Path-scoped push" step 2b) --
+/// comparing bare hashes here would let a scoped push silently overwrite a
+/// remote-side or clone-root-side mode-only change to the exact leaf being
+/// pushed, or miss its own mode-only divergence.
+fn navigate_entry_opt(
     root: Option<&Hash>,
     components: &[&str],
     store: &dyn ObjectStore,
-) -> Result<Option<Hash>, Error> {
+) -> Result<Option<TreeEntry>, Error> {
     match root {
         None => Ok(None),
-        Some(h) => tree_ops::navigate(h, components, store),
+        Some(h) => tree_ops::navigate_entry(h, components, store),
+    }
+}
+
+/// True when two `TreeEntry`s at the same path represent the same content
+/// for the purpose of "has this path actually changed". For a `Blob`, both
+/// the content hash and the executable-bit `mode` must agree -- a hash-only
+/// comparison would treat a `chmod`-only change as "unchanged" (design/03
+/// "Path-scoped push" step 1c / step 2b, "Diff output", `ls --dirty`'s own
+/// dirty detection). For a `Tree`, the tree hash alone is sufficient: it
+/// already covers every descendant's mode. `Symlink` entries have no
+/// content hash to compare by, so they are compared by target instead --
+/// this function is currently only reached for `Blob`/`Tree` scoped_hash
+/// comparisons, but is written to handle every variant correctly.
+fn tree_entries_equal(a: &TreeEntry, b: &TreeEntry) -> bool {
+    match (a, b) {
+        (
+            TreeEntry::Blob {
+                hash: h1, mode: m1, ..
+            },
+            TreeEntry::Blob {
+                hash: h2, mode: m2, ..
+            },
+        ) => h1 == h2 && m1 == m2,
+        (TreeEntry::Tree { hash: h1, .. }, TreeEntry::Tree { hash: h2, .. }) => h1 == h2,
+        (TreeEntry::Symlink { target: t1, .. }, TreeEntry::Symlink { target: t2, .. }) => t1 == t2,
+        _ => false,
     }
 }
 
@@ -1425,302 +1446,8 @@ mod tests {
     use super::*;
     use crate::store::local::LocalStore;
     use std::fs;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, SystemTime};
     use tempfile::TempDir;
-
-    /// A read-side `ObjectStore` wrapper around a `LocalStore` that:
-    /// - counts `open_read` calls (to verify dedup: a shared object must be
-    ///   read exactly once across a whole batched transfer), and
-    /// - tracks how many `open_read` calls are concurrently in flight, with a
-    ///   short artificial delay so real overlap is observable, and
-    /// - forces a fixed `default_transfer_concurrency()` value.
-    ///
-    /// Forcing the concurrency value directly (rather than setting the
-    /// `OMEMFS_TRANSFER_CONCURRENCY` env var) avoids mutating shared process
-    /// state across Rust's parallel test runner -- see transfer.rs's own
-    /// `resolve_concurrency_env_overrides_default` test for the same caveat.
-    struct ConcurrencyTrackingStore {
-        inner: LocalStore,
-        forced_concurrency: usize,
-        delay: Duration,
-        in_flight: AtomicUsize,
-        max_in_flight: AtomicUsize,
-        open_read_calls: AtomicUsize,
-    }
-
-    impl ConcurrencyTrackingStore {
-        fn new(inner: LocalStore, forced_concurrency: usize, delay: Duration) -> Self {
-            ConcurrencyTrackingStore {
-                inner,
-                forced_concurrency,
-                delay,
-                in_flight: AtomicUsize::new(0),
-                max_in_flight: AtomicUsize::new(0),
-                open_read_calls: AtomicUsize::new(0),
-            }
-        }
-    }
-
-    impl ObjectStore for ConcurrencyTrackingStore {
-        fn exists(&self, hash: &Hash) -> Result<bool, Error> {
-            self.inner.exists(hash)
-        }
-        fn size(&self, hash: &Hash) -> Result<u64, Error> {
-            self.inner.size(hash)
-        }
-        fn list_with_sizes(&self) -> Result<Vec<(String, u64)>, Error> {
-            self.inner.list_with_sizes()
-        }
-        fn open_read(&self, hash: &Hash) -> Result<Box<dyn std::io::Read>, Error> {
-            self.open_read_calls.fetch_add(1, Ordering::SeqCst);
-            let cur = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-            self.max_in_flight.fetch_max(cur, Ordering::SeqCst);
-            // Hold the "in-flight" window open long enough for concurrent
-            // workers (if any) to overlap with this call.
-            std::thread::sleep(self.delay);
-            let result = self.inner.open_read(hash);
-            self.in_flight.fetch_sub(1, Ordering::SeqCst);
-            result
-        }
-        fn write_from(&self, hash: &Hash, reader: &mut dyn std::io::Read) -> Result<(), Error> {
-            self.inner.write_from(hash, reader)
-        }
-        fn default_transfer_concurrency(&self) -> usize {
-            self.forced_concurrency
-        }
-    }
-
-    /// Build an unencrypted `LocalStore` ("remote") populated with `n`
-    /// independent single-chunk blobs. Returns the store, its backing
-    /// `TempDir` (kept alive for the caller), and the blob hashes.
-    fn populate_independent_blobs(n: usize) -> (LocalStore, TempDir, Vec<Hash>) {
-        let dir = TempDir::new().unwrap();
-        let store = LocalStore::for_remote(dir.path());
-        let mut hashes = Vec::with_capacity(n);
-        for i in 0..n {
-            let content = format!("blob-content-{i}").into_bytes();
-            let serialised = crate::object::serialise_blob(&content);
-            let hash = crate::object::blob_hash(&content);
-            codec::chunk::store_chunked(&store, &hash, &serialised, None).unwrap();
-            hashes.push(hash);
-        }
-        (store, dir, hashes)
-    }
-
-    /// Build a minimal serialised `Tree::Normal` with blob entries pointing at
-    /// the given hashes (mirrors `transfer.rs`'s test helper of the same shape).
-    fn make_test_tree(entries: &[(&str, &Hash)]) -> Vec<u8> {
-        use crate::object::Tree;
-        let entries = entries
-            .iter()
-            .map(|(name, h)| TreeEntry::Blob {
-                name: name.to_string(),
-                hash: (*h).clone(),
-                size: 0,
-                mtime: None,
-                mode: None,
-            })
-            .collect();
-        Tree::Normal { entries }.serialise()
-    }
-
-    // -----------------------------------------------------------------------
-    // transfer_objects_many (Improvement B) -- design/02_storage_format.md,
-    // "Multi-root batching (Improvement B)".
-    //
-    // `transfer_objects_many` does not exist yet; these tests are written
-    // against its intended signature (same as `transfer_objects` but taking
-    // `&[Hash]` instead of a single root hash). The whole test binary
-    // therefore fails to *compile* until it is added -- the expected
-    // test-first state, not a mistake in these tests.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn transfer_objects_many_copies_all_independent_roots() {
-        // Copying N independent root objects in one `transfer_objects_many`
-        // call must produce the same end state (dst has all of them) as
-        // calling `transfer_objects` once per root.
-        let (remote, _remote_dir, hashes) = populate_independent_blobs(5);
-        let dst_dir = TempDir::new().unwrap();
-        let dst = LocalStore::for_cache(dst_dir.path());
-
-        transfer_objects_many(&remote, &dst, &hashes, None, false).unwrap();
-
-        for hash in &hashes {
-            assert!(
-                dst.exists(hash).unwrap(),
-                "expected {} to have been copied",
-                hash.as_str()
-            );
-        }
-    }
-
-    #[test]
-    fn transfer_objects_many_matches_per_root_transfer_objects_calls() {
-        // The batched call must produce an end state identical to calling
-        // `transfer_objects` once per root (the pre-Improvement-B behaviour),
-        // for a set of independent roots with no shared content.
-        let (remote, _remote_dir, hashes) = populate_independent_blobs(4);
-
-        let dst_a_dir = TempDir::new().unwrap();
-        let dst_a = LocalStore::for_cache(dst_a_dir.path());
-        for hash in &hashes {
-            transfer_objects(&remote, &dst_a, hash, None, false).unwrap();
-        }
-
-        let dst_b_dir = TempDir::new().unwrap();
-        let dst_b = LocalStore::for_cache(dst_b_dir.path());
-        transfer_objects_many(&remote, &dst_b, &hashes, None, false).unwrap();
-
-        for hash in &hashes {
-            assert_eq!(
-                dst_a.exists(hash).unwrap(),
-                dst_b.exists(hash).unwrap(),
-                "per-root loop and batched call must agree on {}",
-                hash.as_str()
-            );
-            assert!(dst_b.exists(hash).unwrap());
-        }
-    }
-
-    #[test]
-    fn transfer_objects_many_dedups_shared_subtree_across_roots() {
-        // Two tree roots that share one child blob: the shared blob must be
-        // read from `remote` exactly once across the whole batched call, not
-        // once per root that references it.
-        let remote_dir = TempDir::new().unwrap();
-        let remote = ConcurrencyTrackingStore::new(
-            LocalStore::for_remote(remote_dir.path()),
-            1, // concurrency is irrelevant here; this test only counts opens
-            Duration::from_millis(0),
-        );
-
-        let shared_content = b"shared-child-blob".to_vec();
-        let shared_serialised = crate::object::serialise_blob(&shared_content);
-        let shared_hash = crate::object::blob_hash(&shared_content);
-        codec::chunk::store_chunked(&remote, &shared_hash, &shared_serialised, None).unwrap();
-
-        let a_tree = make_test_tree(&[("from_a", &shared_hash)]);
-        let b_tree = make_test_tree(&[("from_b", &shared_hash)]);
-        let a_hash = Hash::compute(&a_tree);
-        let b_hash = Hash::compute(&b_tree);
-        assert_ne!(a_hash, b_hash);
-        codec::store_write(&remote, &a_hash, &a_tree, None).unwrap();
-        codec::store_write(&remote, &b_hash, &b_tree, None).unwrap();
-
-        let dst_dir = TempDir::new().unwrap();
-        let dst = LocalStore::for_cache(dst_dir.path());
-
-        transfer_objects_many(
-            &remote,
-            &dst,
-            &[a_hash.clone(), b_hash.clone()],
-            None,
-            false,
-        )
-        .unwrap();
-
-        assert!(dst.exists(&a_hash).unwrap());
-        assert!(dst.exists(&b_hash).unwrap());
-        assert!(dst.exists(&shared_hash).unwrap());
-        // 3 distinct objects (a, b, shared) -> 3 open_read calls, not 4.
-        assert_eq!(
-            remote.open_read_calls.load(Ordering::SeqCst),
-            3,
-            "the shared child blob must be read from remote exactly once, \
-             regardless of how many roots reference it"
-        );
-    }
-
-    #[test]
-    fn transfer_objects_many_serial_path_dedups_across_roots() {
-        // With concurrency forced to 1 (the local-backend default), the
-        // fallback serial loop must still dedup a hash shared by multiple
-        // roots -- not just within one root's own descendants.
-        let remote_dir = TempDir::new().unwrap();
-        let remote = ConcurrencyTrackingStore::new(
-            LocalStore::for_remote(remote_dir.path()),
-            1,
-            Duration::from_millis(0),
-        );
-        let shared_content = b"serial-shared-blob".to_vec();
-        let shared_serialised = crate::object::serialise_blob(&shared_content);
-        let shared_hash = crate::object::blob_hash(&shared_content);
-        codec::chunk::store_chunked(&remote, &shared_hash, &shared_serialised, None).unwrap();
-
-        let dst_dir = TempDir::new().unwrap();
-        let dst = LocalStore::for_cache(dst_dir.path());
-
-        // Same hash listed 3 times, as if 3 stub records happened to
-        // reference identical content.
-        transfer_objects_many(
-            &remote,
-            &dst,
-            &[
-                shared_hash.clone(),
-                shared_hash.clone(),
-                shared_hash.clone(),
-            ],
-            None,
-            false,
-        )
-        .unwrap();
-
-        assert!(dst.exists(&shared_hash).unwrap());
-        assert_eq!(
-            remote.open_read_calls.load(Ordering::SeqCst),
-            1,
-            "a hash repeated across roots must be fetched only once"
-        );
-    }
-
-    #[test]
-    fn transfer_objects_many_achieves_concurrency_across_independent_roots() {
-        // The crux of Improvement B: a batch of N independent, childless
-        // roots (each a single-node BFS on its own) has NO parallel work
-        // available when transferred one root per call -- but seeding one
-        // `transfer_objects_many` call with the whole batch lets the shared
-        // worker pool distribute them from the start.
-        if std::env::var("OMEMFS_TRANSFER_CONCURRENCY").is_ok() {
-            // Skip when the ambient environment overrides concurrency, to
-            // avoid a spurious result unrelated to this test's own setup
-            // (mirrors the guard used by transfer.rs's concurrency test).
-            return;
-        }
-
-        let remote_dir = TempDir::new().unwrap();
-        let remote = ConcurrencyTrackingStore::new(
-            LocalStore::for_remote(remote_dir.path()),
-            4,
-            Duration::from_millis(20),
-        );
-        const N: usize = 6;
-        let mut hashes = Vec::with_capacity(N);
-        for i in 0..N {
-            let content = format!("concurrent-blob-{i}").into_bytes();
-            let serialised = crate::object::serialise_blob(&content);
-            let hash = crate::object::blob_hash(&content);
-            codec::chunk::store_chunked(&remote, &hash, &serialised, None).unwrap();
-            hashes.push(hash);
-        }
-
-        let dst_dir = TempDir::new().unwrap();
-        let dst = LocalStore::for_cache(dst_dir.path());
-
-        transfer_objects_many(&remote, &dst, &hashes, None, false).unwrap();
-
-        for hash in &hashes {
-            assert!(dst.exists(hash).unwrap());
-        }
-        assert!(
-            remote.max_in_flight.load(Ordering::SeqCst) >= 2,
-            "batching {} independent roots into one transfer_objects_many call \
-             should let the worker pool overlap requests (max observed: {})",
-            N,
-            remote.max_in_flight.load(Ordering::SeqCst)
-        );
-    }
 
     // -----------------------------------------------------------------------
     // L3 trigger precision (design/07 "Upload-failure recovery", defect 5):
@@ -1844,41 +1571,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn transfer_objects_per_root_loop_never_exceeds_concurrency_one() {
-        // Contrast case (documents the bug Improvement B fixes; must PASS
-        // today): calling the existing single-root `transfer_objects` once
-        // per root in a plain loop can never observe concurrency > 1, because
-        // each call's own BFS is a lone childless node with nothing to divide
-        // across workers, and the outer loop itself has no parallelism of
-        // its own.
-        let remote_dir = TempDir::new().unwrap();
-        let remote = ConcurrencyTrackingStore::new(
-            LocalStore::for_remote(remote_dir.path()),
-            4,
-            Duration::from_millis(20),
-        );
-        const N: usize = 6;
-        let mut hashes = Vec::with_capacity(N);
-        for i in 0..N {
-            let content = format!("loop-blob-{i}").into_bytes();
-            let serialised = crate::object::serialise_blob(&content);
-            let hash = crate::object::blob_hash(&content);
-            codec::chunk::store_chunked(&remote, &hash, &serialised, None).unwrap();
-            hashes.push(hash);
-        }
-
-        let dst_dir = TempDir::new().unwrap();
-        let dst = LocalStore::for_cache(dst_dir.path());
-
-        for hash in &hashes {
-            transfer_objects(&remote, &dst, hash, None, false).unwrap();
-        }
-
-        assert_eq!(
-            remote.max_in_flight.load(Ordering::SeqCst),
-            1,
-            "a per-root loop of single-node BFS calls has no parallel work available"
-        );
-    }
 }

@@ -216,6 +216,71 @@ setup_two_clones() {
     [ "$before" -eq "$after" ]
 }
 
+@test "pull: leaf-scoped pull handles a remote type change from blob to tree" {
+    # Regression (Bug1): `omemfs pull <leaf>` used to crash with "tree object
+    # hash mismatch" when the remote replaced a plain file with a directory of
+    # the same name, because the scoped-pull is_leaf check required BOTH sides
+    # to be non-Tree and then diffed the two navigated hashes directly -- one
+    # of which was actually a blob hash being read as a tree object.
+    setup_two_clones
+
+    cd clone2
+    run "$OMEMFS" pull
+    [ "$status" -eq 0 ]
+    [ -f file.txt ]
+    cd ..
+
+    cd clone1
+    rm file.txt
+    mkdir file.txt
+    echo "inner" > file.txt/inner.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    cd clone2
+    run "$OMEMFS" pull file.txt
+    [ "$status" -eq 0 ]
+    [ -d file.txt ]
+    [ -f file.txt/inner.txt ]
+    [ "$(cat file.txt/inner.txt)" = "inner" ]
+}
+
+@test "pull: leaf-scoped pull handles a remote type change from tree to blob" {
+    # Regression (Bug1), reverse direction: the remote replaces a directory
+    # with a plain file of the same name.
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone1
+    [ "$status" -eq 0 ]
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone2
+    [ "$status" -eq 0 ]
+
+    cd clone1
+    mkdir d
+    echo "inner" > d/inner.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    cd clone2
+    run "$OMEMFS" pull
+    [ "$status" -eq 0 ]
+    [ -d d ]
+    cd ..
+
+    cd clone1
+    rm -rf d
+    echo "now a file" > d
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    cd clone2
+    run "$OMEMFS" pull d
+    [ "$status" -eq 0 ]
+    [ -f d ]
+    [ "$(cat d)" = "now a file" ]
+}
+
 @test "pull: --stub-threshold does not download blobs at or above the threshold" {
     run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone1
     [ "$status" -eq 0 ]
@@ -717,6 +782,90 @@ setup_two_clones() {
     [ ! -f file.txt.omemfs-conflict-remote ]
 }
 
+@test "pull: stale omemfs-conflict-remote from an earlier conflict is cleared when the remote side later has no content (D8)" {
+    setup_two_clones
+
+    # clone2: sync file.txt into clone_root, then locally modify it.
+    cd clone2
+    run "$OMEMFS" pull
+    [ "$status" -eq 0 ]
+    echo "local change" > file.txt
+
+    # clone1: modify file.txt and push -- clone2's next pull conflicts with a
+    # real, non-empty remote side, so a real .omemfs-conflict-remote helper
+    # gets written this first time.
+    cd ../clone1
+    echo "remote change v1" > file.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    cd ../clone2
+    run "$OMEMFS" pull
+    [ "$status" -ne 0 ]
+    [ -f file.txt.omemfs-conflict-remote ]
+    [ "$(cat file.txt.omemfs-conflict-remote)" = "remote change v1" ]
+
+    # Leave the conflict unresolved. clone1 now deletes file.txt and pushes --
+    # the remote side of the *same* still-unresolved conflict has changed
+    # shape from a blob to an absence.
+    cd ../clone1
+    rm file.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    # clone2 pulls again. The remote side is now deleted, so no
+    # .omemfs-conflict-remote helper should exist for this re-detected
+    # conflict -- the stale v1 helper from the first conflict must be
+    # cleared, not left behind (design/03_sync_model.md, "Missing sides",
+    # "Clearing stale residue before writing").
+    cd ../clone2
+    run "$OMEMFS" pull
+    [ "$status" -ne 0 ]
+    [ ! -f file.txt.omemfs-conflict-remote ]
+
+    # accept-remote must delete the file (remote has no content), not
+    # resurrect the stale v1 content.
+    run "$OMEMFS" conflict accept-remote file.txt
+    [ "$status" -eq 0 ]
+    [ ! -f file.txt ]
+}
+
+@test "pull: stale omemfs-conflict-base is refreshed when clone_root's own recorded value for the path changes across two unresolved conflicts (D8)" {
+    setup_two_clones
+
+    cd clone2
+    run "$OMEMFS" pull
+    [ "$status" -eq 0 ]
+    echo "local change v1" > file.txt
+
+    cd ../clone1
+    echo "remote change v1" > file.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    cd ../clone2
+    run "$OMEMFS" pull
+    [ "$status" -ne 0 ]
+    [ "$(cat file.txt.omemfs-conflict-base)" = "hello" ]
+
+    # Resolve nothing; instead simulate clone_root itself having advanced by
+    # directly editing local content again so a second, distinct conflict
+    # re-detects on the same path -- exercising that the base helper is
+    # rewritten fresh each time, never merely left over from before.
+    echo "local change v2" > file.txt
+    cd ../clone1
+    echo "remote change v2" > file.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    cd ../clone2
+    run "$OMEMFS" pull
+    [ "$status" -ne 0 ]
+    [ "$(cat file.txt.omemfs-conflict-base)" = "hello" ]
+    [ "$(cat file.txt.omemfs-conflict-remote)" = "remote change v2" ]
+    [ "$(cat file.txt.omemfs-conflict-local)" = "local change v2" ]
+}
+
 # ---------------------------------------------------------------------------
 # Executable-bit (mode) handling
 # ---------------------------------------------------------------------------
@@ -816,6 +965,45 @@ setup_two_clones() {
     [ "$(cat big.bin)" = "$(printf '%020d' 9)" ]
 }
 
+@test "pull: leaf-scoped pull of a stubbed file applies a remote update via stub reconcile, not a conflict" {
+    # Regression (Bug2): 'omemfs pull <file>' misreported a stubbed leaf's
+    # absence on disk as a local deletion, so a normal remote content update
+    # to that same path was reported as a conflict even though the local
+    # side made no change of its own (the file was merely stubbed).
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone1
+    [ "$status" -eq 0 ]
+
+    cd clone1
+    printf '%020d' 0 > big.bin
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" --stub-threshold 10 clone2
+    [ "$status" -eq 0 ]
+    [ -f clone2/big.bin.omemfs-stub ]
+    [ ! -f clone2/big.bin ]
+    STUB_BEFORE="$(cat clone2/big.bin.omemfs-stub)"
+
+    cd clone1
+    printf '%020d' 9 > big.bin
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    cd clone2
+    run "$OMEMFS" pull big.bin --stub-threshold 10
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"Conflict"* ]]
+    [ -f big.bin.omemfs-stub ]
+    [ ! -f big.bin ]
+    STUB_AFTER="$(cat big.bin.omemfs-stub)"
+    [ "$STUB_BEFORE" != "$STUB_AFTER" ]
+    run "$OMEMFS" expand big.bin
+    [ "$status" -eq 0 ]
+    [ "$(cat big.bin)" = "$(printf '%020d' 9)" ]
+}
+
 @test "pull: remote deletion of dir-stubbed subtree removes the dir stub" {
     # Regression: a leftover directory stub must not resurrect a deleted subtree.
     run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone1
@@ -857,6 +1045,409 @@ setup_two_clones() {
     run "$OMEMFS" clone --existing --url "$REMOTE_DIR" --stub-threshold 0 verify
     [ "$status" -eq 0 ]
     [ ! -d verify/bigdir ]
+}
+
+# ---------------------------------------------------------------------------
+# D7: pull performs stub reconcile (design/08_stub_system.md, "Stub reconcile
+# (pull and restore)"). Every existing stub in the working tree must be
+# checked against the new clone_root after apply_diff/write_clone_root, and
+# updated/removed/switched-kind per the reconcile table -- not just left with
+# whatever record it had before the pull.
+# ---------------------------------------------------------------------------
+
+@test "pull: reconcile updates a dir stub's fields when its remote content changes underneath it" {
+    # A dir-stubbed subtree's own record is not touched by ordinary diff/apply
+    # (the diff never descends into a dir-stubbed path -- see
+    # plan_reconcile_dir_stub_to_tree's restore.rs analogue). Reconcile must
+    # still bring the stub's hash/size/mtime/blob_count in line with the new
+    # clone_root even though no per-file diff entry for anything under
+    # bigdir/ is ever produced against a dir-stubbed local path.
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone1
+    [ "$status" -eq 0 ]
+
+    cd clone1
+    mkdir -p bigdir
+    printf '%020d' 0 > bigdir/a.txt
+    printf '%020d' 1 > bigdir/b.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" --stub-threshold 10 clone2
+    [ "$status" -eq 0 ]
+    [ -f clone2/bigdir/.omemfs-stub ]
+    STUB_BEFORE="$(cat clone2/bigdir/.omemfs-stub)"
+
+    # clone1: modify a file inside bigdir and add another, then push.
+    cd clone1
+    printf '%020d' 9 > bigdir/a.txt
+    echo "extra" > bigdir/c.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    cd clone2
+    run "$OMEMFS" pull --stub-threshold 10
+    [ "$status" -eq 0 ]
+    # Still a whole directory stub -- reconcile never recurses into it.
+    [ -f bigdir/.omemfs-stub ]
+    [ ! -f bigdir/a.txt ]
+    [ ! -f bigdir/c.txt ]
+    STUB_AFTER="$(cat bigdir/.omemfs-stub)"
+    [ "$STUB_BEFORE" != "$STUB_AFTER" ]
+    # Expanding must produce the new content, proving the stub's hash was
+    # actually advanced to the new clone_root, not left stale.
+    run "$OMEMFS" expand bigdir
+    [ "$status" -eq 0 ]
+    [ "$(cat bigdir/a.txt)" = "$(printf '%020d' 9)" ]
+    [ "$(cat bigdir/c.txt)" = "extra" ]
+}
+
+@test "pull: reconcile removes a file stub whose path is deleted on the remote via an unrelated pull" {
+    # Same delete-reconcile guarantee as the existing dir-stub deletion test
+    # above, but for a FILE stub, and triggered by a pull whose own diff does
+    # not otherwise touch the stubbed path (the deletion happened earlier;
+    # this pull's remote diff is for an unrelated file only). Reconcile must
+    # still catch the now-absent stub on every pull, not just the one whose
+    # diff happens to mention it.
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone1
+    [ "$status" -eq 0 ]
+
+    cd clone1
+    printf '%020d' 0 > big.bin
+    # Kept well under the 10-byte stub threshold used below, so this file is
+    # never itself a stub candidate -- only big.bin is.
+    echo "x" > other.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" --stub-threshold 10 clone2
+    [ "$status" -eq 0 ]
+    [ -f clone2/big.bin.omemfs-stub ]
+    [ ! -f clone2/other.txt.omemfs-stub ]
+
+    # clone1 deletes big.bin and, separately, modifies other.txt; both in one push.
+    cd clone1
+    rm big.bin
+    echo "y" > other.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    cd clone2
+    run "$OMEMFS" pull --stub-threshold 10
+    [ "$status" -eq 0 ]
+    [ ! -f big.bin.omemfs-stub ]
+    [ ! -f big.bin ]
+    [ "$(cat other.txt)" = "y" ]
+}
+
+@test "pull: reconcile switches a file stub to a dir stub when the remote path becomes a directory" {
+    # design/08 reconcile table: clone_root entry = tree, stub kind = file
+    # stub -> remove the file stub, create the directory, write a dir stub
+    # inside. This must happen even when the type-changing path itself is
+    # small enough that ordinary diff/apply already handles the type change
+    # (this test also exercises reconcile's ability to run after a normal
+    # AddedTree/Deleted apply, not just as a substitute for it).
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone1
+    [ "$status" -eq 0 ]
+
+    cd clone1
+    printf '%020d' 0 > thing
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" --stub-threshold 10 clone2
+    [ "$status" -eq 0 ]
+    [ -f clone2/thing.omemfs-stub ]
+    [ ! -e clone2/thing ]
+
+    cd clone1
+    rm thing
+    mkdir thing
+    printf '%020d' 1 > thing/x.txt
+    printf '%020d' 2 > thing/y.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    cd clone2
+    run "$OMEMFS" pull --stub-threshold 10
+    [ "$status" -eq 0 ]
+    [ ! -f thing.omemfs-stub ]
+    [ -d thing ]
+    [ -f thing/.omemfs-stub ]
+    run "$OMEMFS" expand thing
+    [ "$status" -eq 0 ]
+    [ "$(cat thing/x.txt)" = "$(printf '%020d' 1)" ]
+    [ "$(cat thing/y.txt)" = "$(printf '%020d' 2)" ]
+}
+
+@test "pull: reconcile switches a file stub to a dir stub even when the new tree is too small to auto-stub" {
+    # Regression: unlike the previous test (where the new tree meets
+    # --stub-threshold and the diff arrives as a single AddedTree), a SMALL
+    # new tree is diffed recursively into ordinary Deleted(f.txt) +
+    # Added(f.txt/inner.txt) entries. apply_diff's Deleted-entry phase
+    # previously removed the file stub marker unconditionally before
+    # anything recognised this was a type change, so the subsequent
+    # Added(f.txt/inner.txt) materialised inner.txt as an ordinary real file
+    # under f.txt/ instead of leaving the whole path to reconcile's
+    # "tree | file stub -> SwitchToDirStub" row. By the time reconcile_stubs
+    # ran, the stub record was already gone, so nothing caught the mistake.
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone1
+    [ "$status" -eq 0 ]
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone2
+    [ "$status" -eq 0 ]
+
+    cd clone1
+    echo "content" > f.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    cd clone2
+    run "$OMEMFS" pull
+    [ "$status" -eq 0 ]
+    run "$OMEMFS" stub f.txt
+    [ "$status" -eq 0 ]
+    [ -f f.txt.omemfs-stub ]
+    [ ! -e f.txt ]
+    cd ..
+
+    # clone1: replace f.txt with a small directory (well under the default
+    # 1 MiB stub threshold) and push.
+    cd clone1
+    rm f.txt
+    mkdir f.txt
+    echo "inner content" > f.txt/inner.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    # clone2: pull with the DEFAULT stub threshold (no --stub-threshold
+    # override) -- the new tree is small, so ordinary diff/apply would
+    # normally materialise it, but this path was a file stub and must
+    # become a directory stub instead, never a real materialised file.
+    cd clone2
+    run "$OMEMFS" pull
+    [ "$status" -eq 0 ]
+    [ ! -f f.txt.omemfs-stub ]
+    [ -d f.txt ]
+    [ -f f.txt/.omemfs-stub ]
+    [ ! -f f.txt/inner.txt ]
+    run "$OMEMFS" expand f.txt
+    [ "$status" -eq 0 ]
+    [ "$(cat f.txt/inner.txt)" = "inner content" ]
+}
+
+@test "pull: reconcile switches a dir stub to a file stub when the remote path becomes a file" {
+    # design/08 reconcile table: clone_root entry = blob, stub kind = dir
+    # stub -> remove the dir stub marker, remove the directory, write a file
+    # stub in its place.
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone1
+    [ "$status" -eq 0 ]
+
+    cd clone1
+    mkdir -p bigdir
+    printf '%020d' 0 > bigdir/a.txt
+    printf '%020d' 1 > bigdir/b.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" --stub-threshold 10 clone2
+    [ "$status" -eq 0 ]
+    [ -f clone2/bigdir/.omemfs-stub ]
+
+    cd clone1
+    rm -rf bigdir
+    printf '%020d' 5 > bigdir
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    cd clone2
+    run "$OMEMFS" pull --stub-threshold 10
+    [ "$status" -eq 0 ]
+    [ ! -d bigdir ]
+    [ -f bigdir.omemfs-stub ]
+    run "$OMEMFS" expand bigdir
+    [ "$status" -eq 0 ]
+    [ "$(cat bigdir)" = "$(printf '%020d' 5)" ]
+}
+
+@test "pull: reconcile replaces a dir stub with a materialised symlink when the remote path becomes a symlink" {
+    # design/08 reconcile table: clone_root entry = symlink, any stub kind ->
+    # remove the stub, create the symlink (symlinks are always materialised).
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone1
+    [ "$status" -eq 0 ]
+
+    cd clone1
+    mkdir -p bigdir
+    printf '%020d' 0 > bigdir/a.txt
+    printf '%020d' 1 > bigdir/b.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" --stub-threshold 10 clone2
+    [ "$status" -eq 0 ]
+    [ -f clone2/bigdir/.omemfs-stub ]
+
+    cd clone1
+    rm -rf bigdir
+    ln -s /somewhere bigdir
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    cd clone2
+    run "$OMEMFS" pull --stub-threshold 10
+    [ "$status" -eq 0 ]
+    [ ! -f bigdir/.omemfs-stub ]
+    [ ! -f bigdir.omemfs-stub ]
+    [ -L bigdir ]
+    [ "$(readlink bigdir)" = "/somewhere" ]
+}
+
+@test "pull: reconcile leaves a partially-expanded directory's real files untouched, updating only the stub record" {
+    # design/08 "Partial expansion": a directory stub coexisting with real
+    # (locally added) files must have ONLY its .omemfs-stub record updated by
+    # reconcile; the real files are never touched, and reconcile must not
+    # recurse into (or otherwise disturb) the directory beyond that record.
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone1
+    [ "$status" -eq 0 ]
+
+    cd clone1
+    mkdir -p sub
+    printf '%020d' 0 > sub/a.txt
+    printf '%020d' 1 > sub/b.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" --stub-threshold 10 clone2
+    [ "$status" -eq 0 ]
+    [ -f clone2/sub/.omemfs-stub ]
+
+    # Partial expansion: add a new real file alongside the stub marker.
+    cd clone2
+    echo "local-added" > sub/local.txt
+    STUB_BEFORE="$(cat sub/.omemfs-stub)"
+    cd ..
+
+    # clone1: change a.txt (part of the stub's own recorded tree) and push.
+    cd clone1
+    printf '%020d' 9 > sub/a.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    cd clone2
+    run "$OMEMFS" pull --stub-threshold 10
+    [ "$status" -eq 0 ]
+    # The real, locally-added file must be completely untouched.
+    [ "$(cat sub/local.txt)" = "local-added" ]
+    # The stub record itself must have advanced (new a.txt hash pulled in).
+    [ -f sub/.omemfs-stub ]
+    STUB_AFTER="$(cat sub/.omemfs-stub)"
+    [ "$STUB_BEFORE" != "$STUB_AFTER" ]
+    # b.txt is still only in the stub record, not materialised.
+    [ ! -f sub/b.txt ]
+}
+
+@test "pull: working-tree scan merges a partial expansion whose stub tree was never fetched by a lazy clone (D15)" {
+    # design/08 "Partial expansion" + "Stub threshold": a directory whole-
+    # stubbed by a lazy clone never has its tree object fetched. Adding a
+    # real file directly inside the stub marker, then pulling an UNRELATED
+    # remote change, must not crash: pull's own working-tree scan (which runs
+    # before the diff) has to merge the stub's never-locally-cached recorded
+    # entries with the on-disk file, fetching the stub's tree object from the
+    # remote on demand.
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone1
+    [ "$status" -eq 0 ]
+
+    cd clone1
+    mkdir -p bigdir
+    printf '%020d' 0 > bigdir/a.txt
+    printf '%020d' 1 > bigdir/b.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" --stub-threshold 10 clone2
+    [ "$status" -eq 0 ]
+    [ -f clone2/bigdir/.omemfs-stub ]
+
+    cd clone2
+    echo "new-c" > bigdir/c.txt
+    cd ..
+
+    # clone1: push an unrelated change so clone2's pull has to run its
+    # working-tree scan (a pull that ends up "already up to date" would
+    # short-circuit before ever reaching the scan). Kept well below the 10
+    # byte --stub-threshold used below so this file itself is never stubbed.
+    cd clone1
+    echo -n "abc" > other.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    cd clone2
+    run "$OMEMFS" pull --stub-threshold 10
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"object not found"* ]]
+    [ -f other.txt ]
+    # The local addition must be preserved.
+    [ "$(cat bigdir/c.txt)" = "new-c" ]
+}
+
+@test "pull: deleting one file inside a dir-stubbed subtree on the remote does not remove the whole directory stub" {
+    # Regression: apply_diff's post-delete cleanup pass previously removed the
+    # ENTIRE directory stub whenever the working tree showed only the
+    # .omemfs-stub marker after processing Deleted entries -- but that marker
+    # is also what a directory stub with SOME (not all) of its logical
+    # content deleted on the remote looks like on disk. Only reconcile
+    # (consulting the new clone_root) can tell a whole-subtree deletion apart
+    # from a partial one; deleting just bigdir/a.txt on the remote must leave
+    # bigdir/.omemfs-stub in place (updated to the new, smaller tree), not
+    # remove bigdir entirely.
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone1
+    [ "$status" -eq 0 ]
+
+    cd clone1
+    mkdir -p bigdir
+    printf '%020d' 0 > bigdir/a.txt
+    printf '%020d' 1 > bigdir/b.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" --stub-threshold 10 clone2
+    [ "$status" -eq 0 ]
+    [ -f clone2/bigdir/.omemfs-stub ]
+
+    # clone1: delete only ONE of the two files, keep the directory (and the
+    # other file) alive on the remote.
+    cd clone1
+    rm bigdir/a.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    cd clone2
+    run "$OMEMFS" pull --stub-threshold 10
+    [ "$status" -eq 0 ]
+    # bigdir must still exist as a directory stub -- not removed entirely.
+    [ -d bigdir ]
+    [ -f bigdir/.omemfs-stub ]
+    run "$OMEMFS" expand bigdir
+    [ "$status" -eq 0 ]
+    [ ! -f bigdir/a.txt ]
+    [ -f bigdir/b.txt ]
+    [ "$(cat bigdir/b.txt)" = "$(printf '%020d' 1)" ]
 }
 
 # ---------------------------------------------------------------------------
@@ -1156,6 +1747,76 @@ setup_two_clones() {
     [ "$status" -eq 0 ]
 }
 
+@test "pull: line-merges .zsh_history without splitting a backslash-continued multi-line command" {
+    # D17 regression: a zsh extended_history entry for a multi-line command
+    # (e.g. a `for` loop entered interactively) is written as several
+    # PHYSICAL lines, every one but the last ending in `\`. Only the first
+    # physical line carries the ": <epoch>:<duration>;" timestamp prefix; the
+    # continuation lines have none. Before the fix, line_merge split on bare
+    # `\n` and treated each physical line as an independent record, so the
+    # continuation lines (no timestamp -> sort key i64::MIN) floated to the
+    # front of the merged output, detached from the loop's own header line
+    # and from each other -- silently corrupting the multi-line command.
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone1
+    [ "$status" -eq 0 ]
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone2
+    [ "$status" -eq 0 ]
+
+    # clone1: establish a shared base and push it.
+    cd clone1
+    printf ': 100:0;echo start\n' > .zsh_history
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    # clone2: pull the base, then locally append a multi-line `for` loop
+    # entry -- 3 physical lines, the first 2 ending in a literal backslash.
+    cd ../clone2
+    run "$OMEMFS" pull
+    [ "$status" -eq 0 ]
+    printf ': 200:0;for i in 1 2 3; do \\\necho $i\\\ndone\n' >> .zsh_history
+
+    # clone1: append a remote-only entry and push, so clone2's next pull has
+    # both a local-only and a remote-only change -- the clean-merge case.
+    cd ../clone1
+    printf ': 300:0;echo end\n' >> .zsh_history
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    # clone2: pull should merge cleanly, and the for-loop's 3 physical lines
+    # must survive intact as one contiguous block.
+    cd ../clone2
+    run "$OMEMFS" pull
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"erged"* ]]
+    [ ! -f .zsh_history.omemfs-conflict-base ]
+    [ ! -f .zsh_history.omemfs-conflict-local ]
+    [ ! -f .zsh_history.omemfs-conflict-remote ]
+
+    # The exact 3-line block, byte for byte, contiguous, in this order.
+    python3 - .zsh_history <<'PY'
+import sys
+content = open(sys.argv[1], "rb").read()
+block = b"for i in 1 2 3; do \\\necho $i\\\ndone"
+assert block in content, f"for-loop block not found intact: {content!r}"
+PY
+
+    # "done" must immediately follow "echo $i\" (not detached/reordered) --
+    # checked again independently of the python block check above via plain
+    # line adjacency.
+    local done_line_no echo_line_no
+    echo_line_no="$(grep -n '^echo \$i\\$' .zsh_history | head -1 | cut -d: -f1)"
+    done_line_no="$(grep -n '^done$' .zsh_history | head -1 | cut -d: -f1)"
+    [ -n "$echo_line_no" ]
+    [ -n "$done_line_no" ]
+    [ "$((echo_line_no + 1))" -eq "$done_line_no" ]
+
+    grep -q "echo start" .zsh_history
+    grep -q "echo end" .zsh_history
+
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+}
+
 @test "pull: .zsh_history with overlapping same-line edits still conflicts" {
     # An in-place edit of the same base line on both sides (no untouched line
     # to fall back on) cannot be reconciled by the line-level algorithm, so
@@ -1352,4 +2013,404 @@ PY
     [ "$status" -ne 0 ]
     [[ "$output" == *"invalid object"* ]]
     [ ! -f victim.txt.omemfs-stub ]
+}
+
+# ---------------------------------------------------------------------------
+# D6 regression: remote-side type change (tree <-> blob) must not leave pull
+# permanently failing (design/03_sync_model.md, "Diff algorithm" -- a type
+# change must emit deleted(path) for the old side's full content, in addition
+# to added(path) for the new side).
+# ---------------------------------------------------------------------------
+
+@test "pull: remote directory replaced by a file pulls successfully and replaces the old files" {
+    # clone1 turns a.txt (a directory containing files) into a plain file, then
+    # pushes. clone2's pull must delete the old directory's files and write the
+    # new file's content, instead of failing with "Is a directory".
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone1
+    [ "$status" -eq 0 ]
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone2
+    [ "$status" -eq 0 ]
+
+    cd clone1
+    mkdir -p a.txt
+    echo "child1" > a.txt/child1.txt
+    echo "child2" > a.txt/child2.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    cd clone2
+    run "$OMEMFS" pull
+    [ "$status" -eq 0 ]
+    [ -d a.txt ]
+    [ -f a.txt/child1.txt ]
+    [ -f a.txt/child2.txt ]
+    cd ..
+
+    # clone1: replace the directory with a plain file and push.
+    cd clone1
+    rm -rf a.txt
+    echo "now a file" > a.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    # clone2: pull must succeed, remove the old directory's files, and write
+    # the new file's content -- not fail with an I/O error ("Is a directory").
+    cd clone2
+    run "$OMEMFS" pull
+    [ "$status" -eq 0 ]
+    [ -f a.txt ]
+    [ "$(cat a.txt)" = "now a file" ]
+    [ ! -e a.txt/child1.txt ]
+    [ ! -e a.txt/child2.txt ]
+}
+
+@test "pull: remote file replaced by a directory pulls successfully and removes the old file" {
+    # Reverse direction: a.txt starts as a plain file, then clone1 replaces it
+    # with a directory of files. clone2's pull must delete the old file and
+    # materialise the new directory's contents.
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone1
+    [ "$status" -eq 0 ]
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone2
+    [ "$status" -eq 0 ]
+
+    cd clone1
+    echo "was a file" > a.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    cd clone2
+    run "$OMEMFS" pull
+    [ "$status" -eq 0 ]
+    [ -f a.txt ]
+    cd ..
+
+    # clone1: replace the file with a directory and push.
+    cd clone1
+    rm -f a.txt
+    mkdir -p a.txt
+    echo "child1" > a.txt/child1.txt
+    echo "child2" > a.txt/child2.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    # clone2: pull must succeed, remove the old file, and materialise the new
+    # directory -- not fail with "refusing to write through a symlinked
+    # directory" or leave the stale file in place.
+    cd clone2
+    run "$OMEMFS" pull
+    [ "$status" -eq 0 ]
+    [ -d a.txt ]
+    [ -f a.txt/child1.txt ]
+    [ -f a.txt/child2.txt ]
+    [ "$(cat a.txt/child1.txt)" = "child1" ]
+    [ "$(cat a.txt/child2.txt)" = "child2" ]
+}
+
+@test "pull: remote file replaced by a large directory (auto-stubbed) pulls successfully and removes the old file" {
+    # D7-followup regression: diff_recursive's Tree branch first inserted
+    # Deleted(path) for the old blob, then -- when the new tree meets
+    # stub_threshold -- inserted AddedTree at the SAME key `path`, silently
+    # overwriting the Deleted entry (a plain HashMap::insert has no way to
+    # keep both). apply_diff's Phase 2a (delete-first pass) never saw the
+    # deletion, so the stale file was still on disk when Phase 2b tried to
+    # create_dir_all + write the dir stub there, failing with "refusing to
+    # write through a symlinked directory" (fsguard's ENOTDIR/ELOOP guard
+    # tripping on a non-directory in the way).
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone1
+    [ "$status" -eq 0 ]
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone2
+    [ "$status" -eq 0 ]
+
+    cd clone1
+    echo "was a file" > thing
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    cd clone2
+    run "$OMEMFS" pull
+    [ "$status" -eq 0 ]
+    [ -f thing ]
+    cd ..
+
+    # clone1: replace the file with a directory large enough to be auto-stubbed.
+    cd clone1
+    rm -f thing
+    mkdir -p thing
+    printf '%020d' 1 > thing/x.txt
+    printf '%020d' 2 > thing/y.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    cd clone2
+    run "$OMEMFS" pull --stub-threshold 10
+    [ "$status" -eq 0 ]
+    [ ! -f thing ]
+    [ -d thing ]
+    [ -f thing/.omemfs-stub ]
+}
+
+@test "pull: remote symlink replaced by a large directory (auto-stubbed) pulls successfully and removes the old symlink" {
+    # Same HashMap-key-collision bug as above, but for the Symlink -> Tree
+    # type-change direction (diff_recursive's Tree branch treats a base
+    # Symlink the same as a base Blob).
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone1
+    [ "$status" -eq 0 ]
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone2
+    [ "$status" -eq 0 ]
+
+    cd clone1
+    ln -s /nonexistent thing
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    cd clone2
+    run "$OMEMFS" pull
+    [ "$status" -eq 0 ]
+    [ -L thing ]
+    cd ..
+
+    cd clone1
+    rm -f thing
+    mkdir -p thing
+    printf '%020d' 1 > thing/x.txt
+    printf '%020d' 2 > thing/y.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    cd clone2
+    run "$OMEMFS" pull --stub-threshold 10
+    [ "$status" -eq 0 ]
+    [ ! -L thing ]
+    [ -d thing ]
+    [ -f thing/.omemfs-stub ]
+}
+
+@test "pull: remote AddedTree (auto-stubbed new directory) conflicts with a local untracked file under the same name" {
+    # classify_conflicts compared remote_diff and local_diff keys by plain
+    # string equality. A remote directory large enough to be auto-stubbed is
+    # reported as a single AddedTree at the directory's own path ("d"), while
+    # local_diff (always computed with stub_threshold=0) reports an untracked
+    # file under that not-yet-existing directory at the child path ("d/x").
+    # Neither map has the other's exact key, so the collision went undetected
+    # and pull applied the AddedTree straight over the untracked file.
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone1
+    [ "$status" -eq 0 ]
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" clone2
+    [ "$status" -eq 0 ]
+
+    # clone2: create an untracked file under a directory name that does not
+    # exist in clone_root yet -- before pulling.
+    cd clone2
+    mkdir -p d
+    echo "untracked local content" > d/x.txt
+    cd ..
+
+    # clone1: push a new directory "d" large enough to be auto-stubbed.
+    cd clone1
+    mkdir -p d
+    printf '%020d' 1 > d/a.txt
+    printf '%020d' 2 > d/b.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    cd clone2
+    run "$OMEMFS" pull --stub-threshold 10
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"conflict"* ]] || [[ "$output" == *"Conflict"* ]]
+    # The untracked file must survive untouched -- pull must not have applied
+    # anything (atomic-abort policy).
+    [ -f d/x.txt ]
+    [ "$(cat d/x.txt)" = "untracked local content" ]
+    [ ! -f d/.omemfs-stub ]
+}
+
+# ---------------------------------------------------------------------------
+# D12: scoped pull must detect a local deletion the same way a full pull does
+# ---------------------------------------------------------------------------
+
+@test "pull: local deletion overlapping remote modification is a conflict (single scoped pull)" {
+    # Regression (D12): diff_trees(base, target=None) previously returned an
+    # empty diff instead of expanding base's content as Deleted, so a scoped
+    # pull's local-diff for a path removed entirely from the working tree came
+    # back empty. That made classify_conflicts treat the remote change as
+    # non-conflicting clean input, silently resurrecting the remote content
+    # over a deliberate local delete. A full pull (whose top-level working-tree
+    # scan always produces some root hash) never hits this branch, so only the
+    # scoped path was affected.
+    setup_two_clones
+
+    cd clone2
+    run "$OMEMFS" pull
+    [ "$status" -eq 0 ]
+    rm file.txt
+    cd ..
+
+    cd clone1
+    echo "remote change" > file.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    cd clone2
+    run "$OMEMFS" pull file.txt
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"conflict"* ]] || [[ "$output" == *"Conflict"* ]]
+    # Must NOT be silently resurrected with the remote content.
+    [ ! -f file.txt ]
+    [ -f file.txt.omemfs-conflict-remote ]
+    [ "$(cat file.txt.omemfs-conflict-remote)" = "remote change" ]
+    # Local side had no content (file was deleted): no local helper file.
+    [ ! -f file.txt.omemfs-conflict-local ]
+}
+
+@test "pull: local deletion overlapping remote modification is a conflict (multi-path scoped pull)" {
+    # Same regression as above, exercised through the multi-path scoped pull
+    # entry point (pull <path>... with more than one <path>), which builds
+    # each pd's local_diff the same way.
+    setup_two_clones
+
+    cd clone1
+    mkdir -p src
+    echo "hello" > src/file.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    cd clone2
+    run "$OMEMFS" pull
+    [ "$status" -eq 0 ]
+    rm -f src/file.txt file.txt
+    rmdir src
+    cd ..
+
+    cd clone1
+    echo "remote change" > file.txt
+    echo "remote src change" > src/file.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    cd clone2
+    run "$OMEMFS" pull file.txt src
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"conflict"* ]] || [[ "$output" == *"Conflict"* ]]
+    [ ! -f file.txt ]
+    [ ! -f src/file.txt ]
+    [ -f file.txt.omemfs-conflict-remote ]
+    [ -f src/file.txt.omemfs-conflict-remote ]
+}
+
+# ---------------------------------------------------------------------------
+# D11: multi-path scoped pull must not collide same-named conflicts across
+# different scoped subtrees
+# ---------------------------------------------------------------------------
+
+@test "pull: multi-path scoped pull reports and writes helpers for same-named conflicts under different paths" {
+    # Regression (D11): each path's pd.remote_diff/pd.local_diff use keys
+    # relative to that path's own scoped subtree root, so pulling `a` and `b`
+    # where both a/f and b/f conflict previously produced the SAME key ("f")
+    # in conflict_owner/all_conflicts -- the second path's entry silently
+    # overwrote the first's in conflict_owner (a HashMap), and all_conflicts
+    # held "f" twice instead of "a/f" and "b/f" once each. As a result the
+    # conflict helper files (and the printed "conflict: ..." lines) for one of
+    # the two paths were never written / were duplicated, even though both
+    # a/f and b/f are genuinely separate conflicts.
+    setup_two_clones
+
+    cd clone1
+    mkdir -p a b
+    echo "base-a" > a/f
+    echo "base-b" > b/f
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    cd clone2
+    run "$OMEMFS" pull
+    [ "$status" -eq 0 ]
+    echo "local-a" > a/f
+    echo "local-b" > b/f
+    cd ..
+
+    cd clone1
+    echo "remote-a" > a/f
+    echo "remote-b" > b/f
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    cd clone2
+    run "$OMEMFS" pull a b
+    [ "$status" -ne 0 ]
+
+    # Both conflicts must be reported, each under its own repo-relative path
+    # -- not collapsed into a single "f" (and not just one of the two).
+    [[ "$output" == *"a/f"* ]]
+    [[ "$output" == *"b/f"* ]]
+
+    # Both paths keep their own local content (atomic abort — nothing applied).
+    [ "$(cat a/f)" = "local-a" ]
+    [ "$(cat b/f)" = "local-b" ]
+
+    # Each path gets its own correct set of helper files, with the right
+    # content for that path -- not the other path's content, and not missing.
+    [ -f a/f.omemfs-conflict-base ]
+    [ -f a/f.omemfs-conflict-local ]
+    [ -f a/f.omemfs-conflict-remote ]
+    [ "$(cat a/f.omemfs-conflict-base)" = "base-a" ]
+    [ "$(cat a/f.omemfs-conflict-local)" = "local-a" ]
+    [ "$(cat a/f.omemfs-conflict-remote)" = "remote-a" ]
+
+    [ -f b/f.omemfs-conflict-base ]
+    [ -f b/f.omemfs-conflict-local ]
+    [ -f b/f.omemfs-conflict-remote ]
+    [ "$(cat b/f.omemfs-conflict-base)" = "base-b" ]
+    [ "$(cat b/f.omemfs-conflict-local)" = "local-b" ]
+    [ "$(cat b/f.omemfs-conflict-remote)" = "remote-b" ]
+}
+
+@test "pull: conflict list after a multi-path scoped pull shows both same-named conflicts distinctly" {
+    # Same setup as above, but checks `omemfs conflict list` afterwards --
+    # the persisted conflict-helper state must also distinguish a/f from b/f.
+    setup_two_clones
+
+    cd clone1
+    mkdir -p a b
+    echo "base-a" > a/f
+    echo "base-b" > b/f
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    cd clone2
+    run "$OMEMFS" pull
+    [ "$status" -eq 0 ]
+    echo "local-a" > a/f
+    echo "local-b" > b/f
+    cd ..
+
+    cd clone1
+    echo "remote-a" > a/f
+    echo "remote-b" > b/f
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    cd clone2
+    run "$OMEMFS" pull a b
+    [ "$status" -ne 0 ]
+
+    run "$OMEMFS" conflict list
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"a/f"* ]]
+    [[ "$output" == *"b/f"* ]]
 }

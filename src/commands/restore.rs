@@ -230,7 +230,7 @@ pub fn run(opts: RestoreOptions) -> Result<(), Error> {
                     // cause, when not an ordinary cache miss, is still
                     // captured for the end-of-run warning.
                     let pending_before = plan.pending.len();
-                    if let Err(e) = crate::commands::push::transfer_objects_many(
+                    if let Err(e) = crate::commands::transfer::transfer_objects_many(
                         &pack_reader,
                         &local,
                         &plan.pending,
@@ -333,7 +333,7 @@ pub fn run(opts: RestoreOptions) -> Result<(), Error> {
 
     let duration_ms = started.elapsed().as_millis() as u64;
     io_stats::append_record(
-        &repo.work_dir.join(".omemfs"),
+        &repo.omemfs_dir(),
         "restore",
         &opts.remote_name,
         &io_record,
@@ -1701,34 +1701,15 @@ fn print_action(dry_run: bool, kind: &str, path: &str) {
 }
 
 /// Remove the three conflict helper files, and the metadata sidecar, for
-/// `base_path` if they exist.
-///
-/// L6: this used to iterate only `CONFLICT_SUFFIXES` (the three helpers),
-/// which meant restoring a single conflicted path left its
-/// `.omemfs-conflict-meta` sidecar behind -- it was only ever cleaned up
-/// incidentally by a whole-tree restore's "unknown extra file" scan (see
-/// `Action::DeleteConflictArtifact`), and even then it used to be
-/// misreported as a `deleted:` line as if it were user content. Iterating
-/// `CONFLICT_ARTIFACT_SUFFIXES` here fixes the single-path case directly.
-///
-/// design/03_sync_model.md, "Write safety: the working-tree write boundary":
-/// deleting a helper file is a working-tree mutation like any other, so it
-/// must go through `fsguard::remove_file_tolerant` (which also verifies
-/// every component from `work_dir` down is symlink-free) rather than a bare
-/// `fs::remove_file`, which would both follow a symlinked ancestor and
-/// silently swallow every error (including ones worth surfacing). Unlike the
-/// old bare `fs::remove_file` (whose result was always discarded), a
-/// `SymlinkEscape` or other genuine I/O error here now propagates to the
-/// caller instead of being swallowed.
+/// `base_path` if they exist. Thin wrapper over
+/// `conflict::remove_all_conflict_artifacts` -- the single shared
+/// implementation of "clear every conflict artifact for this path" (see that
+/// function's doc comment for why it exists as one place rather than two).
 fn remove_conflict_helpers(
     work_dir: &std::path::Path,
     base_path: &std::path::Path,
 ) -> Result<(), Error> {
-    for suffix in crate::commands::conflict::CONFLICT_ARTIFACT_SUFFIXES {
-        let p = helper_path(base_path, suffix);
-        crate::fsguard::remove_file_tolerant(work_dir, &p)?;
-    }
-    Ok(())
+    crate::commands::conflict::remove_all_conflict_artifacts(work_dir, base_path)
 }
 
 /// Returns true if any conflict helper file (or the metadata sidecar) exists

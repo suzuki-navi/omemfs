@@ -108,10 +108,63 @@ pub struct ScanResult {
 /// (no chunk / compress / encrypt / write). Tree objects are written in both
 /// modes. Either way the file's `(mtime, size, hash)` is recorded in
 /// `ScanResult.files` so the caller can refresh the STAT_CACHE.
+///
+/// Thin wrapper over [`scan_and_store_with_stub_store`] that uses `store` for
+/// both roles (the common case: every caller except `push` and `pull`'s own
+/// working-tree scan, which route the stub-merge read through a
+/// remote-fetching store while keeping everything else local-only -- see that
+/// function's doc comment for why the two must never simply be the same
+/// value there).
 pub fn scan_and_store_with_cache(
     work_dir: &Path,
     dir: &Path,
     store: &dyn ObjectStore,
+    clone_root_entries: Option<&HashMap<String, TreeEntry>>,
+    stat_cache: &StatCache,
+    write_blobs: bool,
+) -> Result<ScanResult, Error> {
+    scan_and_store_with_stub_store(
+        work_dir,
+        dir,
+        store,
+        store,
+        clone_root_entries,
+        stat_cache,
+        write_blobs,
+    )
+}
+
+/// Like [`scan_and_store_with_cache`], but with the store used to read a
+/// partial-expansion directory's `.omemfs-stub` record (design/08_stub_
+/// system.md, "Partial expansion") specified separately from `store`.
+///
+/// `stub_store` is used ONLY for that one read (`merge_partial_expansion`'s
+/// `load_all_entries` call, both for the scan root itself and for every
+/// partially-expanded directory found while recursing). Every other use of
+/// `store` in this scan -- writing newly-built tree/blob objects, and every
+/// `.exists()`-based decision (`blob_fully_cached`'s sealed-blob verification
+/// when `write_blobs` is true; a stub-boundary check elsewhere in the push
+/// path) -- must stay strictly local-only: those decisions answer "is this
+/// object *actually, currently* in the local cache", and routing them through
+/// a remote-fetching store would silently launder a local miss into a false
+/// "present" (D15's own regression while fixing D15 itself: a deleted-then-
+/// reverified blob was wrongly reported fully cached because the seal check
+/// ran through the same lazy store used for the stub read, fetching it back
+/// from the remote instead of reporting the local miss it needed to see).
+///
+/// `push_full`/`push_scoped` (D15, design/08_stub_system.md, "Partial
+/// expansion") and `pull_full`/`pull_scoped`'s own working-tree scan pass a
+/// `LazyTreeStore` for `stub_store` (a partial-expansion directory's stub
+/// tree object may not be in the local cache after a lazy clone) and the
+/// plain local cache for `store`. `pull`/`ls`'s callers that do not scan a
+/// partial-expansion directory through this path at all are unaffected
+/// either way, since `write_blobs` is always `false` there and no `.exists()`
+/// decision in this scan runs when it is.
+pub fn scan_and_store_with_stub_store(
+    work_dir: &Path,
+    dir: &Path,
+    store: &dyn ObjectStore,
+    stub_store: &dyn ObjectStore,
     clone_root_entries: Option<&HashMap<String, TreeEntry>>,
     stat_cache: &StatCache,
     write_blobs: bool,
@@ -132,6 +185,7 @@ pub fn scan_and_store_with_cache(
     dlog_l1!("scan dir: {:?} (with stat cache)", dir);
     let cfg = FileJobConfig {
         store,
+        stub_store,
         clone_root_entries,
         stat_cache: Some(stat_cache),
         now,
@@ -157,10 +211,10 @@ pub fn scan_and_store_with_cache(
     // Without this, a scan rooted on a stubbed directory — every `ls <path>` /
     // `push <path>` landing exactly on one — would return a tree holding only the
     // on-disk entries and drop the stub-only ones.
-    let root_hash = match classify_dir_stub(dir, &rel_prefix, &mut side) {
+    let root_hash = match classify_dir_stub(dir, &rel_prefix, &mut side)? {
         DirStubKind::Full(record) => record.hash,
         DirStubKind::Partial(record) => {
-            merge_partial_expansion(&record.hash, &disk_hash, store)?.0
+            merge_partial_expansion(&record.hash, &disk_hash, stub_store, store)?.0
         }
         DirStubKind::None => disk_hash,
     };
@@ -393,17 +447,20 @@ fn scan_dir(
                     continue;
                 }
                 // Conflict helpers and the metadata sidecar (L6:
-                // `crate::commands::conflict::is_conflict_artifact`, the
-                // single shared predicate -- avoids this check and the
-                // per-path cleanup in `restore.rs` drifting out of sync, as
-                // they once did when the sidecar was missing from an older,
-                // separate copy of the suffix list) are excluded from
-                // scan/push: they are internal state consumed by `omemfs
-                // conflict accept`, not working-tree content. Only the three
-                // helper suffixes are ever tracked in `conflict_paths`
-                // (`conflict_base_name` recognises those and no others); the
-                // sidecar contributes nothing there and is simply skipped.
-                if crate::commands::conflict::is_conflict_artifact(&n) {
+                // `crate::object::is_conflict_artifact`, the single shared
+                // predicate -- avoids this check and the per-path cleanup in
+                // `restore.rs` drifting out of sync, as they once did when
+                // the sidecar was missing from an older, separate copy of
+                // the suffix list) are excluded from scan/push: they are
+                // internal state consumed by `omemfs conflict accept`, not
+                // working-tree content. Only the three helper suffixes are
+                // ever tracked in `conflict_paths` (`conflict_base_name`
+                // recognises those and no others); the sidecar contributes
+                // nothing there and is simply skipped. Defined in
+                // `object.rs` (not `commands::conflict`) so this low-level
+                // scan module does not depend on a specific command module
+                // -- see `object::is_conflict_artifact`'s own doc comment.
+                if crate::object::is_conflict_artifact(&n) {
                     if let Some(base) = conflict_base_name(&n) {
                         let rel = join_rel(rel_prefix, base);
                         side.conflict_paths.insert(rel);
@@ -509,25 +566,43 @@ fn scan_dir(
         let stub_name = format!("{}{}", name, stub::STUB_SUFFIX);
         if raw_name_set.contains(&stub_name) {
             let stub_file = dir.join(&stub_name);
-            if let Ok(s) = fs::read_to_string(&stub_file)
-                && let Ok(record) = serde_json::from_str::<stub::StubRecord>(&s)
-            {
-                // Record the stub as side data even when stale (real file
-                // present); display logic decides how to treat it.
-                side.stubs.push((rel_path.clone(), record.clone()));
-                // The real file is present iff this logical name carried a
-                // real DirEntry (set membership, no statx).
-                if real_entry.is_none() {
-                    entries.push(TreeEntry::Blob {
-                        name,
-                        hash: record.hash,
-                        mtime: record.mtime,
-                        size: record.size,
-                        mode: record.mode,
-                    });
-                    continue;
+            match read_file_stub(&stub_file) {
+                Ok(record) => {
+                    // Record the stub as side data even when stale (real file
+                    // present); display logic decides how to treat it.
+                    side.stubs.push((rel_path.clone(), record.clone()));
+                    // The real file is present iff this logical name carried a
+                    // real DirEntry (set membership, no statx).
+                    if real_entry.is_none() {
+                        entries.push(TreeEntry::Blob {
+                            name,
+                            hash: record.hash,
+                            mtime: record.mtime,
+                            size: record.size,
+                            mode: record.mode,
+                        });
+                        continue;
+                    }
+                    // Stale stub: the real file takes priority below.
                 }
-                // Stale stub: the real file takes priority below.
+                Err(e) if real_entry.is_none() => {
+                    // Fail-closed (design/08_stub_system.md, "Malformed stub
+                    // records are fail-closed"): the real file is absent, so
+                    // this marker is the ONLY record of this entry's content.
+                    // If we cannot read or parse it, treating that as "no
+                    // stub here" would make the scan see nothing at all at
+                    // this path and record it as absent, which push then
+                    // faithfully uploads as a deletion. Abort the whole scan
+                    // instead so the operator notices and repairs it.
+                    return Err(e);
+                }
+                Err(_) => {
+                    // The real file is present, so it takes priority
+                    // regardless: a stale, unreadable, or corrupt stub
+                    // sidecar next to a real file cannot cause data loss and
+                    // is simply ignored, matching the pre-existing
+                    // "real file takes priority" rule above.
+                }
             }
         }
 
@@ -578,7 +653,7 @@ fn scan_dir(
                 mtime,
             });
         } else if ftype.is_dir() {
-            match classify_dir_stub(&child, &rel_path, &mut side) {
+            match classify_dir_stub(&child, &rel_path, &mut side)? {
                 // Fully stubbed: use the recorded tree hash directly without
                 // scanning the subtree.
                 DirStubKind::Full(record) => {
@@ -785,7 +860,7 @@ fn scan_subdir(
     let entry = match &job.partial_stub_hash {
         Some(stub_hash) => {
             let (merged_hash, mtime, size, blob_count) =
-                merge_partial_expansion(stub_hash, &child_scan.hash, cfg.store)?;
+                merge_partial_expansion(stub_hash, &child_scan.hash, cfg.stub_store, cfg.store)?;
             TreeEntry::Tree {
                 name: job.name.clone(),
                 hash: merged_hash,
@@ -803,6 +878,15 @@ fn scan_subdir(
         },
     };
     Ok((SubdirEntry { entry: Some(entry) }, child_scan))
+}
+
+/// Read and parse a file-stub marker (`<name>.omemfs-stub`). Any I/O or JSON
+/// error propagates as-is; callers decide whether that is fatal (see
+/// design/08_stub_system.md, "Malformed stub records are fail-closed").
+fn read_file_stub(stub_file: &Path) -> Result<stub::StubRecord, Error> {
+    let s = fs::read_to_string(stub_file)?;
+    let record = serde_json::from_str(&s)?;
+    Ok(record)
 }
 
 /// Join a relative-path prefix with a name (`""` prefix → bare name).
@@ -859,6 +943,23 @@ struct FileJob {
 /// read-only), so a borrow may be shared across the worker threads.
 struct FileJobConfig<'a> {
     store: &'a dyn ObjectStore,
+    /// Store used ONLY to read a partial-expansion directory's `.omemfs-stub`
+    /// record (`merge_partial_expansion`'s `load_all_entries(stub_hash, ..)`
+    /// call) -- the one place in a scan that unconditionally needs a stub's
+    /// recorded tree object's *content*, which may not be in the local cache
+    /// after a lazy, stub-aware clone (D15, design/08_stub_system.md,
+    /// "Partial expansion"). Deliberately separate from `store`: `store` is
+    /// also used for `.exists()`-based decisions that must stay local-only
+    /// (`blob_fully_cached`'s sealed-blob verification, which must never
+    /// treat a locally-deleted-but-remotely-fetchable blob as "still
+    /// present"; `flatten_tree_entries_for_push`'s stub-boundary check,
+    /// which must never cross into a fully-stubbed subtree just because it
+    /// happens to be resolvable from the remote). Every push/pull caller
+    /// passes the same value here (a `LazyTreeStore`) but a DIFFERENT value
+    /// for `store` (the plain local cache) -- the two are never the same
+    /// object, even though `push`'s and `pull`'s own callers happen to
+    /// construct both from the same underlying `.omemfs/objects/` directory.
+    stub_store: &'a dyn ObjectStore,
     clone_root_entries: Option<&'a HashMap<String, TreeEntry>>,
     stat_cache: Option<&'a StatCache>,
     now: SystemTime,
@@ -1076,28 +1177,36 @@ enum DirStubKind {
 /// scan root (design/03 "Partial-expansion merge is independent of scan root").
 /// The stub is recorded as side data regardless of target type (matches stub
 /// enumeration semantics).
-fn classify_dir_stub(dir: &Path, rel_path: &str, side: &mut ScanSideData) -> DirStubKind {
+fn classify_dir_stub(
+    dir: &Path,
+    rel_path: &str,
+    side: &mut ScanSideData,
+) -> Result<DirStubKind, Error> {
     // The marker is not part of the parent level's name set, so its presence
     // requires one statx (kept to a single call).
     let dir_stub_path = dir.join(stub::DIR_STUB_NAME);
     if !dir_stub_path.is_file() {
-        return DirStubKind::None;
+        return Ok(DirStubKind::None);
     }
-    let Ok(text) = fs::read_to_string(&dir_stub_path) else {
-        return DirStubKind::None;
-    };
-    let Ok(record) = serde_json::from_str::<stub::StubRecord>(&text) else {
-        return DirStubKind::None;
-    };
+    // Fail-closed (design/08_stub_system.md, "Malformed stub records are
+    // fail-closed"): the marker existing means the real directory content is
+    // absent from the working tree by definition. If we cannot read or parse
+    // it, treating that as "no stub here" would make the scan see nothing at
+    // all here and record the path as absent, which push then faithfully
+    // uploads as a deletion -- silently destroying the remote's copy of
+    // content that in truth still exists, only its local marker is damaged.
+    // Abort the whole scan instead so the operator notices and repairs it.
+    let text = fs::read_to_string(&dir_stub_path)?;
+    let record: stub::StubRecord = serde_json::from_str(&text)?;
     side.stubs.push((rel_path.to_string(), record.clone()));
     if record.target_type != stub::StubTargetType::Tree {
-        return DirStubKind::None;
+        return Ok(DirStubKind::None);
     }
-    if dir_has_real_children(dir) {
+    Ok(if dir_has_real_children(dir) {
         DirStubKind::Partial(record)
     } else {
         DirStubKind::Full(record)
-    }
+    })
 }
 
 /// Returns true if `dir` contains any entry other than the directory stub
@@ -1118,12 +1227,18 @@ fn dir_has_real_children(dir: &Path) -> bool {
 /// On-disk entries take priority over same-name entries recorded in the stub;
 /// stub entries are kept for names not present on disk. The merged tree is
 /// stored as a new object. Returns `(merged_hash, mtime, size, blob_count)`.
+/// `stub_hash` (the stub's recorded tree) is read through `stub_store`, which
+/// may fetch from the remote on a local miss (D15: a lazy clone never
+/// downloaded it). `disk_hash` (this scan's own freshly-built subtree) is
+/// always already local, so it is read through the plain `store` -- and the
+/// merged result is written through `store` too.
 fn merge_partial_expansion(
     stub_hash: &Hash,
     disk_hash: &Hash,
+    stub_store: &dyn ObjectStore,
     store: &dyn ObjectStore,
 ) -> Result<(Hash, Option<chrono::DateTime<chrono::Utc>>, u64, u64), Error> {
-    let stub_entries = crate::tree_ops::load_all_entries(stub_hash, store)?;
+    let stub_entries = crate::tree_ops::load_all_entries(stub_hash, stub_store)?;
     let disk_entries = crate::tree_ops::load_all_entries(disk_hash, store)?;
     let disk_names: HashSet<String> = disk_entries.iter().map(|e| e.name().to_string()).collect();
     let mut merged: Vec<TreeEntry> = disk_entries;
@@ -1229,7 +1344,7 @@ pub fn is_reserved_name(name: &str) -> bool {
 /// design/09_reserved_names.md.
 pub fn is_known_reserved_name(name: &str) -> bool {
     stub::is_stub_filename(name)
-        || crate::commands::conflict::is_conflict_artifact(name)
+        || crate::object::is_conflict_artifact(name)
         || name == ".omemfs-filter"
 }
 
@@ -1244,7 +1359,7 @@ pub fn is_unknown_reserved_name(name: &str) -> bool {
 /// Strip a conflict-helper suffix from a filename, returning the base name.
 /// Returns `None` if the name is not a conflict helper file.
 pub fn conflict_base_name(name: &str) -> Option<&str> {
-    crate::commands::conflict::CONFLICT_SUFFIXES
+    crate::object::CONFLICT_SUFFIXES
         .iter()
         .find_map(|suffix| name.strip_suffix(suffix))
 }
@@ -2180,6 +2295,295 @@ mod tests {
         assert!(
             store.exists(&victim).unwrap(),
             "the missing chunk must have been recaptured by the full re-read"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Partial-expansion merge through a read-through (lazy) store (D15)
+    // -----------------------------------------------------------------------
+
+    /// Build a `(PackWriter, PackReader)` pair over a fresh temp-dir "remote",
+    /// mirroring `tree_ops::tests::setup_pack` (not reusable across modules
+    /// since it is private there): the writer publishes objects into the same
+    /// on-disk remote the reader (and, through it, a `LazyTreeStore`) reads
+    /// from.
+    fn setup_pack(
+        tmp: &Path,
+    ) -> (
+        crate::codec::pack::writer::PackWriter,
+        crate::codec::pack::reader::PackReader,
+        LocalStore,
+    ) {
+        use crate::codec::pack::reader::PackReader;
+        use crate::codec::pack::root_pointer::LocalRootPointer;
+        use crate::codec::pack::writer::PackWriter;
+
+        let base = tmp.to_path_buf();
+        fs::create_dir_all(base.join("objects")).unwrap();
+        fs::create_dir_all(base.join("tmp")).unwrap();
+
+        let local_cache_dir = base.join("local_cache");
+        fs::create_dir_all(&local_cache_dir).unwrap();
+        let packcache_dir = base.join("packcache");
+        fs::create_dir_all(&packcache_dir).unwrap();
+        let objcache_dir = base.join("objcache");
+        fs::create_dir_all(&objcache_dir).unwrap();
+        let writer_objcache_dir = base.join("writer_objcache");
+        fs::create_dir_all(&writer_objcache_dir).unwrap();
+
+        let writer = PackWriter::new(
+            Box::new(LocalStore::for_remote(&base)),
+            Box::new(LocalRootPointer::new(base.clone(), None)),
+            LocalStore::for_cache(&writer_objcache_dir),
+            None,
+        )
+        .unwrap();
+
+        let local_cache = LocalStore::for_cache(&local_cache_dir);
+        let reader = PackReader::new(
+            Box::new(LocalStore::for_remote(&base)),
+            local_cache.clone(),
+            LocalStore::for_cache(&packcache_dir),
+            LocalStore::for_cache(&objcache_dir),
+            Box::new(LocalRootPointer::new(base.clone(), None)),
+            None,
+        );
+
+        (writer, reader, local_cache)
+    }
+
+    /// Publish a tree object containing one blob entry (`orig.txt`) to the
+    /// "remote" only -- never to the local cache -- mirroring a stubbed
+    /// directory's tree object after a lazy, stub-aware clone (design/08
+    /// "Stub threshold": the object is never downloaded when the whole
+    /// directory is stubbed as a unit).
+    fn publish_remote_only_stub_tree(
+        writer: &mut crate::codec::pack::writer::PackWriter,
+    ) -> Hash {
+        let orig_content = b"original stubbed content";
+        let orig_hash = Hash::compute(orig_content);
+        let entries = vec![TreeEntry::Blob {
+            name: "orig.txt".to_string(),
+            hash: orig_hash,
+            mtime: None,
+            size: orig_content.len() as u64,
+            mode: None,
+        }];
+        let tree = crate::object::Tree::Normal { entries };
+        let bytes = tree.serialise();
+        let tree_hash = Hash::compute(&bytes);
+        writer
+            .write_from(&tree_hash, &mut std::io::Cursor::new(bytes))
+            .unwrap();
+        writer.finish(&Hash::compute(b"root")).unwrap();
+        tree_hash
+    }
+
+    /// D15 regression: a partial-expansion directory (a `.omemfs-stub` marker
+    /// coexisting with a real file the user added directly inside it -- design/08
+    /// "Partial expansion") whose recorded stub tree object was never fetched to
+    /// the local cache must still scan successfully when the store passed to
+    /// `scan_and_store_with_cache` is a `LazyTreeStore`: the merge reads the
+    /// stub's recorded tree through the read-through store, healing the miss
+    /// from the "remote" on demand.
+    #[test]
+    fn scan_partial_expansion_merges_through_lazy_tree_store() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pack_dir = tmp.path().join("pack");
+        fs::create_dir_all(&pack_dir).unwrap();
+        let (mut writer, reader, local) = setup_pack(&pack_dir);
+        let stub_tree_hash = publish_remote_only_stub_tree(&mut writer);
+        assert!(
+            !local.exists(&stub_tree_hash).unwrap(),
+            "the stub's recorded tree object must be absent locally, mirroring a \
+             stubbed directory never fetched by a lazy clone"
+        );
+
+        let work_dir = tempfile::TempDir::new().unwrap();
+        let sub = work_dir.path().join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        stub::write_dir_stub(
+            work_dir.path(),
+            "sub",
+            &stub::StubRecord {
+                target_type: stub::StubTargetType::Tree,
+                hash: stub_tree_hash.clone(),
+                size: 25,
+                mtime: None,
+                mode: None,
+                blob_count: 1,
+            },
+        )
+        .unwrap();
+        fs::write(sub.join("new.txt"), b"new local content").unwrap();
+
+        let lazy = tree_ops::LazyTreeStore::new(&local, &reader, None);
+        let result = scan_and_store_with_cache(
+            work_dir.path(),
+            work_dir.path(),
+            &lazy,
+            None,
+            &StatCache::default(),
+            true,
+        )
+        .expect(
+            "scanning a partial-expansion directory through a LazyTreeStore must \
+             succeed by fetching the stub's tree object on demand",
+        );
+
+        let entries = tree_ops::load_all_entries(&result.root_hash, &lazy).unwrap();
+        let sub_entry = entries
+            .iter()
+            .find(|e| e.name() == "sub")
+            .expect("sub/ must appear in the merged root");
+        let sub_hash = sub_entry.hash().expect("sub/ is a tree entry").clone();
+        let merged_entries = tree_ops::load_all_entries(&sub_hash, &lazy).unwrap();
+        let names: std::collections::HashSet<&str> =
+            merged_entries.iter().map(|e| e.name()).collect();
+        assert_eq!(
+            names,
+            std::collections::HashSet::from(["orig.txt", "new.txt"]),
+            "the merged tree must contain both the stub-recorded entry and the \
+             real on-disk file"
+        );
+
+        assert!(
+            local.exists(&stub_tree_hash).unwrap(),
+            "the fetched stub tree object must be cached locally afterward"
+        );
+    }
+
+    /// Negative control for the above: the identical scenario, but scanned
+    /// with a bare `&LocalStore` (no fetch capability) instead of a
+    /// `LazyTreeStore`, must fail with `ObjectNotFound` -- pinning the D15 bug
+    /// itself so a future regression in the fix is caught by this test, not
+    /// just by the positive case silently starting to pass for an unrelated
+    /// reason.
+    #[test]
+    fn scan_partial_expansion_fails_without_lazy_tree_store() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pack_dir = tmp.path().join("pack");
+        fs::create_dir_all(&pack_dir).unwrap();
+        let (mut writer, _reader, local) = setup_pack(&pack_dir);
+        let stub_tree_hash = publish_remote_only_stub_tree(&mut writer);
+
+        let work_dir = tempfile::TempDir::new().unwrap();
+        let sub = work_dir.path().join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        stub::write_dir_stub(
+            work_dir.path(),
+            "sub",
+            &stub::StubRecord {
+                target_type: stub::StubTargetType::Tree,
+                hash: stub_tree_hash,
+                size: 25,
+                mtime: None,
+                mode: None,
+                blob_count: 1,
+            },
+        )
+        .unwrap();
+        fs::write(sub.join("new.txt"), b"new local content").unwrap();
+
+        let result = scan_and_store_with_cache(
+            work_dir.path(),
+            work_dir.path(),
+            &local,
+            None,
+            &StatCache::default(),
+            true,
+        );
+        let is_object_not_found = matches!(result, Err(Error::ObjectNotFound(_)));
+        assert!(
+            is_object_not_found,
+            "a raw LocalStore (no fetch capability) must fail with ObjectNotFound \
+             when the stub's recorded tree object is not locally cached, got: {:?}",
+            result.map(|r| r.root_hash).map_err(|e| e.to_string())
+        );
+    }
+
+    /// Regression pin for a defect found while fixing D15 itself: passing the
+    /// SAME `LazyTreeStore` for both `store` and `stub_store` to
+    /// `scan_and_store_with_stub_store` (rather than a plain local `store`
+    /// with only `stub_store` remote-fetching) breaks `blob_fully_cached`'s
+    /// sealed-blob verification, which must answer "is this object *locally*
+    /// present" -- a locally-deleted-but-remotely-fetchable blob must be
+    /// recaptured, not silently accepted as still cached because the
+    /// verification read was able to fetch it back from the "remote".
+    ///
+    /// Mirrors `clone_root_fallback_missing_blob_is_staged_and_cached` (the
+    /// existing non-lazy version of this same invariant) but adds a
+    /// `LazyTreeStore` as `stub_store` alongside the plain local `store`,
+    /// exactly like `push_full`/`push_scoped` now construct both -- proving
+    /// the split is what matters, not merely that a `LazyTreeStore` is absent.
+    #[test]
+    fn scan_seal_check_stays_local_only_even_with_a_lazy_stub_store() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pack_dir = tmp.path().join("pack");
+        fs::create_dir_all(&pack_dir).unwrap();
+        let (mut writer, reader, local) = setup_pack(&pack_dir);
+
+        let work_dir = tempfile::TempDir::new().unwrap();
+        let work = work_dir.path();
+        let content = b"hello world";
+        fs::write(work.join("a.txt"), content).unwrap();
+        let old_secs: i64 = 1_000_000_000;
+        let ft = filetime::FileTime::from_unix_time(old_secs, 0);
+        filetime::set_file_mtime(work.join("a.txt"), ft).unwrap();
+
+        // The blob is fetchable from the "remote" (mirroring a blob that was
+        // pushed once, then deleted from the local cache -- exactly the bats
+        // scenario this pins) but is NOT in the local cache.
+        let hash = crate::object::blob_hash(content);
+        writer
+            .write_from(&hash, &mut std::io::Cursor::new(content.to_vec()))
+            .unwrap();
+        writer.finish(&Hash::compute(b"root")).unwrap();
+        assert!(
+            !local.exists(&hash).unwrap(),
+            "the blob must be absent from the local cache, mirroring a \
+             deleted-then-reverified blob"
+        );
+
+        let mtime = Utc.timestamp_opt(old_secs, 0).single();
+        let mut clone_root: HashMap<String, TreeEntry> = HashMap::new();
+        clone_root.insert(
+            "a.txt".to_string(),
+            TreeEntry::Blob {
+                name: "a.txt".to_string(),
+                hash: hash.clone(),
+                mtime,
+                size: content.len() as u64,
+                mode: None,
+            },
+        );
+
+        // An unrelated `stub_store` (a `LazyTreeStore` that CAN fetch from
+        // the "remote") is passed alongside the plain local `store`. The
+        // seal check (`blob_fully_cached`) must still see the local miss.
+        let lazy = tree_ops::LazyTreeStore::new(&local, &reader, None);
+        let result = scan_and_store_with_stub_store(
+            work,
+            work,
+            &local,
+            &lazy,
+            Some(&clone_root),
+            &StatCache::default(),
+            true,
+        )
+        .unwrap();
+
+        let scanned = result.files.get("a.txt").expect("a.txt scanned");
+        assert!(
+            !scanned.fallback_hit,
+            "a locally-missing blob must be recaptured (full store_file_snapshot), \
+             not accepted as a metadata-only fallback just because stub_store could \
+             have fetched it from the remote"
+        );
+        assert_eq!(scanned.hash, hash);
+        assert!(
+            local.exists(&hash).unwrap(),
+            "the recaptured blob must now be staged in the local cache"
         );
     }
 }

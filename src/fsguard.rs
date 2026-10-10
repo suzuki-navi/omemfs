@@ -803,6 +803,74 @@ pub fn remove_dir_all(work_dir: &Path, abs_dir: &Path, keep: &[&str]) -> Result<
     dir.remove_contents_all(keep)
 }
 
+/// Remove `abs_dir` if it exists, is a real (symlink-free) directory, and is
+/// empty. Every component from `work_dir` down to (and including) `abs_dir`
+/// is verified symlink-free by `resolve_dir`/`rmdir`'s underlying `openat`
+/// calls, so this never follows a symlinked ancestor to remove a directory
+/// outside `work_dir`.
+///
+/// Tolerant by design (mirroring `remove_file_tolerant`'s "nothing to do is
+/// not an error" policy): a missing `abs_dir`, `abs_dir == work_dir`, or a
+/// non-empty directory all return `Ok(false)` rather than an error -- the
+/// caller (conflict-resolution directory pruning, design/03_sync_model.md
+/// "Pruning directories emptied by conflict resolution") walks an ancestor
+/// chain and simply stops once a directory turns out to still have content,
+/// which is the expected, non-exceptional way that walk ends. A `abs_dir`
+/// that is not a directory at all (e.g. a plain file) is likewise `Ok(false)`
+/// -- there is nothing this function is asked to remove. Returns `Ok(true)`
+/// only when `abs_dir` itself was actually removed.
+pub fn remove_dir_if_empty(work_dir: &Path, abs_dir: &Path) -> Result<bool, Error> {
+    let rel = to_rel_string(work_dir, abs_dir)?;
+    if rel.is_empty() {
+        // Never remove work_dir itself.
+        return Ok(false);
+    }
+    let (dir_rel, leaf) = match rel.rfind('/') {
+        Some(idx) => (&rel[..idx], &rel[idx + 1..]),
+        None => ("", rel.as_str()),
+    };
+    validate_component(leaf)?;
+    let parent = match resolve_dir(work_dir, dir_rel, false) {
+        Ok(d) => d,
+        // A missing ancestor directory means abs_dir cannot exist either.
+        Err(Error::Io(e)) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    // Confirm `leaf` is still a real, symlink-free directory (not a file, and
+    // not a symlink swapped in since the caller last looked) before removing
+    // it -- the same lstat-based check `is_real_dir` uses, so a symlink at
+    // `leaf` is refused rather than silently skipped or followed.
+    match parent.lstat_mode(leaf) {
+        Ok(mode) => {
+            let file_type = mode & libc::S_IFMT as u32;
+            if file_type == libc::S_IFLNK as u32 {
+                return Err(Error::SymlinkEscape(parent.abs(leaf).display().to_string()));
+            }
+            if file_type != libc::S_IFDIR as u32 {
+                return Ok(false);
+            }
+        }
+        Err(Error::Io(e)) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    }
+    match parent.rmdir(leaf) {
+        Ok(()) => Ok(true),
+        // ENOTEMPTY (via io::ErrorKind::DirectoryNotEmpty, or its raw errno
+        // on platforms/Rust versions where that ErrorKind variant is not yet
+        // classified) means there is still content in it -- expected, not an
+        // error. A concurrent removal (NotFound) is equally a non-error: the
+        // directory is gone either way.
+        Err(Error::Io(e))
+            if e.kind() == io::ErrorKind::NotFound
+                || e.kind() == io::ErrorKind::DirectoryNotEmpty
+                || e.raw_os_error() == Some(libc::ENOTEMPTY) =>
+        {
+            Ok(false)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1358,5 +1426,88 @@ mod tests {
         let err =
             remove_dir_all(work_dir.path(), &work_dir.path().join("nope"), &[]).unwrap_err();
         assert!(matches!(err, Error::Io(_)), "got {err:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // remove_dir_if_empty
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn remove_dir_if_empty_removes_an_empty_directory() {
+        let work_dir = TempDir::new().unwrap();
+        let target = work_dir.path().join("target");
+        fs::create_dir_all(&target).unwrap();
+
+        let removed = remove_dir_if_empty(work_dir.path(), &target).unwrap();
+        assert!(removed, "an empty directory must be reported as removed");
+        assert!(!target.exists(), "the directory must actually be gone");
+    }
+
+    #[test]
+    fn remove_dir_if_empty_leaves_a_non_empty_directory_untouched() {
+        let work_dir = TempDir::new().unwrap();
+        let target = work_dir.path().join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("still-here.txt"), b"content").unwrap();
+
+        let removed = remove_dir_if_empty(work_dir.path(), &target).unwrap();
+        assert!(!removed, "a non-empty directory must not be reported as removed");
+        assert!(target.is_dir(), "the directory must still exist");
+        assert!(target.join("still-here.txt").exists());
+    }
+
+    #[test]
+    fn remove_dir_if_empty_on_a_missing_directory_is_a_tolerant_noop() {
+        let work_dir = TempDir::new().unwrap();
+        let removed =
+            remove_dir_if_empty(work_dir.path(), &work_dir.path().join("nope")).unwrap();
+        assert!(!removed);
+    }
+
+    #[test]
+    fn remove_dir_if_empty_on_a_plain_file_is_a_tolerant_noop() {
+        let work_dir = TempDir::new().unwrap();
+        let target = work_dir.path().join("target.txt");
+        fs::write(&target, b"a plain file, not a directory").unwrap();
+
+        let removed = remove_dir_if_empty(work_dir.path(), &target).unwrap();
+        assert!(!removed);
+        assert!(target.is_file(), "the file must be untouched");
+    }
+
+    #[test]
+    fn remove_dir_if_empty_refuses_work_dir_itself() {
+        let work_dir = TempDir::new().unwrap();
+        let removed = remove_dir_if_empty(work_dir.path(), work_dir.path()).unwrap();
+        assert!(!removed);
+        assert!(work_dir.path().is_dir());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn remove_dir_if_empty_rejects_a_symlink_at_the_target() {
+        let work_dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let target = work_dir.path().join("link");
+        std::os::unix::fs::symlink(outside.path(), &target).unwrap();
+
+        let err = remove_dir_if_empty(work_dir.path(), &target).unwrap_err();
+        assert!(matches!(err, Error::SymlinkEscape(_)), "got {err:?}");
+        assert!(
+            outside.path().is_dir(),
+            "the symlink target must survive untouched"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn remove_dir_if_empty_rejects_symlinked_intermediate_component() {
+        let work_dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), work_dir.path().join("sub")).unwrap();
+
+        let err = remove_dir_if_empty(work_dir.path(), &work_dir.path().join("sub/child"))
+            .unwrap_err();
+        assert!(matches!(err, Error::SymlinkEscape(_)), "got {err:?}");
     }
 }

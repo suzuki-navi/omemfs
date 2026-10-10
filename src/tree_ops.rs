@@ -115,14 +115,47 @@ pub fn navigate_entry(
     }
 }
 
+/// Read a tree object for an expected hash, verifying that the fetched bytes
+/// actually hash to it before parsing or returning anything.
+///
+/// Untrusted-remote validation (see design/01_object_model.md, Invariant 6):
+/// every caller of this function already holds the hash it expects *before*
+/// reading the object (from a parent tree entry, `clone_root`/`remote_root`,
+/// or a caller-supplied ref). On an unencrypted remote there is no GCM tag
+/// protecting the plaintext, so a corrupted or hostile remote object stored
+/// at the expected key could otherwise be silently parsed and trusted even
+/// though its content does not hash to that key. This recomputes
+/// `hash(tree) = SHA256(0xED F1 | tree JSON bytes)` over the raw bytes
+/// `codec::store_read` returns (which retain the `ED F1` prefix,
+/// see `object::Tree::serialise`) and rejects a mismatch with
+/// `Error::InvalidObject` before `Tree::deserialise` ever sees the content.
+///
+/// This is the single point `find_entry_in_tree` and `load_all_entries` read
+/// a tree object's raw bytes through, so every higher-level tree traversal
+/// built on them is covered. Scoped to tree objects only -- see
+/// design/01_object_model.md, Invariant 6, for why blob/chunk content is out
+/// of scope for this check.
+fn read_tree(hash: &Hash, store: &dyn ObjectStore) -> Result<Tree, Error> {
+    let data = codec::store_read(store, hash, None)?;
+    let computed = Hash::compute(&data);
+    if computed != *hash {
+        return Err(Error::InvalidObject(format!(
+            "tree object hash mismatch: expected {}, computed {} \
+             (remote data may be corrupted or tampered)",
+            hash.as_str(),
+            computed.as_str()
+        )));
+    }
+    Tree::deserialise(&data)
+}
+
 /// Find a single entry by name in a tree.
 pub fn find_entry_in_tree(
     tree_hash: &Hash,
     name: &str,
     store: &dyn ObjectStore,
 ) -> Result<Option<TreeEntry>, Error> {
-    let data = codec::store_read(store, tree_hash, None)?;
-    let Tree::Normal { entries } = Tree::deserialise(&data)?;
+    let Tree::Normal { entries } = read_tree(tree_hash, store)?;
     Ok(entries.into_iter().find(|e| e.name() == name))
 }
 
@@ -286,8 +319,7 @@ pub(crate) fn load_all_entries(
     if let Some(cached) = tree_cache_get(hash) {
         return Ok((*cached).clone());
     }
-    let data = codec::store_read(store, hash, None)?;
-    let Tree::Normal { entries } = Tree::deserialise(&data)?;
+    let Tree::Normal { entries } = read_tree(hash, store)?;
     tree_cache_put(hash, &entries);
     Ok(entries)
 }
@@ -452,6 +484,19 @@ pub fn flatten_tree_entries_scoped(
 }
 
 /// Scoped push variant retaining tree entries inside the selected subtree.
+///
+/// D15: like [`flatten_into_for_push`]'s own recursive step, the FIRST
+/// descent (into `rel`'s own subtree) must not cross the stub boundary
+/// either -- `rel` itself can legitimately be a whole-stubbed directory whose
+/// tree object was never downloaded by a lazy clone (design/08_stub_system.md,
+/// "Stub threshold"), and a map miss here is always safe (see this
+/// function's own doc comment above): the scan simply re-hashes instead of
+/// using the pre-filter. Before this guard, scoping a push directly at a
+/// stubbed directory (`omemfs push <stubbed-dir>`) unconditionally tried to
+/// read that directory's tree object and failed with `ObjectNotFound`, while
+/// an ancestor-scoped or whole-tree push of the same content never hit this
+/// path at all (`flatten_into_for_push`'s recursive guard already protected
+/// it) -- an asymmetry between the two entry points into the same flatten.
 pub fn flatten_tree_entries_scoped_for_push(
     root_hash: &Hash,
     rel: &str,
@@ -465,7 +510,9 @@ pub fn flatten_tree_entries_scoped_for_push(
         Some(entry @ crate::object::TreeEntry::Tree { .. }) => {
             let child_hash = entry.hash().cloned().expect("tree has hash");
             map.insert(rel.to_string(), entry);
-            flatten_into_for_push(&child_hash, rel, store, &mut map)?;
+            if store.exists(&child_hash)? {
+                flatten_into_for_push(&child_hash, rel, store, &mut map)?;
+            }
         }
         Some(entry) => {
             map.insert(rel.to_string(), entry);
@@ -721,6 +768,89 @@ mod tests {
         let data = crate::codec::store_read(&store, &hash, None).unwrap();
         let tree = Tree::deserialise(&data).unwrap();
         assert!(matches!(tree, Tree::Normal { .. }));
+    }
+
+    // Security regression: a tree object fetched from the remote must have
+    // its hash re-verified before its content is trusted (design/01
+    // "Invariants" #6). On an unencrypted remote there is no GCM tag
+    // protecting the plaintext, so a corrupted/tampered object stored under
+    // hash1 but whose actual bytes hash to something else must be rejected,
+    // not silently parsed and returned as if it were the object the caller
+    // asked for.
+    //
+    // Simulates tampering by writing a *different* tree's encoded bytes
+    // directly under `hash1` via the raw `ObjectStore::write_from` (bypassing
+    // `codec::store_write`'s "skip if exists" and content-addressing, exactly
+    // as a hostile/corrupted remote object store would appear to a reader:
+    // present at the expected key, wrong content).
+    fn tamper_tree_at(store: &MemStore, hash: &Hash, replacement_entries: Vec<TreeEntry>) {
+        let replacement_bytes = Tree::Normal {
+            entries: replacement_entries,
+        }
+        .serialise();
+        let encoded = crate::codec::encode(&replacement_bytes, None, hash.as_bytes_array());
+        store
+            .write_from(hash, &mut std::io::Cursor::new(encoded))
+            .unwrap();
+    }
+
+    #[test]
+    fn load_all_entries_rejects_tampered_tree_bytes() {
+        let store = MemStore::new();
+        let entries: Vec<TreeEntry> = (0..3)
+            .map(|i| make_blob_entry(&format!("file{}", i)))
+            .collect();
+        let hash = build_and_store(entries, &store).unwrap();
+
+        // Sanity: the untampered object loads fine.
+        assert!(load_all_entries(&hash, &store).is_ok());
+
+        // Overwrite the stored bytes at the same hash with a different tree's
+        // content -- the hash the caller holds (`hash`) no longer matches
+        // what is actually stored.
+        tamper_tree_at(&store, &hash, vec![make_blob_entry("different-content")]);
+
+        let result = load_all_entries(&hash, &store);
+        assert!(
+            result.is_err(),
+            "load_all_entries must reject tree bytes that do not hash to the requested hash"
+        );
+    }
+
+    #[test]
+    fn find_entry_in_tree_rejects_tampered_tree_bytes() {
+        let store = MemStore::new();
+        let entries: Vec<TreeEntry> = vec![make_blob_entry("target")];
+        let hash = build_and_store(entries, &store).unwrap();
+
+        // Sanity: the untampered object is found fine.
+        assert!(find_entry_in_tree(&hash, "target", &store).unwrap().is_some());
+
+        tamper_tree_at(&store, &hash, vec![make_blob_entry("different-content")]);
+
+        let result = find_entry_in_tree(&hash, "target", &store);
+        assert!(
+            result.is_err(),
+            "find_entry_in_tree must reject tree bytes that do not hash to the requested hash"
+        );
+    }
+
+    #[test]
+    fn read_tree_rejects_tampered_tree_bytes() {
+        let store = MemStore::new();
+        let entries: Vec<TreeEntry> = vec![make_blob_entry("a")];
+        let hash = build_and_store(entries, &store).unwrap();
+
+        // Sanity: the untampered object reads fine.
+        assert!(read_tree(&hash, &store).is_ok());
+
+        tamper_tree_at(&store, &hash, vec![make_blob_entry("b")]);
+
+        let result = read_tree(&hash, &store);
+        assert!(
+            result.is_err(),
+            "read_tree must reject tree bytes that do not hash to the requested hash"
+        );
     }
 
     // build_and_store must skip encode+write when the object already exists.

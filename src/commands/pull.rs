@@ -15,12 +15,12 @@ use crate::io_stats;
 use crate::line_merge::{self, MergeOutcome};
 use crate::object::{Hash, Tree, TreeEntry};
 use crate::repo::Repo;
-use crate::scan::{refresh_stat_cache, scan_and_store_with_cache};
+use crate::scan::{refresh_stat_cache, scan_and_store_with_stub_store};
 use crate::stat_cache::StatCache;
 use crate::store::ObjectStore;
 use crate::store::local::LocalStore;
 use crate::store::stats::IoRecord;
-use crate::stub::{self, StubRecord};
+use crate::stub::{self, StubRecord, StubTargetType};
 use crate::term::{Output, Styles, paint};
 use crate::tree_ops;
 use crate::tree_ops::LazyTreeStore;
@@ -58,7 +58,7 @@ pub fn run(opts: PullOptions) -> Result<(), Error> {
         Arc::clone(&io_record),
     );
     if result.is_ok() && !opts.dry_run {
-        let omemfs_dir = repo.work_dir.join(".omemfs");
+        let omemfs_dir = repo.omemfs_dir();
         let duration_ms = started.elapsed().as_millis() as u64;
         io_stats::append_record(&omemfs_dir, "pull", remote_name, &io_record, duration_ms);
     }
@@ -83,7 +83,7 @@ fn pull_full(
     // Post-clone sync guard (origin only): an absent index root with a synced
     // clone_root is a hard error (design/03).
     let index_root = pack_reader.read_index_root()?;
-    crate::commands::push::post_clone_sync_guard(clone_root.as_ref(), index_root.is_some())?;
+    crate::commands::transfer::post_clone_sync_guard(clone_root.as_ref(), index_root.is_some())?;
 
     let remote_root = match index_root.and_then(|ir| ir.remote_root_hash()) {
         None => {
@@ -129,15 +129,25 @@ fn pull_full(
     let clone_root_flat = clone_root
         .as_ref()
         .and_then(|h| flatten_clone_root_present(h, &repo.work_dir, &lazy).ok());
-    let omemfs_dir = repo.work_dir.join(".omemfs");
+    let omemfs_dir = repo.omemfs_dir();
     let stat_cache = StatCache::read(&omemfs_dir);
     let working_hash = {
         let phase = crate::progress::begin_phase("Scan working tree");
         let _t = dtimer_l1!("scan working tree");
-        let scan_result = scan_and_store_with_cache(
+        // `stub_store: &lazy`: a partial-expansion directory's `.omemfs-stub`
+        // record (design/08_stub_system.md, "Partial expansion") names a
+        // clone-root-rooted tree object that may not be in the local cache
+        // after a lazy clone (the whole directory was stubbed as a unit) --
+        // the same gap `clone_root_flat` above is already routed through
+        // `lazy` to cover. `store: &local` keeps every `.exists()`-based
+        // decision in this scan strictly local-only (see
+        // `scan_and_store_with_stub_store`'s doc comment for why the two
+        // must never simply be the same value).
+        let scan_result = scan_and_store_with_stub_store(
             &repo.work_dir,
             &repo.work_dir,
             &local,
+            &lazy,
             clone_root_flat.as_ref(),
             &stat_cache,
             false,
@@ -240,6 +250,12 @@ fn pull_full(
 
     repo.write_clone_root(&remote_root)?;
 
+    // Stub reconcile (design/08_stub_system.md, "Stub reconcile (pull and
+    // restore)"): run only after clone_root has actually advanced above --
+    // never while a conflict is outstanding (this point is unreached in that
+    // case; see the `Err(Error::Conflict)` return earlier in this function).
+    reconcile_stubs(&remote_root, &repo.work_dir, &repo.work_dir, &local)?;
+
     {
         let mut out = Output::for_stdout();
         let colored = out.colored();
@@ -303,14 +319,14 @@ fn pull_scoped(
         return pull_full(repo, remote_name, dry_run, stub_threshold, io_record);
     }
 
-    rels = crate::commands::push::deduplicate_paths(rels);
+    rels = crate::commands::transfer::deduplicate_paths(rels);
 
     let local = repo.local_store();
     let (pack_reader, _remote, remote_key) = repo.pack_reader(remote_name, Some(&io_record))?;
 
     let clone_root = repo.read_clone_root()?;
     let index_root = pack_reader.read_index_root()?;
-    crate::commands::push::post_clone_sync_guard(clone_root.as_ref(), index_root.is_some())?;
+    crate::commands::transfer::post_clone_sync_guard(clone_root.as_ref(), index_root.is_some())?;
 
     let remote_root = match index_root.and_then(|ir| ir.remote_root_hash()) {
         None => {
@@ -349,7 +365,7 @@ fn pull_scoped(
     let clone_root_flat = clone_root
         .as_ref()
         .and_then(|h| flatten_clone_root_present(h, &repo.work_dir, &lazy).ok());
-    let omemfs_dir = repo.work_dir.join(".omemfs");
+    let omemfs_dir = repo.omemfs_dir();
     // STAT_CACHE is read once in full (not per-path scoped, unlike push's
     // single-path `read_scoped`) and written back once at the end from the
     // union of every path's scan results (refactor-instructions.md Phase 8
@@ -376,9 +392,28 @@ fn pull_scoped(
         // `navigate` returns a blob hash for a file leaf. Diffing that hash as
         // a tree attempts to parse file content as JSON, so compare leaf entries
         // through one-entry wrapper trees instead.
-        let is_leaf = !matches!(remote_scoped_entry.as_ref(), Some(TreeEntry::Tree { .. }))
-            && !matches!(clone_scoped_entry.as_ref(), Some(TreeEntry::Tree { .. }))
-            && (remote_scoped_entry.is_some() || clone_scoped_entry.is_some());
+        //
+        // A leaf scope is selected whenever at least one EXISTING side (remote
+        // or clone-root) is not a Tree -- not only when BOTH existing sides
+        // agree on being non-Tree (design/03_sync_model.md, "Leaf-scope type
+        // changes"). This also covers a type change AT the scope root itself
+        // (e.g. a pushed file replaced by a directory of the same name, or
+        // vice versa): one side navigates to a Blob/Symlink entry, the other
+        // to a Tree entry. Requiring agreement between the two sides would
+        // send that Tree side down the plain `navigate` (hash-only) path
+        // below, and diffing a blob hash as if it were a tree hash fails
+        // (`tree object hash mismatch`, since `diff_recursive`/`load_all_entries`
+        // read every `base`/`target` hash as a tree object unconditionally).
+        // Wrapping both sides in a one-entry tree here, as an ordinary leaf
+        // would be, hands the type change to the same tree-diff type-change
+        // rule ("Diff algorithm") that already applies at any other depth.
+        let is_leaf = matches!(
+            remote_scoped_entry,
+            Some(TreeEntry::Blob { .. }) | Some(TreeEntry::Symlink { .. })
+        ) || matches!(
+            clone_scoped_entry,
+            Some(TreeEntry::Blob { .. }) | Some(TreeEntry::Symlink { .. })
+        );
         let remote_scoped_hash = if is_leaf {
             remote_scoped_entry
                 .as_ref()
@@ -437,19 +472,73 @@ fn pull_scoped(
         // (refactor-instructions.md Phase 8 E7 scan-scope fix). Matches
         // pull_scoped's per-path scan below.
         let scoped_abs = repo.work_dir.join(rel);
+        // `is_leaf` reflects the remote/clone-root sides' kinds, not what is
+        // actually on disk here -- a leaf-scope type change (design/03,
+        // "Leaf-scope type changes") may still have the OLD kind on disk
+        // locally (e.g. the working tree still has a real directory at
+        // `<path>` when the remote replaced it with a file, and this pull
+        // has not been run yet). `scan_file_as_tree` would try to open that
+        // directory as a file and fail with EISDIR, so branch on the actual
+        // on-disk entity kind here, independent of `is_leaf`, and wrap either
+        // result in the same one-entry synthetic tree so it compares against
+        // `clone_scoped_hash`/`remote_scoped_hash` (both wrapped the same way
+        // whenever `is_leaf` is true).
+        // `symlink_metadata` (not `is_dir`, which follows a symlink target)
+        // so a symlink pointing at a directory is still routed through
+        // `scan_file_as_tree` below, which itself branches on
+        // `file_type().is_symlink()` -- matching the non-type-changed leaf
+        // path's existing symlink handling exactly.
+        let scoped_is_dir = fs::symlink_metadata(&scoped_abs)
+            .map(|md| md.is_dir())
+            .unwrap_or(false);
         let working_scoped_hash = if scoped_abs.exists() {
-            if is_leaf {
+            if is_leaf && !scoped_is_dir {
                 Some(scan_file_as_tree(
                     &scoped_abs,
                     components.last().unwrap(),
                     &local,
                 )?)
-            } else {
+            } else if is_leaf {
+                // On-disk directory, but the remote/clone-root sides make this
+                // a leaf scope: scan the directory as an ordinary subtree, then
+                // wrap its root in a one-entry tree named after the leaf so it
+                // compares against the wrapped remote/clone-root hashes.
+                // `stub_store: &lazy` (not `local`): a partial-expansion
+                // directory's stub record may name a clone-root tree object
+                // not yet in the local cache after a lazy clone. `store:
+                // &local` keeps this read-only scan's own `.exists()`-based
+                // decisions local-only (see
+                // `scan_and_store_with_stub_store`'s doc comment).
                 let phase = crate::progress::begin_phase("Scan working tree");
-                let scan_result = scan_and_store_with_cache(
+                let scan_result = scan_and_store_with_stub_store(
                     &repo.work_dir,
                     &scoped_abs,
                     &local,
+                    &lazy,
+                    clone_root_flat.as_ref(),
+                    &stat_cache,
+                    false,
+                )?;
+                let file_count = scan_result.files.len();
+                scanned_files.extend(scan_result.files);
+                phase.complete(format!("{} files", file_count));
+                let (mtime, size, blob_count) = tree_ops::tree_meta(&scan_result.root_hash, &local)?;
+                let entry = TreeEntry::Tree {
+                    name: components.last().unwrap().to_string(),
+                    hash: scan_result.root_hash,
+                    mtime,
+                    size,
+                    blob_count,
+                };
+                Some(tree_ops::build_and_store(vec![entry], &local)?)
+            } else {
+                // Same `stub_store`/`store` split as the branch above.
+                let phase = crate::progress::begin_phase("Scan working tree");
+                let scan_result = scan_and_store_with_stub_store(
+                    &repo.work_dir,
+                    &scoped_abs,
+                    &local,
+                    &lazy,
                     clone_root_flat.as_ref(),
                     &stat_cache,
                     false,
@@ -459,6 +548,24 @@ fn pull_scoped(
                 phase.complete(format!("{} files", file_count));
                 Some(scan_result.root_hash)
             }
+        } else if let Some(entry) = crate::commands::push::resolve_scoped_stub(&repo.work_dir, rel)
+        {
+            // A file stub for this leaf path (design/08_stub_system.md, "Path-
+            // scoped pull's local-change check must resolve a stubbed leaf"):
+            // the real file is absent (the `scoped_abs.exists()` check above
+            // is false), but a stub is "content exists, not materialised" --
+            // never a local deletion. Resolve to the stub's own recorded
+            // entry, the same way `push_scoped`'s `resolve_scoped_stub`
+            // already splices it in directly, instead of falling through to
+            // `None` (which the rest of this diff reads as "locally deleted"
+            // and would misreport as a conflict against any remote change to
+            // this same path). `resolve_scoped_stub`'s directory-stub branch
+            // requires `abs.is_dir()`, which is never true here (this `else`
+            // arm is only reached when `scoped_abs.exists()` is false), so in
+            // practice this only ever resolves a file stub -- wrapped the
+            // same way an ordinary is_leaf entry is, so it compares against
+            // the already-wrapped `clone_scoped_hash`/`remote_scoped_hash`.
+            Some(tree_ops::build_and_store(vec![entry], &local)?)
         } else {
             None
         };
@@ -509,10 +616,16 @@ fn pull_scoped(
     // Collect all diffs and conflict-check across all paths before applying anything.
     // pd_clean[i] accumulates clean entries for path_diffs[i] so apply_diff can
     // iterate each pd's entries directly without re-scanning the combined map.
-    // conflict_owner[path] maps each conflict path to its pd index.
+    // conflict_owner[repo_rel_path] maps each conflict's repo-root-relative
+    // path to (its pd index, its key within that pd's own scoped-relative
+    // remote_diff/local_diff maps) -- the two differ whenever the pull is
+    // scoped, so both are needed: the repo-relative path is what identifies
+    // the conflict uniquely across all specified paths (see the loop below
+    // that populates this map), while the scoped-relative key is what
+    // `pd.remote_diff`/`pd.local_diff` are actually keyed by.
     let mut pd_clean: Vec<HashMap<String, DiffEntry>> = vec![HashMap::new(); path_diffs.len()];
     let mut all_conflicts: Vec<String> = Vec::new();
-    let mut conflict_owner: HashMap<String, usize> = HashMap::new();
+    let mut conflict_owner: HashMap<String, (usize, String)> = HashMap::new();
     // resolved_by_pd[i] holds the [line_merge] merges resolved for path_diffs[i]
     // (not yet written to disk -- see resolve_line_merges's doc comment).
     let mut resolved_by_pd: Vec<Vec<ResolvedLineMerge>> =
@@ -551,20 +664,40 @@ fn pull_scoped(
             &scoped_abs,
             pd.clone_scoped_hash.as_ref(),
             &lazy,
-            move |p| {
-                if rel_prefix.is_empty() {
-                    p.to_string()
-                } else if p.is_empty() {
-                    rel_prefix.clone()
-                } else {
-                    format!("{}/{}", rel_prefix, p)
+            {
+                let rel_prefix = rel_prefix.clone();
+                move |p| {
+                    if rel_prefix.is_empty() {
+                        p.to_string()
+                    } else if p.is_empty() {
+                        rel_prefix.clone()
+                    } else {
+                        format!("{}/{}", rel_prefix, p)
+                    }
                 }
             },
         );
 
+        // Conflict tracking across all specified paths keys on the
+        // repo-root-relative path, never the scoped-subtree-relative key each
+        // pd's own remote_diff/local_diff use internally -- otherwise a
+        // same-named conflict under two different scoped paths (e.g. `pull a
+        // b` where both a/f and b/f conflict) would collide on the bare key
+        // "f" in conflict_owner (a HashMap keyed by that string) and in
+        // all_conflicts (design/04_cli_spec.md, "Behaviour (path-scoped
+        // pull)"; design/03_sync_model.md, "Conflict helper files"). Reuses
+        // the same scoped-to-repo-relative join `resolve_line_merges` above
+        // is given as `to_repo_rel`.
         for path in conflicts {
-            conflict_owner.insert(path.clone(), i);
-            all_conflicts.push(path);
+            let repo_rel = if rel_prefix.is_empty() {
+                path.clone()
+            } else if path.is_empty() {
+                rel_prefix.clone()
+            } else {
+                format!("{}/{}", rel_prefix, path)
+            };
+            conflict_owner.insert(repo_rel.clone(), (i, path));
+            all_conflicts.push(repo_rel);
         }
     }
     all_conflicts.sort();
@@ -572,7 +705,7 @@ fn pull_scoped(
     if !all_conflicts.is_empty() {
         // Pre-compute clone_scoped_hash once per pd that owns at least one conflict.
         let mut clone_scoped_by_pd: Vec<Option<Hash>> = vec![None; path_diffs.len()];
-        for &i in conflict_owner.values() {
+        for &(i, _) in conflict_owner.values() {
             if clone_scoped_by_pd[i].is_none() {
                 clone_scoped_by_pd[i] = if path_diffs[i].is_leaf {
                     // Leaf scopes use a one-entry wrapper tree for their diff keys.
@@ -589,23 +722,21 @@ fn pull_scoped(
                 };
             }
         }
-        // Write conflict helpers for each conflicting path.
-        for path in &all_conflicts {
-            let i = conflict_owner[path];
-            let pd = &path_diffs[i];
-            // The conflict path key is relative to the scoped subtree root. A leaf
-            // scope wraps its file in a one-entry tree, so its key is the leaf name
-            // itself and must be joined onto the leaf parent, not `pd.rel` again.
-            let abs = if pd.is_leaf {
-                repo.work_dir.join(&pd.rel).parent().unwrap().join(path)
-            } else {
-                repo.work_dir.join(&pd.rel).join(path)
-            };
-            let clone_scoped_hash = clone_scoped_by_pd[i].as_ref();
+        // Write conflict helpers for each conflicting path. `repo_rel` (the
+        // key in `all_conflicts`/`conflict_owner`) is already the
+        // repo-root-relative path, so it joins directly onto `work_dir` --
+        // unlike the scoped-relative `scoped_key` that `pd.remote_diff` /
+        // `pd.local_diff` are actually keyed by, which still needs looking up
+        // via `conflict_owner`.
+        for repo_rel in &all_conflicts {
+            let (i, scoped_key) = &conflict_owner[repo_rel];
+            let pd = &path_diffs[*i];
+            let abs = repo.work_dir.join(repo_rel);
+            let clone_scoped_hash = clone_scoped_by_pd[*i].as_ref();
             write_conflict_for_path(
                 &repo.work_dir,
                 &abs,
-                path,
+                scoped_key,
                 clone_scoped_hash,
                 &pd.remote_diff,
                 &lazy,
@@ -677,6 +808,23 @@ fn pull_scoped(
     }
     if let Some(ref cr) = new_clone_root {
         repo.write_clone_root(cr)?;
+
+        // Stub reconcile (design/08_stub_system.md, "Stub reconcile (pull
+        // and restore)"): run only after clone_root has actually advanced
+        // above -- never while a conflict is outstanding (unreached in that
+        // case; see the `Err(Error::Conflict)` return earlier). Each pd is
+        // reconciled at its own scope: a leaf path (`omemfs pull <file>`)
+        // via `reconcile_leaf_stub` (its own path may itself be a stub, but
+        // `stub::list_under` cannot walk a file), a directory scope via
+        // `reconcile_stubs` bounded to that pd's own subtree -- never wider
+        // than what this pull actually touched.
+        for pd in &path_diffs {
+            if pd.is_leaf {
+                reconcile_leaf_stub(cr, &pd.rel, &repo.work_dir, &local)?;
+            } else {
+                reconcile_stubs(cr, &repo.work_dir.join(&pd.rel), &repo.work_dir, &local)?;
+            }
+        }
     }
 
     {
@@ -815,8 +963,12 @@ fn build_conflict_meta(
     // resolution"), for `accept-*` to splice into `clone_root`. `None` here
     // (path absent from remote_diff) cannot happen for a real conflict --
     // `classify_conflicts` only ever produces a conflict for a path present
-    // in `remote_diff` -- so `Unrecorded` is a defensive-only fallback, never
-    // exercised by pull's own conflict-detection path.
+    // in `remote_diff`. A remote side that turned the path into a symlink is
+    // a real, reachable shape (design/03_sync_model.md, "Remote side is a
+    // symlink"), recorded explicitly rather than falling back to
+    // `Unrecorded`, which is a defensive-only fallback for any other shape
+    // (`AddedEmptyDir`/`AddedTree`, or no entry at all), never exercised by
+    // pull's own conflict-detection path.
     let remote_resolution = Some(match remote_entry {
         Some(DiffEntry::Added {
             hash,
@@ -836,10 +988,13 @@ fn build_conflict_meta(
             mode: mode.clone(),
         },
         Some(DiffEntry::Deleted) => RemoteResolution::Deleted,
-        Some(DiffEntry::AddedEmptyDir)
-        | Some(DiffEntry::AddedTree { .. })
-        | Some(DiffEntry::Symlink { .. })
-        | None => RemoteResolution::Unrecorded,
+        Some(DiffEntry::Symlink { target, mtime, .. }) => RemoteResolution::Symlink {
+            target: target.clone(),
+            mtime: *mtime,
+        },
+        Some(DiffEntry::AddedEmptyDir) | Some(DiffEntry::AddedTree { .. }) | None => {
+            RemoteResolution::Unrecorded
+        }
     });
     ConflictMeta {
         base,
@@ -924,6 +1079,15 @@ fn write_conflict_for_path(
     pack_reader: &PackReader,
     remote_key: Option<&crate::codec::encrypt::EncryptKey>,
 ) -> Result<(), Error> {
+    // Clear any conflict artifact left over from an earlier, unresolved
+    // conflict on this exact path before writing the current one. A "missing
+    // side" below (no helper written because that side has no content in
+    // the conflict just detected) must never be shadowed by a stale helper
+    // from a previous conflict on the same path whose remote/base/local side
+    // had different content or a different shape -- see
+    // design/03_sync_model.md, "Missing sides", "Clearing stale residue
+    // before writing" (D8).
+    crate::commands::conflict::remove_all_conflict_artifacts(work_dir, abs)?;
     let base_src = base_root_source(base_hash, path, lazy)?;
     let local_src = working_file_source(abs);
     let remote_src = remote_diff
@@ -1021,12 +1185,35 @@ fn classify_conflicts(
             } else {
                 conflicts.push(path.clone());
             }
+        } else if matches!(remote_entry, DiffEntry::AddedTree { .. })
+            && local_diff
+                .keys()
+                .any(|local_path| is_local_change_under_added_tree(path, local_path))
+        {
+            // No content comparison is possible across a directory/file
+            // granularity mismatch (remote `AddedTree("d")` vs. local
+            // `Added("d/x")`), so any such overlap is a conflict.
+            conflicts.push(path.clone());
         } else {
             clean.insert(path.clone(), remote_entry.clone());
         }
     }
     conflicts.sort();
     (clean, conflicts)
+}
+
+/// True when `local_path` lies strictly under the `AddedTree` at `tree_path`
+/// and is not part of a `.git` directory. A `.git` change means the user
+/// already has a local git worktree there, which pull materialises into
+/// rather than stubs (design/08_stub_system.md, "Stubs and Git repositories").
+fn is_local_change_under_added_tree(tree_path: &str, local_path: &str) -> bool {
+    let Some(rest) = local_path
+        .strip_prefix(tree_path)
+        .and_then(|r| r.strip_prefix('/'))
+    else {
+        return false;
+    };
+    rest.split('/').next() != Some(".git")
 }
 
 /// Returns true when two diff entries represent the same object content.
@@ -1314,12 +1501,122 @@ fn apply_diff(
                 DiffEntry::Deleted | DiffEntry::AddedEmptyDir | DiffEntry::Symlink { .. } => {}
             }
         }
-        crate::commands::push::transfer_objects_many(remote, local, &pending, remote_key, true)?;
+        crate::commands::transfer::transfer_objects_many(remote, local, &pending, remote_key, true)?;
     }
 
     // Directories touched by deletions, for dir-stub / empty-parent cleanup.
     let mut deleted_dirs: std::collections::HashSet<std::path::PathBuf> =
         std::collections::HashSet::new();
+
+    // Phase 2a: apply every `Deleted` entry FIRST, before any `Added`/
+    // `Modified`/`Symlink`/`AddedTree`/`AddedEmptyDir` entry is written.
+    //
+    // A remote-side type change (design/03_sync_model.md "Diff algorithm")
+    // reports the old side's full content as `Deleted` alongside an `Added`
+    // (or `Symlink`) for the new content at the SAME path -- e.g. a
+    // directory replaced by a file emits `deleted: dir/child` for every old
+    // child plus `added: dir` for the new blob. `diff` is a `HashMap`, so its
+    // iteration order is arbitrary: writing the new blob before the old
+    // directory's children are removed would try to `rename()` a temp file
+    // onto a non-empty (or even empty) directory, which the kernel refuses
+    // with EISDIR -- the "Is a directory" pull failure this fixes. Applying
+    // every deletion first, then letting the directory-cleanup pass below
+    // prune the now-empty directory, then applying creations, ensures a
+    // type-changed path is always genuinely absent by the time its new
+    // content is materialised.
+    for (rel_path, change) in diff {
+        if !matches!(change, DiffEntry::Deleted) {
+            continue;
+        }
+        let abs_path = base_dir.join(rel_path);
+        let work_rel = abs_path
+            .strip_prefix(work_dir)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| rel_path.to_string());
+        // design/08_stub_system.md, "Interaction with pull's ordinary
+        // diff/apply" (the file-stub mirror-image paragraph): a `Deleted`
+        // entry at a path that is CURRENTLY a file stub is not necessarily a
+        // genuine deletion -- design/03_sync_model.md's diff algorithm also
+        // emits `Deleted(path)` as the old-side half of a blob-to-tree type
+        // change (a file stub whose remote clone_root entry became a small
+        // tree, diffed recursively rather than as a single AddedTree). If
+        // apply removed the file stub marker here unconditionally, the
+        // subsequent Added entries for that new tree's children (processed
+        // in Phase 2b below) would materialise as ordinary real files under
+        // this path, silently bypassing reconcile's "tree | file stub ->
+        // SwitchToDirStub" row -- by the time reconcile_stubs runs, the one
+        // signal it needs (an existing file stub record) would already be
+        // gone. Leave the stub marker in place and skip the rest of this
+        // entry's handling; reconcile alone decides the outcome once the
+        // new clone_root is current (it also correctly handles the genuine
+        // "file stub deleted outright on the remote" case via its own
+        // `absent -> Remove` row, so nothing is lost by deferring here).
+        if stub::exists(work_dir, &work_rel) {
+            continue;
+        }
+        // N1 (design/03_sync_model.md, "Write safety: the working-
+        // tree write boundary"): this delete is driven by the remote
+        // diff, not a fresh on-disk probe, but it is still a lexical
+        // write-tree path that must not follow a symlinked parent.
+        let existed = abs_path.exists();
+        crate::fsguard::remove_file_tolerant(work_dir, &abs_path)?;
+        if existed {
+            changed += 1;
+        }
+        // Remove stub if it existed.
+        stub::remove(work_dir, &work_rel)?;
+        if let Some(parent) = abs_path.parent() {
+            deleted_dirs.insert(parent.to_path_buf());
+        }
+    }
+
+    // Prune now-empty directories left behind by deletions. This never
+    // touches a directory stub marker itself: whether a directory stub
+    // should be removed entirely is decided by `reconcile_stubs` (run after
+    // this function returns and `clone_root` is written), by checking
+    // whether the new `clone_root` still has ANY entry at that path --
+    // design/08_stub_system.md, "Interaction with pull's ordinary
+    // diff/apply". A naive on-disk check here ("only the marker remains in
+    // this directory") cannot tell a whole-subtree deletion apart from a
+    // partial one (a directory stub with SOME, not all, of its logical
+    // content deleted on the remote looks identical on disk -- only the
+    // marker is ever materialised either way), so it must not decide this;
+    // deferring to reconcile_stubs, which does consult the new clone_root,
+    // is the only correct place for this decision.
+    //
+    // Walk each deleted directory and all of its ancestors up to (but not
+    // including) work_dir, pruning any that are now genuinely empty (no
+    // marker, no files). A directory that still holds a `.omemfs-stub`
+    // marker is never "empty" by this check, so this loop is a no-op for any
+    // directory stub -- exactly the deferral described above.
+    let mut cleanup: std::collections::HashSet<std::path::PathBuf> =
+        std::collections::HashSet::new();
+    for dir in &deleted_dirs {
+        let mut cur = dir.clone();
+        while cur.starts_with(work_dir) && cur != work_dir {
+            cleanup.insert(cur.clone());
+            match cur.parent() {
+                Some(p) => cur = p.to_path_buf(),
+                None => break,
+            }
+        }
+    }
+    // Process deepest paths first so empty children are removed before parents.
+    let mut cleanup_sorted: Vec<std::path::PathBuf> = cleanup.into_iter().collect();
+    cleanup_sorted.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+    for dir in cleanup_sorted {
+        if fs::read_dir(&dir)
+            .map(|mut rd| rd.next().is_none())
+            .unwrap_or(false)
+        {
+            fs::remove_dir(&dir).ok();
+        }
+    }
+
+    // Phase 2b: apply every remaining (non-`Deleted`) entry, now that every
+    // `Deleted` path -- including a type change's old-side unwind -- is
+    // genuinely gone from the working tree and any now-empty directory left
+    // behind has been pruned above.
     for (rel_path, change) in diff {
         let abs_path = base_dir.join(rel_path);
         // Compute the path relative to work_dir (correct even for scoped pulls where
@@ -1328,6 +1625,55 @@ fn apply_diff(
             .strip_prefix(work_dir)
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| rel_path.to_string());
+        // design/08_stub_system.md, "Interaction with pull's ordinary
+        // diff/apply": a remote change to a file inside a locally
+        // directory-stubbed path still shows up here as an ordinary
+        // per-entry Added/Modified/Deleted DiffEntry (the diff itself has no
+        // notion of local dir-stub state), but writing it would materialise
+        // a real file underneath a directory that is supposed to be a
+        // whole-unit stub. Skip any entry whose path has a dir-stubbed
+        // proper ancestor -- reconcile_stubs (run after this function
+        // returns and clone_root is written) is what brings that one
+        // directory stub's own record up to date instead. Deletion of such
+        // an entry was already skipped the same way in Phase 2a above.
+        //
+        // This also covers the path itself being a directory stub whose OWN
+        // clone_root entry changed kind (tree -> blob / tree -> symlink):
+        // apply's ordinary Added/Symlink handling assumes it is writing into
+        // an absent-or-plain-file path, and correctly replacing a whole
+        // directory-stub directory is exactly reconcile's
+        // SwitchToFileStub/MaterialiseSymlink job (design/08, "Interaction
+        // with pull's ordinary diff/apply" -- the paragraph on the stubbed
+        // path's own entry changing kind). `Modified` never needs this: a
+        // dir stub's clone_root entry is a Tree, and `Modified` only ever
+        // targets a Blob-to-Blob change.
+        //
+        // Mirror-image case (design/08, the file-stub paragraph): a file
+        // stub whose remote clone_root entry became a small tree (diffed
+        // recursively, so its children arrive as ordinary Added entries
+        // rather than a single AddedTree) must be left entirely to
+        // reconcile too. Phase 2a above already left this path's file stub
+        // marker in place instead of removing it on the corresponding
+        // Deleted(work_rel) entry; here, a child entry like
+        // Added(f.txt/inner.txt) has `work_rel` strictly NESTED under the
+        // still-present file stub at "f.txt", which `file_stub_at_or_above`
+        // finds. Only the "nested under" shape needs this guard -- unlike
+        // the dir-stub case above, an entry AT the exact file-stub path
+        // itself never needs deferring here: `Modified` there is the
+        // ordinary on-stub update (must run, handled inside its own match
+        // arm below), `Symlink` there is ALWAYS materialised directly per
+        // design/08 regardless of the previous stub kind (no directory to
+        // clear first, so this is safe), and `AddedTree` there is already
+        // fully self-contained (its own `stub::remove` above). Excluding an
+        // exact match (`found_rel == work_rel`) is what keeps this from
+        // regressing those.
+        if stub::deepest_ancestor_stub(work_dir, &work_rel)?.is_some()
+            || stub::dir_exists(work_dir, &work_rel)
+            || stub::file_stub_at_or_above(work_dir, &work_rel)?
+                .is_some_and(|(found_rel, _)| found_rel != work_rel)
+        {
+            continue;
+        }
         match change {
             DiffEntry::Added {
                 hash,
@@ -1418,20 +1764,7 @@ fn apply_diff(
                 changed += 1;
             }
             DiffEntry::Deleted => {
-                // N1 (design/03_sync_model.md, "Write safety: the working-
-                // tree write boundary"): this delete is driven by the remote
-                // diff, not a fresh on-disk probe, but it is still a lexical
-                // write-tree path that must not follow a symlinked parent.
-                let existed = abs_path.exists();
-                crate::fsguard::remove_file_tolerant(work_dir, &abs_path)?;
-                if existed {
-                    changed += 1;
-                }
-                // Remove stub if it existed.
-                stub::remove(work_dir, &work_rel)?;
-                if let Some(parent) = abs_path.parent() {
-                    deleted_dirs.insert(parent.to_path_buf());
-                }
+                // Already applied in Phase 2a, above.
             }
             DiffEntry::AddedTree {
                 hash,
@@ -1439,6 +1772,32 @@ fn apply_diff(
                 mtime,
                 blob_count,
             } => {
+                // Type-change self-containment (design/03_sync_model.md, "Diff
+                // algorithm"): when this AddedTree replaces a blob or symlink
+                // (never a tree -- diff_recursive only emits AddedTree for a
+                // target-side tree), diff_recursive's Tree branch also inserts
+                // Deleted(path) for that old entry, but at the very same
+                // HashMap key this AddedTree occupies -- the second insert
+                // silently discards the first, so `diff` carries no separate
+                // trace of the old entry by the time apply_diff sees it. Clear
+                // whatever is actually on disk here unconditionally, the same
+                // way the Symlink branch above is self-contained about
+                // removing a stale stub/entry, instead of relying on a
+                // `Deleted` entry that was never going to survive. A stale
+                // file stub is removed first (the old side may have been
+                // stubbed), then anything materialised at `abs_path` -- a
+                // regular file or a symlink, never a directory here since the
+                // old side was never a tree -- is removed too, so create_dir_all/
+                // materialise_tree below are never handed a non-directory in
+                // their way (the "refusing to write through a symlinked
+                // directory" failure this fixes).
+                stub::remove(work_dir, &work_rel)?;
+                if fs::symlink_metadata(&abs_path)
+                    .map(|md| !md.is_dir())
+                    .unwrap_or(false)
+                {
+                    crate::fsguard::remove_file_tolerant(work_dir, &abs_path)?;
+                }
                 // The entire subtree is stored as a single directory stub —
                 // unless the directory stub file (`<dir>/.omemfs-stub`) would be
                 // visible to Git, in which case stubs must not be created
@@ -1471,57 +1830,181 @@ fn apply_diff(
         }
     }
 
-    // Clean up directory stubs and empty directories left behind by deletions.
-    // When the remote deletes a path that is (or is under) a local directory
-    // stub, the per-blob Deleted entries never match a real file, so the
-    // leftover `.omemfs-stub` marker would re-introduce the deleted subtree on
-    // the next push (the "deleted tree resurrection" bug). Remove the marker
-    // and prune now-empty parent directories (design/08 reconcile: "absent on
-    // remote → remove stub; remove directory if empty").
-    //
-    // Walk each deleted directory and all of its ancestors up to (but not
-    // including) work_dir, removing dir stubs that no longer have logical
-    // content and pruning empty directories.
-    let mut cleanup: std::collections::HashSet<std::path::PathBuf> =
-        std::collections::HashSet::new();
-    for dir in &deleted_dirs {
-        let mut cur = dir.clone();
-        while cur.starts_with(work_dir) && cur != work_dir {
-            cleanup.insert(cur.clone());
-            match cur.parent() {
-                Some(p) => cur = p.to_path_buf(),
-                None => break,
-            }
-        }
-    }
-    // Process deepest paths first so empty children are removed before parents.
-    let mut cleanup_sorted: Vec<std::path::PathBuf> = cleanup.into_iter().collect();
-    cleanup_sorted.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
-    for dir in cleanup_sorted {
-        let dir_stub = dir.join(stub::DIR_STUB_NAME);
-        // Remove a directory stub marker whose subtree is now fully deleted
-        // (only the marker remains inside the directory).
-        if dir_stub.is_file() {
-            let only_marker = fs::read_dir(&dir)
-                .map(|rd| {
-                    !rd.flatten()
-                        .any(|e| e.file_name().to_string_lossy() != stub::DIR_STUB_NAME)
-                })
-                .unwrap_or(false);
-            if only_marker {
-                fs::remove_file(&dir_stub).ok();
-            }
-        }
-        // Prune the directory if it is now empty.
-        if fs::read_dir(&dir)
-            .map(|mut rd| rd.next().is_none())
-            .unwrap_or(false)
-        {
-            fs::remove_dir(&dir).ok();
-        }
-    }
-
     Ok(changed)
+}
+
+/// Stub reconcile (design/08_stub_system.md, "Stub reconcile (pull and
+/// restore)"): after `apply_diff` has run and `clone_root` has been advanced
+/// to `new_clone_root`, walk every stub currently in the working tree under
+/// `scope_dir` and bring its record in line with `new_clone_root`, per the
+/// reconcile table. Called once per pull (full or scoped) after the new
+/// `clone_root` is written -- never while a conflict is outstanding, since a
+/// conflicting pull returns an error before `clone_root` is ever advanced
+/// (`Error::Conflict`, both in `pull_full` and `pull_scoped`), so reconcile
+/// never runs against a `clone_root` that does not yet reflect this pull.
+///
+/// `stub::list` already stops descending at a directory stub (never
+/// recursing into a fully- or partially-stubbed directory), which is exactly
+/// the behaviour the reconcile table requires: a directory stub's own record
+/// is checked and possibly updated, but nothing underneath it is touched,
+/// and a partial-expansion directory's real files are left alone -- only its
+/// `.omemfs-stub` record is a candidate for reconcile here.
+///
+/// `clone_root` navigation is local-only (`local`, never the lazy/remote
+/// store): a stub's own reconcile never needs to fetch anything -- it either
+/// updates metadata already carried by a `TreeEntry` in some ancestor's tree
+/// object, or removes the stub -- and this pull has already fetched
+/// everything its own diff touched. If an intermediate tree object the walk
+/// would need is not in the local cache (e.g. a stub whose entire subtree,
+/// including the spine down to it, this pull's scope never touched),
+/// `navigate_entry` reports `Error::ObjectNotFound`; that one stub is simply
+/// left unreconciled rather than triggering a fetch or aborting the pull --
+/// this mirrors reconcile's own "stubbed content is not guaranteed to be
+/// locally cached" premise (see the partial-expansion paragraph above) and
+/// keeps a lazily-cloned pull's I/O bounded to what its own diff needed.
+///
+/// `pub(crate)`: also called by `push` (`commands::push::push_full`/
+/// `push_scoped`), after it has durably advanced its own `clone_root`, to
+/// implement design/08_stub_system.md's "After push, the stub's hash field
+/// is updated to reflect the merged tree." Push does not duplicate this
+/// decision logic, only triggers it at a different point.
+pub(crate) fn reconcile_stubs(
+    new_clone_root: &Hash,
+    scope_dir: &std::path::Path,
+    work_dir: &std::path::Path,
+    local: &LocalStore,
+) -> Result<(), Error> {
+    for (rel, current) in stub::list_under(work_dir, scope_dir)? {
+        reconcile_one_stub(new_clone_root, &rel, &current, work_dir, local)?;
+    }
+    Ok(())
+}
+
+/// Like `reconcile_stubs`, but for a single scoped-pull leaf path (`omemfs
+/// pull <file>`, where the scope names one file rather than a directory)
+/// instead of a directory `stub::list_under` can walk. `rel` is checked
+/// directly against `stub::exists`/`stub::dir_exists` for whichever stub kind
+/// (if any) is currently on disk at that path; a `rel` that is not currently
+/// any kind of stub is a no-op (reconcile never creates a stub for a path
+/// that has none -- design/08_stub_system.md).
+///
+/// `pub(crate)`: also called by `push_scoped` per pushed leaf path -- see
+/// `reconcile_stubs`'s doc comment.
+pub(crate) fn reconcile_leaf_stub(
+    new_clone_root: &Hash,
+    rel: &str,
+    work_dir: &std::path::Path,
+    local: &LocalStore,
+) -> Result<(), Error> {
+    let current = if let Some(record) = stub::read(work_dir, rel)? {
+        record
+    } else if let Some(record) = stub::read_dir_stub(work_dir, rel)? {
+        record
+    } else {
+        return Ok(());
+    };
+    reconcile_one_stub(new_clone_root, rel, &current, work_dir, local)
+}
+
+/// Shared per-stub reconcile step used by both `reconcile_stubs` (directory
+/// walk) and `reconcile_leaf_stub` (single scoped-pull leaf path): navigate
+/// `new_clone_root` to `rel` (local-only -- see `reconcile_stubs`'s doc
+/// comment for why a missing intermediate tree object is tolerated rather
+/// than fetched) and apply whatever `stub::reconcile_action` decides.
+fn reconcile_one_stub(
+    new_clone_root: &Hash,
+    rel: &str,
+    current: &StubRecord,
+    work_dir: &std::path::Path,
+    local: &LocalStore,
+) -> Result<(), Error> {
+    let components: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+    let clone_entry = match tree_ops::navigate_entry(new_clone_root, &components, local) {
+        Ok(e) => e,
+        Err(Error::ObjectNotFound(_)) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let is_dir_stub = current.target_type == StubTargetType::Tree;
+    let action = stub::reconcile_action(current, clone_entry.as_ref(), is_dir_stub);
+    apply_reconcile_action(action, rel, is_dir_stub, work_dir)
+}
+
+/// Apply one `stub::ReconcileAction` decided for the stub at `rel` (a file
+/// stub if `is_dir_stub` is false, a directory stub otherwise).
+fn apply_reconcile_action(
+    action: stub::ReconcileAction,
+    rel: &str,
+    is_dir_stub: bool,
+    work_dir: &std::path::Path,
+) -> Result<(), Error> {
+    use stub::ReconcileAction;
+    match action {
+        ReconcileAction::UpToDate => Ok(()),
+        ReconcileAction::UpdateFields(record) => {
+            if is_dir_stub {
+                stub::write_dir_stub(work_dir, rel, &record)
+            } else {
+                stub::write(work_dir, rel, &record)
+            }
+        }
+        ReconcileAction::SwitchToFileStub(record) => {
+            // dir stub -> file stub: remove the marker and the (now-empty,
+            // aside from the marker just removed) directory, then write the
+            // file stub in its place. `fs::remove_dir_all` (not fsguard, not
+            // remove_dir) matches restore.rs's ReconcileDirStubToBlob: a
+            // fully- or partially-stubbed directory's real files (if any, in
+            // the partial-expansion case) are never guaranteed to be safe to
+            // keep once clone_root says this path is now a plain blob, and
+            // this mirrors the one existing precedent for this exact
+            // transition rather than inventing a new one.
+            stub::remove_dir_stub(work_dir, rel)?;
+            let abs = work_dir.join(rel);
+            if abs.exists() {
+                fs::remove_dir_all(&abs)?;
+            }
+            stub::write(work_dir, rel, &record)
+        }
+        ReconcileAction::SwitchToDirStub(record) => {
+            // file stub -> dir stub: remove the file stub marker, create the
+            // directory, write the dir stub inside.
+            stub::remove(work_dir, rel)?;
+            let abs = work_dir.join(rel);
+            crate::fsguard::create_dir_all(work_dir, &abs)?;
+            stub::write_dir_stub(work_dir, rel, &record)
+        }
+        ReconcileAction::MaterialiseSymlink { target, mtime } => {
+            // Symlinks are always materialised (design/08), for either stub
+            // kind. A dir stub's directory must be cleared first (a symlink
+            // cannot be created where a non-empty directory exists);
+            // fs::remove_dir_all mirrors restore.rs's RestoreSymlink/
+            // ReconcileDirStubToBlob handling of the same transition.
+            let abs = work_dir.join(rel);
+            if is_dir_stub {
+                stub::remove_dir_stub(work_dir, rel)?;
+                if abs.exists() {
+                    fs::remove_dir_all(&abs)?;
+                }
+            } else {
+                stub::remove(work_dir, rel)?;
+            }
+            crate::fsmeta::write_symlink_atomic(work_dir, &abs, &target)?;
+            crate::fsmeta::restore_symlink_mtime(&abs, &mtime);
+            Ok(())
+        }
+        ReconcileAction::Remove => {
+            let abs = work_dir.join(rel);
+            if is_dir_stub {
+                stub::remove_dir_stub(work_dir, rel)?;
+                // Remove the directory if it is now empty (it may still
+                // hold real files from a partial expansion -- design/08:
+                // reconcile never removes those).
+                fs::remove_dir(&abs).ok();
+            } else {
+                stub::remove(work_dir, rel)?;
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Materialise a blob into `abs_path`, restoring mtime and the executable-bit
@@ -1734,7 +2217,7 @@ fn ensure_blob_local(
     remote_key: Option<&crate::codec::encrypt::EncryptKey>,
 ) -> Result<(), Error> {
     if !local.exists(hash)? {
-        crate::commands::push::transfer_objects(remote, local, hash, remote_key, true)?;
+        crate::commands::transfer::transfer_objects(remote, local, hash, remote_key, true)?;
     }
     Ok(())
 }
@@ -1801,10 +2284,20 @@ impl DiffEntry {
 /// Returns true if the tree object at `hash` has a direct child tree entry named ".git".
 /// This identifies a directory that is itself a Git repository root, so its children
 /// must not be directory-stubbed (stubs inside a Git working tree are not allowed).
+///
+/// `hash` here is always a `TreeEntry::Tree`'s own hash (a real tree, by
+/// construction), so this is not actually reachable with a blob whose content
+/// happens to parse as tree JSON today -- but is gated on `Tree::is_tree_bytes`
+/// anyway, matching design/01_object_model.md's "Tree/blob discrimination"
+/// (D13) and the other three call sites named there, rather than inferring
+/// "is this a tree?" from whether `Tree::deserialise` happens to succeed.
 fn tree_contains_git_dir(store: &dyn ObjectStore, hash: &Hash) -> bool {
     let Ok(data) = codec::store_read(store, hash, None) else {
         return false;
     };
+    if !Tree::is_tree_bytes(&data) {
+        return false;
+    }
     let Ok(Tree::Normal { entries }) = Tree::deserialise(&data) else {
         return false;
     };
@@ -1874,6 +2367,19 @@ fn materialise_tree(
 /// at or above the threshold are emitted as `DiffEntry::AddedTree` rather than
 /// being recursed into. This mirrors the clone threshold rule and allows pull to
 /// place directory stubs for large newly-added subtrees.
+///
+/// `target: None` is not "nothing to compare, so no changes" — it means the
+/// entire root being diffed to is absent (design/03_sync_model.md, "Whole-root
+/// absence"). When `base` is `Some`, every entry reachable from `base` is
+/// therefore reported `Deleted` (the same expansion `mark_deleted_tree`
+/// already performs for a deleted subtree found mid-walk by `diff_recursive`).
+/// When `base` is also `None`, nothing existed on either side, so the diff is
+/// empty. This matters for a scoped pull's local-diff: a `<path>` removed
+/// entirely from the working tree has no scoped hash to pass as `target`, and
+/// must still be diffed as a full local deletion, not an empty diff, so a
+/// conflicting remote change to `<path>` is still caught by
+/// `classify_conflicts` (a full pull's own local diff never hits this branch,
+/// since its top-level working-tree scan always yields some root hash).
 fn diff_trees(
     base: Option<&Hash>,
     target: Option<&Hash>,
@@ -1881,16 +2387,23 @@ fn diff_trees(
     stub_threshold: u64,
 ) -> Result<HashMap<String, DiffEntry>, Error> {
     let mut result = HashMap::new();
-    if let Some(t) = target {
-        diff_recursive(
-            base,
-            t,
-            store,
-            &mut String::new(),
-            &mut result,
-            stub_threshold,
-            false,
-        )?;
+    match target {
+        Some(t) => {
+            diff_recursive(
+                base,
+                t,
+                store,
+                &mut String::new(),
+                &mut result,
+                stub_threshold,
+                false,
+            )?;
+        }
+        None => {
+            if let Some(b) = base {
+                mark_deleted_tree(b, store, "", &mut result)?;
+            }
+        }
     }
     Ok(result)
 }
@@ -1958,11 +2471,34 @@ fn diff_recursive(
                             );
                         }
                     }
-                    // Entry kind changed (was a tree or symlink): report as modified.
-                    Some(_) => {
+                    // Entry kind changed (was a tree): design/03_sync_model.md
+                    // "Diff algorithm" -- a type change emits deleted(path) +
+                    // added(path), and when the old side is a tree that
+                    // deleted(path) expands to every blob/symlink reachable
+                    // under it, so the receiver removes them (and, via
+                    // apply_diff's directory cleanup, the now-empty directory
+                    // itself) before this new blob is written in its place.
+                    Some(TreeEntry::Tree { hash: old_hash, .. }) => {
+                        mark_deleted_tree(old_hash, store, &path, result)?;
                         result.insert(
                             path,
-                            DiffEntry::Modified {
+                            DiffEntry::Added {
+                                hash: hash.clone(),
+                                size: *size,
+                                mtime: *mtime,
+                                mode: mode.clone(),
+                            },
+                        );
+                    }
+                    // Entry kind changed (was a symlink): no subtree to unwind
+                    // -- this is a plain overwrite of the single path, so it
+                    // is reported as `Added` (matching a fresh write) rather
+                    // than `Modified` (which assumes a prior blob hash to
+                    // compare against).
+                    Some(TreeEntry::Symlink { .. }) => {
+                        result.insert(
+                            path,
+                            DiffEntry::Added {
                                 hash: hash.clone(),
                                 size: *size,
                                 mtime: *mtime,
@@ -1993,8 +2529,15 @@ fn diff_recursive(
                 let base_tree_hash = match base_entries.get(name) {
                     Some(TreeEntry::Tree { hash: h, .. }) => Some(h),
                     // Entry kind changed (was a blob or symlink): diff against
-                    // an empty base so all descendants are reported as added.
-                    _ => None,
+                    // an empty base so all descendants are reported as added,
+                    // but first report the old blob/symlink itself as
+                    // deleted (design/03_sync_model.md "Diff algorithm") --
+                    // it has no place in the new tree that replaces it.
+                    Some(TreeEntry::Blob { .. }) | Some(TreeEntry::Symlink { .. }) => {
+                        result.insert(path, DiffEntry::Deleted);
+                        None
+                    }
+                    None => None,
                 };
                 let prev_len = prefix.len();
                 if !prefix.is_empty() {
@@ -2069,8 +2612,24 @@ fn diff_recursive(
                             );
                         }
                     }
-                    // Kind changed (was a blob or tree): replace with a symlink.
-                    Some(_) => {
+                    // Kind changed and the old side was a tree: unwind its
+                    // full contents as deleted (design/03_sync_model.md
+                    // "Diff algorithm") before the symlink replaces it,
+                    // matching the Blob/Tree-swap handling above.
+                    Some(TreeEntry::Tree { hash: old_hash, .. }) => {
+                        mark_deleted_tree(old_hash, store, &path, result)?;
+                        result.insert(
+                            path,
+                            DiffEntry::Symlink {
+                                target: target.clone(),
+                                mtime: *mtime,
+                                was_present: true,
+                            },
+                        );
+                    }
+                    // Kind changed and the old side was a blob: a plain
+                    // single-path overwrite, no subtree to unwind.
+                    Some(TreeEntry::Blob { .. }) => {
                         result.insert(
                             path,
                             DiffEntry::Symlink {
@@ -2515,5 +3074,77 @@ mod tests {
             files.len(),
             remote.max_in_flight.load(Ordering::SeqCst)
         );
+    }
+
+    fn added(content: &[u8]) -> DiffEntry {
+        DiffEntry::Added {
+            hash: Hash::compute(content),
+            size: content.len() as u64,
+            mtime: None,
+            mode: None,
+        }
+    }
+
+    fn added_tree() -> DiffEntry {
+        DiffEntry::AddedTree {
+            hash: Hash::compute(b"tree"),
+            size: 100,
+            mtime: None,
+            blob_count: 2,
+        }
+    }
+
+    #[test]
+    fn classify_conflicts_flags_added_tree_over_local_untracked_descendant() {
+        let remote: HashMap<String, DiffEntry> = [("d".to_string(), added_tree())].into();
+        let local: HashMap<String, DiffEntry> = [("d/x.txt".to_string(), added(b"local"))].into();
+        let (clean, conflicts) = classify_conflicts(&remote, &local);
+        assert_eq!(conflicts, vec!["d".to_string()]);
+        assert!(clean.is_empty());
+    }
+
+    #[test]
+    fn classify_conflicts_ignores_local_git_dir_under_added_tree() {
+        // A pre-existing local git worktree at the AddedTree's path is the
+        // design/08 "materialise inside a git worktree" case, not a conflict.
+        let remote: HashMap<String, DiffEntry> = [("g".to_string(), added_tree())].into();
+        let local: HashMap<String, DiffEntry> = [
+            ("g/.git/HEAD".to_string(), added(b"ref")),
+            ("g/.git/config".to_string(), added(b"cfg")),
+        ]
+        .into();
+        let (clean, conflicts) = classify_conflicts(&remote, &local);
+        assert!(conflicts.is_empty());
+        assert!(clean.contains_key("g"));
+    }
+
+    #[test]
+    fn classify_conflicts_flags_added_tree_when_local_has_file_beside_git_dir() {
+        let remote: HashMap<String, DiffEntry> = [("g".to_string(), added_tree())].into();
+        let local: HashMap<String, DiffEntry> = [
+            ("g/.git/HEAD".to_string(), added(b"ref")),
+            ("g/notes.txt".to_string(), added(b"local")),
+        ]
+        .into();
+        let (_clean, conflicts) = classify_conflicts(&remote, &local);
+        assert_eq!(conflicts, vec!["g".to_string()]);
+    }
+
+    #[test]
+    fn classify_conflicts_does_not_treat_sibling_with_shared_name_prefix_as_related() {
+        let remote: HashMap<String, DiffEntry> = [("d".to_string(), added_tree())].into();
+        let local: HashMap<String, DiffEntry> = [("dx/y.txt".to_string(), added(b"local"))].into();
+        let (clean, conflicts) = classify_conflicts(&remote, &local);
+        assert!(conflicts.is_empty());
+        assert!(clean.contains_key("d"));
+    }
+
+    #[test]
+    fn classify_conflicts_keeps_same_content_exact_match_clean() {
+        let remote: HashMap<String, DiffEntry> = [("f".to_string(), added(b"same"))].into();
+        let local: HashMap<String, DiffEntry> = [("f".to_string(), added(b"same"))].into();
+        let (clean, conflicts) = classify_conflicts(&remote, &local);
+        assert!(conflicts.is_empty());
+        assert!(clean.contains_key("f"));
     }
 }

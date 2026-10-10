@@ -60,7 +60,7 @@ pub fn run(opts: StubOptions) -> Result<(), Error> {
     // any input path is even examined (design/04 "omemfs stub").
     let clone_blob_entries = tree_ops::flatten_tree_entries_local(&clone_root, &local)?;
 
-    let omemfs_dir = repo.work_dir.join(".omemfs");
+    let omemfs_dir = repo.omemfs_dir();
     let stat_cache = StatCache::read(&omemfs_dir);
 
     // Resolve each input path to a StubTarget, or collect individual files.

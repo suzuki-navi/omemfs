@@ -160,9 +160,13 @@ impl PackWriter {
         // remote already holds. Starting from an empty filter would make every
         // `exists()` report "definitely absent" and re-upload every object on
         // every push (the worst-case performance bug). If the stored filter is
-        // missing, unreadable, or sized differently from the current
-        // configuration, rebuild a fresh empty filter rather than corrupt-merge.
-        let bloom = load_remote_bloom(remote.as_ref(), snapshot_root.as_ref(), remote_key.as_ref());
+        // genuinely missing (ObjectNotFound) or sized differently from the
+        // current configuration, rebuild a fresh empty filter rather than
+        // corrupt-merge; any other failure (I/O, auth, decrypt, deserialise)
+        // is propagated instead of being papered over with a fresh filter
+        // (design/02 "Filter sizing", "Genuine absence vs. an unreadable
+        // filter") -- see `load_remote_bloom`'s doc comment for why.
+        let bloom = load_remote_bloom(remote.as_ref(), snapshot_root.as_ref(), remote_key.as_ref())?;
 
         Ok(PackWriter {
             remote,
@@ -472,16 +476,10 @@ impl PackWriter {
             return Ok(true);
         }
 
-        // Cold shard for this hash prefix.
-        let prefix_bits = ir.cold_prefix_bits as usize;
-        let shard_hash = if prefix_bits > 0 {
-            let prefix = crate::codec::pack::reader::hash_prefix(hash, prefix_bits);
-            ir.cold_shard_hash(prefix)
-        } else if !ir.cold_shards.is_empty() {
-            ir.cold_shard_hash(0)
-        } else {
-            None
-        };
+        // Cold shard for this hash prefix. Shared with `PackReader::locate`
+        // via `cold_shard_hash_for` so the two paths always address the same
+        // shard for a given hash (design/02, dedup item 8.3).
+        let shard_hash = crate::codec::pack::reader::cold_shard_hash_for(hash, ir);
         if let Some(shard_hash) = shard_hash
             && self.load_index_file(&shard_hash)?.find(hash).is_some()
         {
@@ -538,25 +536,11 @@ impl PackWriter {
         self.remote.as_ref()
     }
 
-    /// Encrypt INDEX_ROOT plaintext → nonce || ciphertext || tag.
+    /// Encrypt INDEX_ROOT plaintext → nonce || ciphertext || tag. Thin
+    /// wrapper over the shared `crate::codec::pack::encrypt_index_root_bytes`
+    /// (also used by `commands::pack::encrypt_index_root`).
     fn encrypt_index_root(&self, root: &IndexRoot) -> Result<Vec<u8>, Error> {
-        let plaintext = root.serialise()?;
-        let Some(ref key) = self.remote_key else {
-            return Ok(plaintext);
-        };
-
-        use rand::RngCore;
-        let mut nonce = [0u8; 12];
-        rand::rng().fill_bytes(&mut nonce);
-
-        let mut pseudo_hash = [0u8; 32];
-        pseudo_hash[..12].copy_from_slice(&nonce);
-
-        let encrypted = crate::codec::encrypt::encrypt(plaintext, Some(key), &pseudo_hash);
-        let mut out = Vec::with_capacity(12 + encrypted.len());
-        out.extend_from_slice(&nonce);
-        out.extend_from_slice(&encrypted);
-        Ok(out)
+        crate::codec::pack::encrypt_index_root_bytes(root, self.remote_key.as_ref())
     }
 }
 
@@ -570,62 +554,80 @@ impl PackWriter {
 /// num_hash_functions)` happen to be -- only `omemfs pack` resizes the
 /// filter.
 ///
-/// A fresh (empty) filter is only built when there is nothing valid to load
-/// at all:
+/// A fresh (empty) filter is only built when the filter GENUINELY does not
+/// exist yet:
 ///   - there is no snapshot, or `bloom_hash` is all-zero (never generated), or
-///   - the stored filter cannot be fetched / decrypted / deserialised, or
+///   - the stored filter's fetch fails with `Error::ObjectNotFound` (the
+///     object bloom_hash names does not exist on the remote), or
 ///   - the stored filter is structurally unusable per
 ///     `BloomFilter::structural_defect()` (`num_bits == 0`, which would
 ///     divide by zero inside `may_contain`, or `num_hash_functions == 0`,
-///     which is well-defined but useless).
+///     which is well-defined but useless) -- this is a distinct case from
+///     the two above: the object WAS read, decrypted, and deserialised
+///     successfully, it is just not usable as a filter.
+///
+/// Per design/02 "Filter sizing" ("Genuine absence vs. an unreadable
+/// filter"): any OTHER failure while obtaining an object that `bloom_hash`
+/// says should exist -- a non-`ObjectNotFound` fetch error (I/O, auth, or
+/// any other backend error), a `read_to_end` failure, a `decrypt` failure,
+/// or a `BloomFilter::deserialise` failure -- is propagated as `Err` rather
+/// than silently substituting a fresh filter. Silently substituting one
+/// there would make every cold-tier object look "definitely absent" for the
+/// rest of the push and corrupt the *published* filter (which push writes
+/// back with the run's new hashes merged in) until the next `omemfs pack`
+/// rebuilds it from scratch -- a false negative disguised as a routine cache
+/// miss.
 ///
 /// The fresh filter's capacity hint is `capacity_for(loaded.element_count)`
 /// when a filter WAS read but rejected for being structurally unusable (its
 /// `element_count` field is still meaningful even though its bit array is
-/// not); otherwise (nothing could be read at all) the hint is `0`, which
-/// `capacity_for` floors at `MIN_CAPACITY` -- the same size the old fixed
-/// constant always produced. `loaded.element_count` is an 8-byte field fully
-/// controlled by whoever wrote the remote object, so it is passed to
-/// `capacity_for` unclamped -- the bound (`bloom::MAX_CAPACITY`) is enforced
-/// inside `capacity_for` itself, not here (design/02 "Bounding the capacity
-/// (hostile and corrupt filters)").
+/// not); otherwise (nothing could be read at all, i.e. the genuine-absence
+/// case) the hint is `0`, which `capacity_for` floors at `MIN_CAPACITY` --
+/// the same size the old fixed constant always produced. `loaded.element_count`
+/// is an 8-byte field fully controlled by whoever wrote the remote object, so
+/// it is passed to `capacity_for` unclamped -- the bound
+/// (`bloom::MAX_CAPACITY`) is enforced inside `capacity_for` itself, not here
+/// (design/02 "Bounding the capacity (hostile and corrupt filters)").
 fn load_remote_bloom(
     remote: &dyn ObjectStore,
     snapshot_root: Option<&IndexRoot>,
     key: Option<&EncryptKey>,
-) -> BloomFilter {
+) -> Result<BloomFilter, Error> {
     let fresh = |hint_element_count: u64| bloom::sized_for(hint_element_count);
 
     let Some(ir) = snapshot_root else {
-        return fresh(0);
+        return Ok(fresh(0));
     };
     let Some(bloom_hash) = ir.bloom_hash_opt() else {
-        return fresh(0);
+        return Ok(fresh(0));
     };
 
     use std::io::Read as _;
     let mut r = match remote.open_read(&bloom_hash) {
         Ok(r) => r,
-        Err(_) => return fresh(0),
+        // Genuine absence (the object bloom_hash names does not exist):
+        // fall back to a fresh filter. Any other error (I/O, auth, ...) is
+        // propagated -- the remote's actual Bloom state is unknown, and a
+        // fresh empty filter would silently corrupt the published filter
+        // (see the function doc comment above).
+        Err(Error::ObjectNotFound(_)) => return Ok(fresh(0)),
+        Err(e) => return Err(e),
     };
     let mut stored = Vec::new();
-    if r.read_to_end(&mut stored).is_err() {
-        return fresh(0);
+    if let Err(e) = r.read_to_end(&mut stored) {
+        return Err(Error::Io(e));
     }
-    let plaintext = match crate::codec::encrypt::decrypt(stored, key, bloom_hash.as_bytes_array()) {
-        Ok(pt) => pt,
-        Err(_) => return fresh(0),
-    };
-    let loaded = match BloomFilter::deserialise(&plaintext) {
-        Ok(bf) => bf,
-        Err(_) => return fresh(0),
-    };
+    let plaintext = crate::codec::encrypt::decrypt(stored, key, bloom_hash.as_bytes_array())?;
+    let loaded = BloomFilter::deserialise(&plaintext)?;
 
     // Structurally unusable: rebuild fresh, using the just-read filter's
     // element_count (still meaningful even though its bit array is not) as
     // the capacity hint. `fresh` -> `bloom::sized_for` -> `capacity_for`
     // clamps that hint to `MAX_CAPACITY`, so a hostile/corrupt element_count
-    // cannot demand an unbounded allocation here.
+    // cannot demand an unbounded allocation here. This is not a "failure to
+    // read" case -- the object was read, decrypted, and deserialised
+    // successfully -- so it is handled the same way regardless of the
+    // ObjectNotFound distinction above.
     if let Some(reason) = loaded.structural_defect() {
         dlog_l6!(
             "load_remote_bloom: rejecting structurally defective filter ({}), \
@@ -633,12 +635,12 @@ fn load_remote_bloom(
             reason,
             loaded.element_count
         );
-        return fresh(loaded.element_count);
+        return Ok(fresh(loaded.element_count));
     }
 
     // Any other structurally valid filter is accepted as-is, whatever size
     // it happens to be.
-    loaded
+    Ok(loaded)
 }
 
 // ---------------------------------------------------------------------------
@@ -1875,6 +1877,113 @@ mod tests {
         let _ = loaded.may_contain(&probe);
     }
 
+    /// Regression test for D3 (design/02 "Filter sizing", "Genuine absence
+    /// vs. an unreadable filter"): `bloom_hash` names an object that was
+    /// never actually written to the remote (e.g. an INDEX_ROOT crafted by a
+    /// test, or -- in real use -- a repository state genuinely missing its
+    /// Bloom object). The fetch must fail with `Error::ObjectNotFound`, and
+    /// that specific failure must fall back to a fresh empty filter, exactly
+    /// like an unset `bloom_hash` -- construction must succeed.
+    #[test]
+    fn load_remote_bloom_falls_back_to_fresh_when_bloom_object_is_genuinely_absent() {
+        let tmp = TempDir::new().unwrap();
+        let base = make_remote_base(&tmp);
+
+        // bloom_hash points at an object that was never written anywhere.
+        let mut root = IndexRoot::new_empty();
+        root.bloom_hash = *Hash::compute(b"never-written-bloom-object").as_bytes_array();
+        publish_raw_index_root(&base, &root);
+
+        let writer = PackWriter::new(
+            Box::new(LocalStore::for_remote(&base)),
+            Box::new(LocalRootPointer::new(base.clone(), None)),
+            LocalStore::for_cache(tmp.path().join("objcache")),
+            None,
+        )
+        .expect(
+            "a genuinely absent Bloom object (ObjectNotFound) must fall back to a \
+             fresh filter, not fail PackWriter::new",
+        );
+
+        let loaded = writer.bloom.lock().unwrap();
+        assert!(loaded.num_bits >= 1);
+        let probe = make_hash_from_data(b"genuinely-absent-bloom-probe");
+        let _ = loaded.may_contain(&probe);
+    }
+
+    /// `ObjectStore` wrapper whose `open_read` always fails with a
+    /// non-`ObjectNotFound` error, simulating a transient I/O / network /
+    /// auth failure while fetching the Bloom object -- as opposed to the
+    /// object genuinely not existing.
+    struct AlwaysIoErrorsOnOpenRead {
+        inner: LocalStore,
+    }
+
+    impl ObjectStore for AlwaysIoErrorsOnOpenRead {
+        fn exists(&self, hash: &Hash) -> Result<bool, Error> {
+            self.inner.exists(hash)
+        }
+        fn size(&self, hash: &Hash) -> Result<u64, Error> {
+            self.inner.size(hash)
+        }
+        fn list_with_sizes(&self) -> Result<Vec<(String, u64)>, Error> {
+            self.inner.list_with_sizes()
+        }
+        fn open_read(&self, _hash: &Hash) -> Result<Box<dyn io::Read>, Error> {
+            Err(Error::Other("simulated transient I/O failure".to_string()))
+        }
+        fn write_from(&self, hash: &Hash, reader: &mut dyn io::Read) -> Result<(), Error> {
+            self.inner.write_from(hash, reader)
+        }
+    }
+
+    /// Regression test for D3: when the Bloom object fetch fails with a
+    /// non-`ObjectNotFound` error (a transient I/O / network / auth
+    /// failure), `PackWriter::new` must propagate the error rather than
+    /// silently falling back to a fresh empty filter -- an empty filter
+    /// would make every cold-tier object look "definitely absent" for the
+    /// rest of the push and corrupt the published filter.
+    #[test]
+    fn load_remote_bloom_propagates_error_on_non_object_not_found_fetch_failure() {
+        let tmp = TempDir::new().unwrap();
+        let base = make_remote_base(&tmp);
+
+        // A real Bloom object exists on the remote (so a plain "not found"
+        // is not what would happen here), but the wrapper's open_read always
+        // errors regardless.
+        let real_bloom = BloomFilter::new(50, 0.01, 5);
+        let bytes = real_bloom.serialise();
+        let bloom_hash = Hash::compute(&bytes);
+        LocalStore::for_remote(&base)
+            .write_from(&bloom_hash, &mut io::Cursor::new(&bytes))
+            .unwrap();
+
+        let mut root = IndexRoot::new_empty();
+        root.bloom_hash = *bloom_hash.as_bytes_array();
+        publish_raw_index_root(&base, &root);
+
+        let failing_remote = AlwaysIoErrorsOnOpenRead {
+            inner: LocalStore::for_remote(&base),
+        };
+
+        let err = PackWriter::new(
+            Box::new(failing_remote),
+            Box::new(LocalRootPointer::new(base.clone(), None)),
+            LocalStore::for_cache(tmp.path().join("objcache")),
+            None,
+        )
+        .err()
+        .expect(
+            "a non-ObjectNotFound fetch failure while loading the Bloom filter must \
+             abort PackWriter::new, not fall back to a fresh empty filter",
+        );
+        assert!(
+            !matches!(err, Error::ObjectNotFound(_)),
+            "the propagated error must be the underlying fetch failure, not be \
+             mistaken for or coerced into ObjectNotFound, got: {err:?}"
+        );
+    }
+
     #[test]
     fn load_remote_bloom_falls_back_to_fresh_on_zero_num_hash_functions() {
         let tmp = TempDir::new().unwrap();
@@ -1911,8 +2020,15 @@ mod tests {
         let _ = loaded.may_contain(&probe);
     }
 
+    /// D3 (design/02 "Filter sizing", "Genuine absence vs. an unreadable
+    /// filter"): a Bloom object that exists (fetch succeeds) but whose
+    /// content fails to deserialise (bad magic / corrupted bytes) is NOT a
+    /// genuine absence -- `PackWriter::new` must propagate the
+    /// deserialisation error and abort push, rather than silently
+    /// substituting a fresh empty filter. This replaces the previous
+    /// "falls back to fresh" expectation for this failure mode.
     #[test]
-    fn load_remote_bloom_falls_back_to_fresh_on_corrupted_bytes() {
+    fn load_remote_bloom_propagates_error_on_deserialise_failure() {
         let tmp = TempDir::new().unwrap();
         let base = make_remote_base(&tmp);
 
@@ -1927,23 +2043,21 @@ mod tests {
         root.bloom_hash = *bloom_hash.as_bytes_array();
         publish_raw_index_root(&base, &root);
 
-        let writer = PackWriter::new(
+        let err = PackWriter::new(
             Box::new(LocalStore::for_remote(&base)),
             Box::new(LocalRootPointer::new(base.clone(), None)),
             LocalStore::for_cache(tmp.path().join("objcache")),
             None,
         )
-        .unwrap();
-
-        let loaded = writer.bloom.lock().unwrap();
-        assert!(loaded.num_bits >= 1);
-        let probe = make_hash_from_data(b"corrupted-fallback-probe");
-        let _ = loaded.may_contain(&probe);
-        // Nothing valid could be read at all -> the MIN_CAPACITY hint, not an
-        // element-count-derived one.
-        assert_eq!(
-            crate::codec::pack::bloom::designed_capacity(loaded.num_bits),
-            crate::codec::pack::bloom::capacity_for(0)
+        .err()
+        .expect(
+            "a Bloom object that fails to deserialise must abort PackWriter::new, \
+             not fall back to a fresh empty filter",
+        );
+        assert!(
+            !matches!(err, Error::ObjectNotFound(_)),
+            "a deserialisation failure must not be reported as ObjectNotFound, \
+             got: {err:?}"
         );
     }
 
@@ -1965,8 +2079,15 @@ mod tests {
         out
     }
 
+    /// D3 (design/02 "Filter sizing", "Genuine absence vs. an unreadable
+    /// filter"): a Bloom object that exists but fails GCM authentication
+    /// (wrong key, or tampered/corrupted ciphertext) is NOT a genuine
+    /// absence -- `PackWriter::new` must propagate the decrypt error and
+    /// abort push, rather than silently substituting a fresh empty filter.
+    /// This replaces the previous "falls back to fresh" expectation for
+    /// this failure mode.
     #[test]
-    fn load_remote_bloom_falls_back_to_fresh_on_decrypt_failure() {
+    fn load_remote_bloom_propagates_error_on_decrypt_failure() {
         use crate::codec::encrypt::EncryptKey;
 
         let tmp = TempDir::new().unwrap();
@@ -1976,8 +2097,7 @@ mod tests {
 
         // Store a WELL-FORMED plaintext filter, but UNENCRYPTED -- reading it
         // back with a configured key must fail GCM tag verification (the
-        // bytes are not valid ciphertext||tag for that key), triggering the
-        // fresh fallback rather than propagating a decrypt error.
+        // bytes are not valid ciphertext||tag for that key).
         let plaintext_bloom = BloomFilter::new(50, 0.01, 5);
         let bytes = plaintext_bloom.serialise();
         let bloom_hash = Hash::compute(&bytes);
@@ -1994,18 +2114,21 @@ mod tests {
         let rp = LocalRootPointer::new(base.clone(), None);
         rp.cas_write(&RootToken::Absent, &root_bytes).unwrap();
 
-        let writer = PackWriter::new(
+        let err = PackWriter::new(
             Box::new(LocalStore::for_remote(&base)),
             Box::new(LocalRootPointer::new(base.clone(), None)),
             LocalStore::for_cache(tmp.path().join("objcache")),
             Some(key),
         )
-        .unwrap();
-
-        let loaded = writer.bloom.lock().unwrap();
-        assert!(loaded.num_bits >= 1);
-        let probe = make_hash_from_data(b"decrypt-failure-fallback-probe");
-        let _ = loaded.may_contain(&probe);
+        .err()
+        .expect(
+            "a Bloom object that fails GCM decryption must abort PackWriter::new, \
+             not fall back to a fresh empty filter",
+        );
+        assert!(
+            !matches!(err, Error::ObjectNotFound(_)),
+            "a decrypt failure must not be reported as ObjectNotFound, got: {err:?}"
+        );
     }
 
     // -------------------------------------------------------------------------

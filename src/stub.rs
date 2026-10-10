@@ -14,7 +14,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
-use crate::object::Hash;
+use crate::object::{Hash, TreeEntry};
 
 /// Suffix appended to the original filename to form a file stub filename.
 pub const STUB_SUFFIX: &str = ".omemfs-stub";
@@ -31,7 +31,7 @@ pub enum StubTargetType {
     Tree,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StubRecord {
     #[serde(default)]
     pub target_type: StubTargetType,
@@ -188,7 +188,25 @@ pub fn read_dir_stub(work_dir: &Path, rel_path: &str) -> Result<Option<StubRecor
 fn read_from_path(path: &Path) -> Result<Option<StubRecord>, Error> {
     match fs::read_to_string(path) {
         Ok(s) => Ok(Some(serde_json::from_str(&s)?)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        // `NotADirectory` (ENOTDIR): some component ABOVE the leaf that used
+        // to be a directory is no longer one -- e.g. `read_dir_stub(_,
+        // "bigdir/x")` builds the path "bigdir/x/.omemfs-stub", and "bigdir"
+        // itself was just switched from a directory to a plain file by an
+        // in-progress type-change apply/reconcile. This is exactly as absent
+        // as a plain ENOENT for the purposes of "is there a stub record
+        // here": there is no directory left to hold one. Callers that walk
+        // every ancestor of a path unconditionally (`deepest_ancestor_stub`,
+        // used by pull's apply step to test each proper ancestor) have no
+        // other way to know a shallower ancestor just changed kind under
+        // them, so this must not be a hard I/O error.
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(None)
+        }
         Err(e) => Err(Error::Io(e)),
     }
 }
@@ -241,8 +259,17 @@ pub fn remove_dir_stub(work_dir: &Path, rel_path: &str) -> Result<(), Error> {
 /// - File stubs: `rel_path` is the logical file path (without `.omemfs-stub` suffix).
 /// - Directory stubs: `rel_path` is the directory path (without trailing slash).
 pub fn list(work_dir: &Path) -> Result<Vec<(String, StubRecord)>, Error> {
+    list_under(work_dir, work_dir)
+}
+
+/// Like [`list`], but bounded to stubs found under `dir` (a subdirectory of
+/// `root`, or `root` itself), while still returning `rel_path`s relative to
+/// `root` -- so a caller can scope the walk (e.g. a scoped pull's own
+/// subtree) without losing the repo-root-relative paths its `clone_root`
+/// navigation needs. `root` must be an ancestor of (or equal to) `dir`.
+pub fn list_under(root: &Path, dir: &Path) -> Result<Vec<(String, StubRecord)>, Error> {
     let mut result = Vec::new();
-    collect(work_dir, work_dir, &mut result)?;
+    collect(root, dir, &mut result)?;
     Ok(result)
 }
 
@@ -343,6 +370,37 @@ pub fn deepest_ancestor_stub(
     Ok(None)
 }
 
+/// Find the deepest on-disk FILE stub record that is `rel_path` itself, or a
+/// proper ancestor of it. Unlike `deepest_ancestor_stub` (which only ever
+/// considers proper ancestors, because its callers have already ruled out a
+/// direct match at the path itself), this also checks `rel_path` itself
+/// first -- pull's apply step (design/08_stub_system.md, "Interaction with
+/// pull's ordinary diff/apply", the file-stub mirror-image paragraph) needs
+/// to recognise both shapes a blob-to-tree type change's diff entries can
+/// take: `Deleted(f.txt)` where `f.txt` IS the file stub, and
+/// `Added(f.txt/inner.txt)` where `f.txt` is a proper ancestor of it.
+///
+/// Checks `rel_path` itself, then every ancestor directory from deepest to
+/// shallowest, returning the first one with an on-disk file-stub marker,
+/// along with its `rel_path` and `StubRecord`. Returns `None` when neither
+/// `rel_path` nor any ancestor is a file stub.
+pub fn file_stub_at_or_above(
+    work_dir: &Path,
+    rel_path: &str,
+) -> Result<Option<(String, StubRecord)>, Error> {
+    if let Some(record) = read(work_dir, rel_path)? {
+        return Ok(Some((rel_path.to_string(), record)));
+    }
+    let components: Vec<&str> = rel_path.split('/').filter(|c| !c.is_empty()).collect();
+    for end in (1..components.len()).rev() {
+        let ancestor = components[..end].join("/");
+        if let Some(record) = read(work_dir, &ancestor)? {
+            return Ok(Some((ancestor, record)));
+        }
+    }
+    Ok(None)
+}
+
 // ---------------------------------------------------------------------------
 // Filename helpers
 // ---------------------------------------------------------------------------
@@ -356,6 +414,151 @@ pub fn is_stub_filename(name: &str) -> bool {
 /// Returns `None` if the name does not end with the suffix.
 pub fn logical_name(stub_name: &str) -> Option<&str> {
     stub_name.strip_suffix(STUB_SUFFIX)
+}
+
+// ---------------------------------------------------------------------------
+// Reconcile (design/08_stub_system.md, "Stub reconcile (pull and restore)")
+// ---------------------------------------------------------------------------
+
+/// One outcome of checking an existing stub record against the corresponding
+/// entry (if any) in a new `clone_root`, per the reconcile table in
+/// design/08_stub_system.md. `reconcile_action` (below) is the single place
+/// that table's decision is made; `restore.rs`'s `plan_reconcile_*` family
+/// duplicates the same decisions inline as part of its own `Plan`/`Action`
+/// walk (predating this shared helper -- restore has its own execution
+/// model, so it is not rebuilt on top of this enum), while `pull.rs`'s
+/// `reconcile_stubs` (added for D7) matches on this enum directly.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReconcileAction {
+    /// Already in sync: `clone_root`'s entry at this path is the stub's own
+    /// kind (blob for a file stub, tree for a dir stub) and every recorded
+    /// field already matches. Nothing to do.
+    UpToDate,
+    /// `clone_root` still has a blob at this path (file stub case) or a tree
+    /// (dir stub case), but at least one recorded field is stale. Carries the
+    /// fresh `StubRecord` to write in place of the current one.
+    UpdateFields(StubRecord),
+    /// The dir stub at this path must become a file stub: `clone_root` now
+    /// has a blob here. Carries the new file-stub `StubRecord` to write after
+    /// the directory (and its `.omemfs-stub` marker) are removed.
+    SwitchToFileStub(StubRecord),
+    /// The file stub at this path must become a dir stub: `clone_root` now
+    /// has a tree here. Carries the new dir-stub `StubRecord` to write inside
+    /// the freshly-created directory, after the file stub marker is removed.
+    SwitchToDirStub(StubRecord),
+    /// `clone_root` now has a symlink here: symlinks are always materialised
+    /// (never stubbed), so the stub (file or dir) must be removed and the
+    /// symlink created in its place. Carries the symlink's `target`/`mtime`.
+    MaterialiseSymlink {
+        target: String,
+        mtime: Option<DateTime<Utc>>,
+    },
+    /// `clone_root` has no entry at all at this path (deleted on the
+    /// remote): the stub (file or dir) must be removed.
+    Remove,
+}
+
+/// Decide the reconcile action for a stub whose current on-disk record is
+/// `current` (as `read`/`read_dir_stub` returned it) and whose corresponding
+/// `clone_root` entry is `clone_entry` (as `tree_ops::navigate_entry`
+/// returned it -- `None` when the path is absent from `clone_root`).
+///
+/// `is_dir_stub` distinguishes a file stub from a directory stub: it decides
+/// which `StubTargetType`/table row applies when `clone_entry` matches the
+/// stub's own kind (a dir stub facing a `Tree`, or a file stub facing a
+/// `Blob`), and therefore whether the *fields-only* update path
+/// (`UpdateFields`) or a *kind-switch* path is taken for a given
+/// `clone_entry` shape.
+///
+/// This is a pure decision function: it reads no filesystem state beyond
+/// what the caller already passed in, and performs no I/O of its own. See
+/// `ReconcileAction`'s variants for what each outcome means and what the
+/// caller (`pull::reconcile_stubs`) must do to apply it.
+pub fn reconcile_action(
+    current: &StubRecord,
+    clone_entry: Option<&TreeEntry>,
+    is_dir_stub: bool,
+) -> ReconcileAction {
+    match clone_entry {
+        None => ReconcileAction::Remove,
+        Some(TreeEntry::Symlink { target, mtime, .. }) => ReconcileAction::MaterialiseSymlink {
+            target: target.clone(),
+            mtime: *mtime,
+        },
+        Some(TreeEntry::Blob {
+            hash,
+            size,
+            mtime,
+            mode,
+            ..
+        }) => {
+            if is_dir_stub {
+                // Type mismatch (dir stub / clone_root blob): unconditional
+                // switch, matching restore.rs's plan_reconcile_dir_stub_to_blob
+                // (no needs-update gating for a type change).
+                ReconcileAction::SwitchToFileStub(StubRecord {
+                    target_type: StubTargetType::Blob,
+                    hash: hash.clone(),
+                    size: *size,
+                    mtime: *mtime,
+                    mode: mode.clone(),
+                    blob_count: 0,
+                })
+            } else if current.hash != *hash
+                || current.size != *size
+                || current.mtime != *mtime
+                || current.mode != *mode
+            {
+                ReconcileAction::UpdateFields(StubRecord {
+                    target_type: StubTargetType::Blob,
+                    hash: hash.clone(),
+                    size: *size,
+                    mtime: *mtime,
+                    mode: mode.clone(),
+                    blob_count: 0,
+                })
+            } else {
+                ReconcileAction::UpToDate
+            }
+        }
+        Some(TreeEntry::Tree {
+            hash,
+            size,
+            mtime,
+            blob_count,
+            ..
+        }) => {
+            if is_dir_stub {
+                if current.hash != *hash
+                    || current.size != *size
+                    || current.mtime != *mtime
+                    || current.blob_count != *blob_count
+                {
+                    ReconcileAction::UpdateFields(StubRecord {
+                        target_type: StubTargetType::Tree,
+                        hash: hash.clone(),
+                        size: *size,
+                        mtime: *mtime,
+                        mode: None,
+                        blob_count: *blob_count,
+                    })
+                } else {
+                    ReconcileAction::UpToDate
+                }
+            } else {
+                // Type mismatch (file stub / clone_root tree): unconditional
+                // switch, matching restore.rs's plan_reconcile_file_stub_to_tree.
+                ReconcileAction::SwitchToDirStub(StubRecord {
+                    target_type: StubTargetType::Tree,
+                    hash: hash.clone(),
+                    size: *size,
+                    mtime: *mtime,
+                    mode: None,
+                    blob_count: *blob_count,
+                })
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -376,6 +579,74 @@ mod tests {
             mode: None,
             blob_count: 0,
         }
+    }
+
+    #[test]
+    fn read_dir_stub_returns_none_when_an_intermediate_component_is_a_file_not_a_directory() {
+        // Regression: read_dir_stub("bigdir/x") builds the path
+        // "bigdir/x/.omemfs-stub". If "bigdir" has just been reconciled/
+        // materialised from a directory into a plain file (a dir-stub ->
+        // file-stub or dir-stub -> blob transition, or simply a type change
+        // applied by pull's ordinary diff/apply), the intermediate component
+        // "bigdir" is no longer a directory, so the OS reports ENOTDIR
+        // (io::ErrorKind::NotADirectory), not ENOENT (NotFound). This must be
+        // treated the same as "no stub here" (Ok(None)), not propagated as a
+        // hard I/O error -- deepest_ancestor_stub (used by pull's apply step
+        // to test every proper ancestor of a path) walks ancestors
+        // unconditionally and has no other way to know one of them just
+        // changed kind under it.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("bigdir"), b"now a file").unwrap();
+        let result = read_dir_stub(dir.path(), "bigdir/x");
+        assert_eq!(result.unwrap(), None);
+    }
+
+    #[test]
+    fn read_returns_none_when_an_intermediate_component_is_a_file_not_a_directory() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("bigdir"), b"now a file").unwrap();
+        let result = read(dir.path(), "bigdir/x");
+        assert_eq!(result.unwrap(), None);
+    }
+
+    #[test]
+    fn deepest_ancestor_stub_does_not_error_when_an_ancestor_just_became_a_file() {
+        // End-to-end version of the two tests above, through the actual
+        // caller pull.rs uses.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("bigdir"), b"now a file").unwrap();
+        let result = deepest_ancestor_stub(dir.path(), "bigdir/a.txt");
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn list_under_scopes_to_the_given_subdirectory_but_keeps_root_relative_paths() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "top.txt", &dummy_record()).unwrap();
+        write(dir.path(), "sub/inner.txt", &dummy_record()).unwrap();
+        write(dir.path(), "other/elsewhere.txt", &dummy_record()).unwrap();
+
+        let found = list_under(dir.path(), &dir.path().join("sub")).unwrap();
+        let rels: Vec<&str> = found.iter().map(|(rel, _)| rel.as_str()).collect();
+        assert_eq!(rels, vec!["sub/inner.txt"]);
+    }
+
+    #[test]
+    fn list_under_root_itself_matches_list() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "top.txt", &dummy_record()).unwrap();
+        write(dir.path(), "sub/inner.txt", &dummy_record()).unwrap();
+
+        let mut via_list = list(dir.path()).unwrap();
+        let mut via_list_under = list_under(dir.path(), dir.path()).unwrap();
+        via_list.sort_by(|a, b| a.0.cmp(&b.0));
+        via_list_under.sort_by(|a, b| a.0.cmp(&b.0));
+        let rels_a: Vec<&str> = via_list.iter().map(|(rel, _)| rel.as_str()).collect();
+        let rels_b: Vec<&str> = via_list_under
+            .iter()
+            .map(|(rel, _)| rel.as_str())
+            .collect();
+        assert_eq!(rels_a, rels_b);
     }
 
     #[test]
@@ -411,5 +682,218 @@ mod tests {
         write_dir_stub(dir.path(), "a/b", &dummy_record()).unwrap();
         let found = deepest_ancestor_stub(dir.path(), "a/b").unwrap();
         assert!(found.is_none());
+    }
+
+    #[test]
+    fn file_stub_at_or_above_finds_a_marker_at_the_path_itself() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "f.txt", &dummy_record()).unwrap();
+        let found = file_stub_at_or_above(dir.path(), "f.txt").unwrap();
+        assert_eq!(found.map(|(rel, _)| rel), Some("f.txt".to_string()));
+    }
+
+    #[test]
+    fn file_stub_at_or_above_finds_a_marker_at_a_proper_ancestor() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "f.txt", &dummy_record()).unwrap();
+        let found = file_stub_at_or_above(dir.path(), "f.txt/inner.txt").unwrap();
+        assert_eq!(found.map(|(rel, _)| rel), Some("f.txt".to_string()));
+    }
+
+    #[test]
+    fn file_stub_at_or_above_finds_the_deepest_ancestor_marker() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "a", &dummy_record()).unwrap();
+        write(dir.path(), "a.d/b", &dummy_record()).unwrap();
+        let found = file_stub_at_or_above(dir.path(), "a.d/b/c").unwrap();
+        assert_eq!(found.map(|(rel, _)| rel), Some("a.d/b".to_string()));
+    }
+
+    #[test]
+    fn file_stub_at_or_above_returns_none_with_no_marker_anywhere() {
+        let dir = TempDir::new().unwrap();
+        let found = file_stub_at_or_above(dir.path(), "a/b/c").unwrap();
+        assert!(found.is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // reconcile_action
+    // -----------------------------------------------------------------
+
+    fn blob_entry(hash: Hash, size: u64, mode: Option<&str>) -> TreeEntry {
+        TreeEntry::Blob {
+            name: "x".to_string(),
+            hash,
+            mtime: None,
+            size,
+            mode: mode.map(|m| m.to_string()),
+        }
+    }
+
+    fn tree_entry(hash: Hash, size: u64, blob_count: u64) -> TreeEntry {
+        TreeEntry::Tree {
+            name: "x".to_string(),
+            hash,
+            mtime: None,
+            size,
+            blob_count,
+        }
+    }
+
+    fn symlink_entry(target: &str) -> TreeEntry {
+        TreeEntry::Symlink {
+            name: "x".to_string(),
+            target: target.to_string(),
+            mtime: None,
+        }
+    }
+
+    fn file_stub_record(hash: Hash, size: u64) -> StubRecord {
+        StubRecord {
+            target_type: StubTargetType::Blob,
+            hash,
+            size,
+            mtime: None,
+            mode: None,
+            blob_count: 0,
+        }
+    }
+
+    fn dir_stub_record(hash: Hash, size: u64, blob_count: u64) -> StubRecord {
+        StubRecord {
+            target_type: StubTargetType::Tree,
+            hash,
+            size,
+            mtime: None,
+            mode: None,
+            blob_count,
+        }
+    }
+
+    #[test]
+    fn reconcile_action_file_stub_up_to_date_when_fields_match_blob() {
+        let hash = Hash::compute(b"a");
+        let current = file_stub_record(hash.clone(), 10);
+        let entry = blob_entry(hash, 10, None);
+        assert_eq!(
+            reconcile_action(&current, Some(&entry), false),
+            ReconcileAction::UpToDate
+        );
+    }
+
+    #[test]
+    fn reconcile_action_file_stub_updates_fields_when_hash_changed() {
+        let old_hash = Hash::compute(b"a");
+        let new_hash = Hash::compute(b"b");
+        let current = file_stub_record(old_hash, 10);
+        let entry = blob_entry(new_hash.clone(), 20, Some("755"));
+        match reconcile_action(&current, Some(&entry), false) {
+            ReconcileAction::UpdateFields(rec) => {
+                assert_eq!(rec.hash, new_hash);
+                assert_eq!(rec.size, 20);
+                assert_eq!(rec.mode, Some("755".to_string()));
+                assert_eq!(rec.target_type, StubTargetType::Blob);
+            }
+            other => panic!("expected UpdateFields, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reconcile_action_dir_stub_up_to_date_when_fields_match_tree() {
+        let hash = Hash::compute(b"a");
+        let current = dir_stub_record(hash.clone(), 40, 2);
+        let entry = tree_entry(hash, 40, 2);
+        assert_eq!(
+            reconcile_action(&current, Some(&entry), true),
+            ReconcileAction::UpToDate
+        );
+    }
+
+    #[test]
+    fn reconcile_action_dir_stub_updates_fields_when_blob_count_changed() {
+        let hash = Hash::compute(b"a");
+        let current = dir_stub_record(hash.clone(), 40, 2);
+        let entry = tree_entry(hash.clone(), 60, 3);
+        match reconcile_action(&current, Some(&entry), true) {
+            ReconcileAction::UpdateFields(rec) => {
+                assert_eq!(rec.hash, hash);
+                assert_eq!(rec.size, 60);
+                assert_eq!(rec.blob_count, 3);
+                assert_eq!(rec.target_type, StubTargetType::Tree);
+            }
+            other => panic!("expected UpdateFields, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reconcile_action_dir_stub_switches_to_file_stub_when_clone_root_is_a_blob() {
+        let hash = Hash::compute(b"a");
+        let current = dir_stub_record(Hash::compute(b"old"), 40, 2);
+        let entry = blob_entry(hash.clone(), 5, None);
+        match reconcile_action(&current, Some(&entry), true) {
+            ReconcileAction::SwitchToFileStub(rec) => {
+                assert_eq!(rec.target_type, StubTargetType::Blob);
+                assert_eq!(rec.hash, hash);
+                assert_eq!(rec.size, 5);
+            }
+            other => panic!("expected SwitchToFileStub, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reconcile_action_file_stub_switches_to_dir_stub_when_clone_root_is_a_tree() {
+        let hash = Hash::compute(b"a");
+        let current = file_stub_record(Hash::compute(b"old"), 5);
+        let entry = tree_entry(hash.clone(), 40, 2);
+        match reconcile_action(&current, Some(&entry), false) {
+            ReconcileAction::SwitchToDirStub(rec) => {
+                assert_eq!(rec.target_type, StubTargetType::Tree);
+                assert_eq!(rec.hash, hash);
+                assert_eq!(rec.blob_count, 2);
+            }
+            other => panic!("expected SwitchToDirStub, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reconcile_action_materialises_symlink_for_file_stub() {
+        let current = file_stub_record(Hash::compute(b"old"), 5);
+        let entry = symlink_entry("/target");
+        match reconcile_action(&current, Some(&entry), false) {
+            ReconcileAction::MaterialiseSymlink { target, .. } => {
+                assert_eq!(target, "/target");
+            }
+            other => panic!("expected MaterialiseSymlink, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reconcile_action_materialises_symlink_for_dir_stub() {
+        let current = dir_stub_record(Hash::compute(b"old"), 5, 1);
+        let entry = symlink_entry("/target");
+        match reconcile_action(&current, Some(&entry), true) {
+            ReconcileAction::MaterialiseSymlink { target, .. } => {
+                assert_eq!(target, "/target");
+            }
+            other => panic!("expected MaterialiseSymlink, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reconcile_action_removes_file_stub_when_clone_root_entry_is_absent() {
+        let current = file_stub_record(Hash::compute(b"old"), 5);
+        assert_eq!(
+            reconcile_action(&current, None, false),
+            ReconcileAction::Remove
+        );
+    }
+
+    #[test]
+    fn reconcile_action_removes_dir_stub_when_clone_root_entry_is_absent() {
+        let current = dir_stub_record(Hash::compute(b"old"), 5, 1);
+        assert_eq!(
+            reconcile_action(&current, None, true),
+            ReconcileAction::Remove
+        );
     }
 }

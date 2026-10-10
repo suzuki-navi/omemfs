@@ -160,7 +160,41 @@ Executable file example:
 
    `\` (backslash) is deliberately **allowed** and is not a path separator on Linux — it is an ordinary byte that can legally appear anywhere in a filename (e.g. `a\bslash.txt`, `we\ird\name`). It is stored and restored verbatim, exactly like any other non-separator byte. Correspondingly, **no path-string normalisation anywhere in the codebase may rewrite `\` into `/`**: doing so would silently turn a single legitimate entry name into a multi-component path and write/read the wrong location. Earlier revisions of several path-handling helpers called `.replace('\\', "/")` on relative-path strings as an apparent (and, on this Linux-only target, dead) attempt at Windows separator normalisation; those calls have been removed for this reason.
 
-   Known limitation: `Tree::deserialise` is also used in a few places (`src/commands/cat.rs`, `src/commands/stats.rs`, `src/commands/pull.rs`, `src/commands/transfer.rs`) purely as an "is this object a tree?" discriminator — a failed `deserialise` is treated as "not a tree, therefore a blob" rather than "a malformed tree." Now that `\` is no longer rejected, this ambiguity is reachable only for genuinely malformed tree objects, not for ordinary filenames. A future improvement would be a dedicated `Tree::is_tree_bytes()` check (testing for the `ED F1` tag alone, without full JSON validation) so the two cases — "not a tree" vs. "a corrupt tree" — can be told apart; this is not implemented yet.
+   **Tree/blob discrimination (`Tree::is_tree_bytes`)**: `Tree::deserialise` is also used in a few places (`src/commands/cat.rs`, `src/commands/stats.rs`, `src/commands/pull.rs`, `src/commands/transfer.rs`) purely as an "is this object a tree?" discriminator — the code at those call sites branches on whether `Tree::deserialise` succeeds, not on the parsed `Tree` value's *content*, treating success as "this is a tree" and failure as "not a tree, therefore a blob." That conflated two independently-failing checks into one: whether the bytes carry the `ED F1` tree-object tag at all, and whether the JSON that follows the tag actually parses as a well-formed `Tree`. Before `Tree::is_tree_bytes()` existed, an ordinary blob whose content happened to *parse as valid tree JSON* — e.g. a file literally containing `{"kind":"normal","entries":[]}` — was indistinguishable, at these four call sites, from a real (untagged, legacy-format) tree object: `Tree::deserialise` succeeded on both, so the blob was misidentified as a tree. `src/commands/transfer.rs`'s `child_hashes` is the sharpest case: misidentifying such a blob as a tree makes it walk the blob's JSON content as if it were a list of child object references, enqueue those (bogus, coincidental) hashes for upload, and fail permanently with "a referenced local object is missing" — `omemfs push` never succeeds again for that blob, even on retry, because nothing about a retry changes the blob's content.
+
+   `Tree::is_tree_bytes(data: &[u8]) -> bool` (`src/object.rs`) now resolves this: it tests only for the `ED F1` tag prefix, with no JSON parsing at all, so it can never be fooled by tree-shaped blob *content* — only the tag byte sequence matters, and blob content is written through `serialise_blob`, which escapes any content that would otherwise start with an `ED Fx` byte pair (`blob_needs_escape`, above), so a blob's stored bytes can never begin with the untagged `ED F1` sequence by coincidence. All four call sites now check `Tree::is_tree_bytes` first: an object without the tag is decided to be "not a tree" immediately, before `Tree::deserialise` is ever invoked on it, so a tree-shaped blob is no longer at risk of misidentification. An object *with* the tag still goes on to call `Tree::deserialise` exactly as before — a tagged-but-corrupt tree still fails to parse and is still handled however that call site already handled a `Tree::deserialise` failure (e.g. `stats`'s `unknown_count` bucket, `cat`'s "not a tree, try as blob" fallback) — `Tree::is_tree_bytes` only removes the "coincidentally parses as tree JSON" false positive; it does not change what happens to a genuinely malformed tagged tree.
+
+   This fix is deliberately scoped to those four discriminator call sites plus the new `Tree::is_tree_bytes` function itself. `Tree::deserialise`'s own behaviour — accepting data with or without the `ED F1` prefix, so untagged JSON still parses as a tree for callers that already know they are reading a tree (`clone.rs`, `expand.rs`, `restore.rs`, `tree_ops.rs`, and part of `ls.rs`) — is unchanged; those call sites read a hash that is already known (from a parent `TreeEntry::Tree`, `clone_root`/`remote_root`, or a caller-supplied ref, per Invariant 6 below) to reference a tree, so there is nothing to discriminate there.
+
+6. **Untrusted-remote hash verification (tree objects)**: a tree object fetched
+   from the remote is always fetched *for* an expected hash — every caller
+   already has the hash before it reads the object (from a parent tree entry,
+   from `clone_root`/`remote_root`, or from a caller-supplied ref). On an
+   unencrypted remote there is no GCM tag protecting the plaintext bytes, so a
+   corrupted or maliciously-modified remote object would otherwise be decoded,
+   parsed, and (via a caller such as `pull`) persisted into the local cache
+   under the hash the caller *asked for*, even though its content does not
+   actually hash to that value. `tree_ops::read_tree` (`src/tree_ops.rs`) is
+   the single point that reads a tree object's bytes with an expected hash in
+   hand: it recomputes `hash(tree) = SHA256(0xED 0xF1 | tree JSON bytes)` (the
+   raw bytes `codec::store_read` returns, which retain the `ED F1` prefix) and
+   compares it against the caller's expected hash *before* calling
+   `Tree::deserialise` or returning anything to the caller, rejecting a
+   mismatch with `Error::InvalidObject`. `find_entry_in_tree` and
+   `load_all_entries` (the two `tree_ops.rs` functions that read a tree
+   object's raw bytes for a known hash and immediately call
+   `Tree::deserialise`) are both routed through it, which in turn covers every
+   higher-level tree traversal built on them (`navigate`, `pull`'s diff/apply,
+   `ls`'s diff, `clone`, `expand`, `restore`, ...).
+
+   This check is scoped to tree objects only, not blob or chunk content: a
+   tree's hash is always `Hash::compute` over its own exact serialised bytes
+   (`object::Tree::serialise`/`Hash::compute`, "Hash anchor" above), a single
+   uniform computation independent of storage routing. Blob and chunk hashes
+   are computed the same way in principle but read through several different
+   call sites with routing-dependent shapes (chunked vs. unchunked, manifest
+   vs. direct) that would each need their own verification point; extending
+   this defence to them is future work, tracked separately from this fix.
 
 ### Empty directories
 

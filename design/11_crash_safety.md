@@ -201,4 +201,4 @@ up with the remote state it just created".
 | `STAT_CACHE` write (after barrier) | Cache absent or old; objects are durable | Next scan re-hashes files with missing cache entries |
 | `write_clone_root` (after barrier) | atomic rename — old or new value only | Either value is consistent; objects for new value are already durable |
 | Push upload | `clone_root` is old; remote is incomplete | Next push overwrites remote (idempotent) |
-| Push `write_clone_root` | Remote updated; `clone_root` still old | Next push re-uploads same content (idempotent) |
+| Push `write_clone_root` | Remote updated; `clone_root` still old | If the working tree is unchanged, the next push finds the remote root already equal to its own new root, so the lost-update precheck passes (design/03 step 4b), re-uploads nothing (content-addressed, idempotent), and advances `clone_root`. If the working tree changed in the meantime, the next push is rejected (`remote has been updated since last sync`); run `omemfs pull`, which treats the earlier push's paths as identical on both sides (not a conflict) and advances `clone_root` |

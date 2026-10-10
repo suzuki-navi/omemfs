@@ -160,6 +160,43 @@ teardown() {
 # Temp log file cleanup when run outside a repository
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Nested repositories: the inner repo's logs must never fall back to an
+# outer repo's logs directory.
+# ---------------------------------------------------------------------------
+
+@test "log show: does not fall back to an outer repository's logs" {
+    # setup_repo already created an outer repo at $TEST_DIR with log entries.
+    # Create an independent inner repo nested inside it. `clone` writes a log
+    # of its own, so remove the inner logs directory to make the inner repo
+    # have no logs at all.
+    inner_remote="$(mktemp -d)"
+    mkdir -p inner
+    run "$OMEMFS" clone --new --url "$inner_remote" inner
+    [ "$status" -eq 0 ]
+    rm -rf inner/.omemfs/logs
+
+    run bash -c "cd inner && '$OMEMFS' log show"
+    [ "$status" -ne 0 ]
+    [[ "$output" =~ "no .omemfs/logs/latest.log found" ]]
+
+    rm -rf "$inner_remote"
+}
+
+@test "log ls: does not fall back to an outer repository's logs" {
+    inner_remote="$(mktemp -d)"
+    mkdir -p inner
+    run "$OMEMFS" clone --new --url "$inner_remote" inner
+    [ "$status" -eq 0 ]
+    rm -rf inner/.omemfs/logs
+
+    run bash -c "cd inner && '$OMEMFS' log ls"
+    [ "$status" -ne 0 ]
+    [[ "$output" =~ "no .omemfs/logs/ found" ]]
+
+    rm -rf "$inner_remote"
+}
+
 @test "no stray temp log file remains when run outside a repository" {
     # Use an isolated temp dir so we only see this invocation's stray files.
     isolated_tmp="$(mktemp -d)"

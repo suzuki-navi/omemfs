@@ -105,7 +105,7 @@ pub fn run(mut opts: LsOptions) -> Result<(), Error> {
 
     // --dirty: show only diff between working tree and clone root.
     if opts.dirty {
-        let omemfs_dir_dirty = repo.work_dir.join(".omemfs");
+        let omemfs_dir_dirty = repo.omemfs_dir();
         // --dirty honours the cwd / <path> scope just like a plain ls: from a
         // subdirectory (or with a <path> argument) only changes under that scope
         // are listed. Use the scoped working-tree scan so out-of-scope subtrees
@@ -274,7 +274,7 @@ pub fn run(mut opts: LsOptions) -> Result<(), Error> {
             Some(prefix) => crate::tree_ops::flatten_tree_entries_scoped(h, prefix, &local).ok(),
             None => crate::tree_ops::flatten_tree_entries(h, &local).ok(),
         });
-    let omemfs_dir = repo.work_dir.join(".omemfs");
+    let omemfs_dir = repo.omemfs_dir();
 
     // STAT_CACHE scope-limited load (design/07 "Read optimisation"): for a single
     // <path>, parse only that path's slice of STAT_CACHE rather than the whole

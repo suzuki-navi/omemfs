@@ -607,6 +607,59 @@ make_conflict() {
     rm -rf "$clone2"
 }
 
+# ---------------------------------------------------------------------------
+# D10 regression: a remote whole-directory delete conflicting with a local
+# edit of one file inside it must not leave an empty directory behind after
+# `accept-remote` -- an unpruned empty directory would resurrect the deleted
+# directory on the next push (design/03_sync_model.md, "Pruning directories
+# emptied by conflict resolution").
+# ---------------------------------------------------------------------------
+
+@test "conflict accept-remote: prunes a directory emptied by resolving a remote whole-directory delete vs local edit conflict (D10)" {
+    mkdir -p d
+    echo "one" > d/f
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    local clone2
+    clone2="$(mktemp -d)"
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" "$clone2"
+    [ "$status" -eq 0 ]
+
+    # Remote (via clone2) deletes the whole "d" directory, including its
+    # only file.
+    (cd "$clone2" && rm -rf d && "$OMEMFS" push)
+
+    # Local edits d/f, unaware that the remote deleted the whole directory.
+    echo "local edit" > d/f
+    run "$OMEMFS" pull
+    [ "$status" -ne 0 ]
+    [ -f d/f.omemfs-conflict-local ]
+    [ ! -f d/f.omemfs-conflict-remote ]
+
+    run "$OMEMFS" conflict accept-remote d/f
+    [ "$status" -eq 0 ]
+
+    # accept-remote must not merely delete d/f -- it must also prune the
+    # now-empty "d" directory it leaves behind.
+    [ ! -e d ]
+
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    run "$OMEMFS" pull
+    [ "$status" -eq 0 ]
+    [ ! -e d ]
+
+    # Confirm the remote itself never had "d" resurrected: a fresh clone must
+    # not contain it either.
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" clone_verify_d10
+    [ "$status" -eq 0 ]
+    [ ! -e clone_verify_d10/d ]
+
+    rm -rf "$clone2"
+}
+
 @test "conflict accept-base: advances clone_root so the following push succeeds" {
     local clone2
     clone2="$(mktemp -d)"
@@ -855,6 +908,101 @@ make_conflict() {
     [ "$status" -eq 0 ]
     [[ "$(cat clone_chk/sub/inner/file.txt)" == "local change" ]]
     [[ "$(cat clone_chk/top.txt)" == "untouched" ]]
+
+    rm -rf "$clone2"
+}
+
+# ---------------------------------------------------------------------------
+# D9 regression: a conflict whose remote side turned the path into a symlink
+# (while the local side edited its content independently) must converge
+# under accept-remote -- a symlink created, mtime restored, clone_root
+# advanced -- rather than the pre-fix behaviour (file deleted, clone_root
+# left unadvanced, so every following push/pull kept failing).
+# See design/03_sync_model.md, "Remote side is a symlink".
+# ---------------------------------------------------------------------------
+
+@test "conflict accept-remote: resolves a conflict where the remote side became a symlink (D9)" {
+    echo "content" > f.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    local clone2
+    clone2="$(mktemp -d)"
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" "$clone2"
+    [ "$status" -eq 0 ]
+
+    # Remote (via clone2) replaces f.txt with a symlink.
+    (cd "$clone2" && rm f.txt && ln -s target.txt f.txt && "$OMEMFS" push)
+
+    # Local independently edits f.txt's content, unaware of the remote change.
+    echo "local edit" > f.txt
+    run "$OMEMFS" pull
+    [ "$status" -ne 0 ]
+    [ -f f.txt.omemfs-conflict-local ]
+    [ ! -f f.txt.omemfs-conflict-remote ]
+    # The sidecar must record the remote's symlink shape, not fall back to
+    # "unrecorded" (which would leave clone_root unadvanced). serde_json's
+    # pretty-printer inserts a space after each key's colon.
+    grep -q '"kind": *"symlink"' f.txt.omemfs-conflict-meta
+    grep -q '"target": *"target.txt"' f.txt.omemfs-conflict-meta
+
+    run "$OMEMFS" conflict accept-remote f.txt
+    [ "$status" -eq 0 ]
+
+    # accept-remote must create the symlink itself, not merely delete the file.
+    [ -L f.txt ]
+    [ "$(readlink f.txt)" = "target.txt" ]
+    [ ! -f f.txt.omemfs-conflict-local ]
+    [ ! -f f.txt.omemfs-conflict-meta ]
+
+    # clone_root must be advanced: the following push is a clean no-op, not a
+    # CAS failure.
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Nothing to push"* ]]
+
+    # A later pull must not re-detect the same conflict.
+    run "$OMEMFS" pull
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Already up to date"* ]]
+
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" clone_verify_d9
+    [ "$status" -eq 0 ]
+    [ -L clone_verify_d9/f.txt ]
+    [ "$(readlink clone_verify_d9/f.txt)" = "target.txt" ]
+
+    rm -rf "$clone2"
+}
+
+@test "conflict accept-local: a conflict where the remote side became a symlink still advances clone_root to the symlink (D9)" {
+    echo "content" > f.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    local clone2
+    clone2="$(mktemp -d)"
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" "$clone2"
+    [ "$status" -eq 0 ]
+
+    (cd "$clone2" && rm f.txt && ln -s target.txt f.txt && "$OMEMFS" push)
+
+    echo "local edit" > f.txt
+    run "$OMEMFS" pull
+    [ "$status" -ne 0 ]
+
+    run "$OMEMFS" conflict accept-local f.txt
+    [ "$status" -eq 0 ]
+    # accept-local keeps the local content, not the symlink.
+    [[ "$(cat f.txt)" == "local edit" ]]
+
+    # clone_root was still advanced to the remote's symlink value, so push
+    # succeeds as a deliberate supersession (not a lost-update CAS failure).
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" clone_verify_d9_local
+    [ "$status" -eq 0 ]
+    [[ "$(cat clone_verify_d9_local/f.txt)" == "local edit" ]]
 
     rm -rf "$clone2"
 }

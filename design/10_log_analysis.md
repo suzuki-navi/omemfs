@@ -89,7 +89,7 @@ Columns:
 
 `REF` accepts four forms:
 
-1. **Omitted** — use `latest.log` (walk up the directory tree to find the repo root).
+1. **Omitted** — use `<repo>/.omemfs/logs/latest.log`, where `<repo>` is the repository root already discovered when the command started (the same `Repo::discover` walk-up used by every other subcommand). No additional upward search is performed here.
 2. **`@N`** — use the N-th entry from `log ls` (1-based, newest first).
 3. **Logical name** — a string with no `/`, no `.`, and not starting with `@`;
    resolved to `<repo>/.omemfs/logs/<name>.log`.

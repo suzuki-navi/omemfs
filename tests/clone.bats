@@ -74,6 +74,31 @@ teardown() {
     [[ "$output" == *"existing path(s) skipped"* ]]
 }
 
+@test "clone: --force refuses to overwrite an existing .omemfs/ directory (would lose the DEK)" {
+    # Seed an encrypted remote and clone it into "dest", producing a
+    # .omemfs/config that holds the remote's DEK.
+    run "$OMEMFS" clone --new --encrypt --url "$REMOTE_DIR" dest
+    [ "$status" -eq 0 ]
+    [ -f dest/.omemfs/config ]
+    original_config="$(cat dest/.omemfs/config)"
+
+    # A second remote (also encrypted, different DEK) that a later `clone
+    # --force` on top of the same directory must NOT be able to import in
+    # place of the original config.
+    OTHER_REMOTE_DIR="$(mktemp -d)"
+
+    run "$OMEMFS" clone --new --force --url "$OTHER_REMOTE_DIR" dest
+    # Expect failure: an existing .omemfs/ must never be overwritten, even
+    # with --force.
+    [ "$status" -ne 0 ]
+    [[ "$output" == *".omemfs"* ]]
+
+    # The original config (and thus its DEK) must be untouched.
+    [ "$(cat dest/.omemfs/config)" = "$original_config" ]
+
+    rm -rf "$OTHER_REMOTE_DIR"
+}
+
 @test "clone: default remote name is 'origin'" {
     run "$OMEMFS" clone --new --url "$REMOTE_DIR" myrepo
     [ "$status" -eq 0 ]

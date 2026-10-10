@@ -347,6 +347,136 @@ teardown() {
     [ -f verify/sub/b.txt ]
 }
 
+@test "stub: scoped push of a path below a stubbed ancestor directory errors instead of deleting" {
+    # Regression: `sub/` is fully stubbed (a single .omemfs-stub marker, no
+    # real children on disk). Scoped-pushing a path INSIDE it (not the
+    # directory itself) must not silently be treated as a deletion just
+    # because Path::exists() is false for it -- the path is unreachable
+    # (deferred behind the stub), not confirmed absent.
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" repo
+    [ "$status" -eq 0 ]
+    cd repo
+    mkdir -p sub
+    echo "a" > sub/a.txt
+    echo "b" > sub/b.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    REMOTE_BEFORE="$(get_remote_root)"
+
+    run "$OMEMFS" stub sub/
+    [ "$status" -eq 0 ]
+    [ -f sub/.omemfs-stub ]
+    [ ! -f sub/a.txt ]
+
+    # Scoped push of a/ path that lives below the stubbed directory, not the
+    # directory itself: must abort with an error, not delete sub/a.txt from
+    # the remote.
+    run "$OMEMFS" push sub/a.txt
+    [ "$status" -ne 0 ]
+    cd ..
+
+    # The remote must be completely unchanged (both files still present).
+    REMOTE_AFTER="$(cd repo && get_remote_root)"
+    [ "$REMOTE_AFTER" = "$REMOTE_BEFORE" ]
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" --stub-threshold 0 verify
+    [ "$status" -eq 0 ]
+    [ -f verify/sub/a.txt ]
+    [ -f verify/sub/b.txt ]
+}
+
+@test "stub: scoped push of an unreadable path (permission error) aborts instead of deleting" {
+    # A path that cannot be stat'd due to a permission error (e.g. an
+    # unreadable ancestor directory) must abort the whole push with an
+    # error, never be silently treated as "deleted".
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" repo
+    [ "$status" -eq 0 ]
+    cd repo
+    mkdir -p secret
+    echo "hidden" > secret/inside.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    REMOTE_BEFORE="$(get_remote_root)"
+
+    chmod 000 secret
+
+    run "$OMEMFS" push secret/inside.txt
+    chmod 700 secret  # restore before any cleanup/rm -rf
+    [ "$status" -ne 0 ]
+
+    REMOTE_AFTER="$(get_remote_root)"
+    [ "$REMOTE_AFTER" = "$REMOTE_BEFORE" ]
+    cd ..
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" verify_perm
+    [ "$status" -eq 0 ]
+    [ -f verify_perm/secret/inside.txt ]
+    [ "$(cat verify_perm/secret/inside.txt)" = "hidden" ]
+}
+
+@test "stub: push aborts (fail-closed) when a file stub marker holds invalid JSON" {
+    # Regression (D5): a corrupted file-stub marker must never be silently
+    # treated as "no stub here" -- that would make the scan see nothing at
+    # this path and push would upload it as a deletion, destroying the
+    # remote's copy of content whose only problem is a damaged local marker.
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" repo
+    [ "$status" -eq 0 ]
+    cd repo
+    echo "keep-me" > file.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    REMOTE_BEFORE="$(get_remote_root)"
+
+    run "$OMEMFS" stub file.txt
+    [ "$status" -eq 0 ]
+    [ -f file.txt.omemfs-stub ]
+    [ ! -f file.txt ]
+
+    # Corrupt the stub marker's JSON content.
+    echo "not valid json {{{" > file.txt.omemfs-stub
+
+    run "$OMEMFS" push
+    [ "$status" -ne 0 ]
+
+    REMOTE_AFTER="$(get_remote_root)"
+    [ "$REMOTE_AFTER" = "$REMOTE_BEFORE" ]
+    cd ..
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" verify_bad_stub
+    [ "$status" -eq 0 ]
+    [ -f verify_bad_stub/file.txt ]
+    [ "$(cat verify_bad_stub/file.txt)" = "keep-me" ]
+}
+
+@test "stub: push aborts (fail-closed) when a directory stub marker holds invalid JSON" {
+    # Regression (D5): same as the file-stub case above, but for a
+    # fully-stubbed directory's marker.
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" repo
+    [ "$status" -eq 0 ]
+    cd repo
+    mkdir -p sub
+    echo "a" > sub/a.txt
+    echo "b" > sub/b.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    REMOTE_BEFORE="$(get_remote_root)"
+
+    run "$OMEMFS" stub sub/
+    [ "$status" -eq 0 ]
+    [ -f sub/.omemfs-stub ]
+
+    # Corrupt the directory stub marker's JSON content.
+    echo "not valid json {{{" > sub/.omemfs-stub
+
+    run "$OMEMFS" push
+    [ "$status" -ne 0 ]
+
+    REMOTE_AFTER="$(get_remote_root)"
+    [ "$REMOTE_AFTER" = "$REMOTE_BEFORE" ]
+    cd ..
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" --stub-threshold 0 verify_bad_dir_stub
+    [ "$status" -eq 0 ]
+    [ -f verify_bad_dir_stub/sub/a.txt ]
+    [ -f verify_bad_dir_stub/sub/b.txt ]
+}
+
 @test "stub: partial expansion push merges stub entries with new files" {
     # Stub a directory, then add a new file inside it (partial expansion).
     # A push must merge the stub's recorded tree with the new on-disk file so

@@ -68,7 +68,12 @@ use crate::store::local::LocalStore;
 
 // Offset of pack body relative to the start of the pack file
 // (i.e. skip the 2-byte ED E1 magic header).
-const PACK_BODY_OFFSET: u64 = 2;
+//
+// pub(crate) so commands::pack's consolidation pass (which reads pack files
+// laid out identically to PackWriter's own pack files, see PACK_TARGET's doc
+// comment in writer.rs) can slice out an entry's payload using this same
+// constant instead of a bare literal `2` (design/02, dedup item 8.4).
+pub(crate) const PACK_BODY_OFFSET: u64 = 2;
 
 /// Strip the standalone escape prefix (ED E0) if present.
 /// Standalone objects whose encrypted bytes began with ED E0..EF are stored
@@ -312,9 +317,36 @@ impl PackReader {
                 self.packcache.write_from(pack_hash, &mut r)?;
             }
         }
+        // Untrusted-remote validation (see design/02_storage_format.md,
+        // "Untrusted-remote validation of pack entry `length`"): `offset`
+        // and `length` come from an index-file `PackEntry`, which on an
+        // unencrypted or compromised remote is not authenticated before
+        // this slice read runs. Cap the requested slice against the actual
+        // size of the pack file now cached locally in full -- a `length`
+        // that would read past the end of the cached pack cannot possibly
+        // be satisfied by real data, so reject it with `Error::InvalidObject`
+        // BEFORE allocating `buf`, rather than allocating up to 4 GiB
+        // (`u32::MAX`) for a hostile or corrupted entry.
+        let pack_size = self.packcache.size(pack_hash)?;
+        let skip = PACK_BODY_OFFSET + offset as u64;
+        let needed_end = skip.checked_add(length as u64).ok_or_else(|| {
+            Error::InvalidObject(format!(
+                "pack slice offset {} + length {} overflows",
+                offset, length
+            ))
+        })?;
+        if needed_end > pack_size {
+            return Err(Error::InvalidObject(format!(
+                "pack slice [offset {}, length {}) exceeds cached pack file size {} for pack {}",
+                offset,
+                length,
+                pack_size,
+                pack_hash.as_str()
+            )));
+        }
+
         // Serve the slice from the local cache.
         let mut reader = self.packcache.open_read(pack_hash)?;
-        let skip = PACK_BODY_OFFSET + offset as u64;
         io::copy(&mut reader.by_ref().take(skip), &mut io::sink()).map_err(Error::Io)?;
         let mut buf = vec![0u8; length as usize];
         reader.read_exact(&mut buf).map_err(Error::Io)?;
@@ -549,7 +581,11 @@ impl PackReader {
 /// Shared by `locate`'s step [A] (cache-only warm search) and step 6 (the
 /// unchanged cold-start fetch), so the two steps always address the same
 /// shard for a given hash and the prefix-bit logic is not duplicated.
-fn cold_shard_hash_for(hash: &Hash, index_root: &IndexRoot) -> Option<Hash> {
+///
+/// Also `pub(crate)` for `PackWriter::index_contains`, which needs to
+/// resolve the same cold-shard address on the push path (design/02, dedup
+/// item 8.3) -- previously that logic was reimplemented inline there.
+pub(crate) fn cold_shard_hash_for(hash: &Hash, index_root: &IndexRoot) -> Option<Hash> {
     let prefix_bits = index_root.cold_prefix_bits as usize;
     if prefix_bits > 0 {
         index_root.cold_shard_hash(hash_prefix(hash, prefix_bits))
@@ -773,6 +809,52 @@ mod tests {
         let mut got = Vec::new();
         r.read_to_end(&mut got).unwrap();
         assert_eq!(got, data);
+    }
+
+    // Security regression: `length` in a pack-entry index record comes from
+    // an untrusted or corrupted remote (on an unencrypted remote there is no
+    // GCM tag protecting it). Before the fix, `fetch_pack_slice` allocated
+    // `vec![0u8; length as usize]` directly from that field -- up to 4 GiB
+    // (the u32 max) from a single crafted index entry. The fixed version
+    // must cap `length` against the actual size of the already-cached pack
+    // file and reject an over-long slice with `Error::InvalidObject` before
+    // that allocation.
+    #[test]
+    fn fetch_pack_slice_rejects_length_exceeding_cached_pack_size() {
+        let tmp = TempDir::new().unwrap();
+        let (writer, reader) = setup(&tmp);
+
+        // Write a pack-range object so a real pack file (with a real,
+        // bounded size) ends up cached locally once read.
+        let data = vec![0xBBu8; 1024];
+        let hash = Hash::compute(&data);
+        writer
+            .write_from(&hash, &mut io::Cursor::new(&data))
+            .unwrap();
+        let mut writer = writer;
+        writer.finish(&Hash::compute(b"root")).unwrap();
+
+        // Locate the entry to learn the real pack_hash/offset, then fetch a
+        // valid slice once so the whole pack gets cached locally (fetch_pack_slice
+        // only checks packcache's *cached* size, so the pack must be cached first).
+        let entry = match reader.locate(&hash).unwrap() {
+            Located::Entry(IndexEntry::Pack(e)) => e,
+            other => panic!("expected a cached pack entry, got {other:?}"),
+        };
+        let good = reader
+            .fetch_pack_slice(&entry.pack_hash, entry.offset, entry.length)
+            .unwrap();
+        assert_eq!(good, data);
+
+        // Now request a length far beyond the actual (now-cached) pack file
+        // size -- this is what a hostile/corrupted index entry would supply.
+        let huge_length = u32::MAX;
+        let result = reader.fetch_pack_slice(&entry.pack_hash, entry.offset, huge_length);
+        assert!(
+            result.is_err(),
+            "a pack slice length exceeding the cached pack file's real size must be rejected, \
+             not turned into a ~4 GiB allocation"
+        );
     }
 
     #[test]
@@ -1247,11 +1329,7 @@ mod tests {
     /// [Improvement A] Once a cold shard has been fetched into the local
     /// objcache -- by resolving any hash that lives in it -- resolving a
     /// DIFFERENT hash from the SAME shard must be a pure local operation: no
-    /// further remote `exists()` probe. The current implementation always
-    /// issues one `exists()` HEAD per lookup regardless of shard warmth (see
-    /// `locate`'s step 5, which runs unconditionally before step 6's cold
-    /// shard search), so this test is expected to FAIL until Improvement A is
-    /// implemented.
+    /// further remote `exists()` probe.
     #[test]
     fn cold_shard_search_is_free_once_warm() {
         use crate::codec::pack::index::InlineEntry;
@@ -1317,11 +1395,10 @@ mod tests {
     }
 
     /// Regression guard: the FIRST lookup of a hash whose cold shard has never
-    /// been fetched must still defer to the remote `exists()` probe before
-    /// fetching the shard -- Improvement A only changes behaviour once a shard
-    /// is already warm (design/02 "Why the cold shard is checked before the
-    /// remote probe when already cached"). This must hold both before and
-    /// after Improvement A is implemented.
+    /// been fetched must not probe a standalone key before fetching the
+    /// shard -- Improvement A only changes behaviour once a shard is already
+    /// warm (design/02 "Why the covering cold shard is searched before the
+    /// Bloom filter").
     #[test]
     fn cold_shard_first_lookup_avoids_standalone_probe() {
         use crate::codec::pack::index::InlineEntry;
@@ -1370,25 +1447,15 @@ mod tests {
         );
     }
 
-    /// [Improvement C, corrected] When a Bloom filter is recorded and
-    /// reports a hash as "definitely absent", `locate` must still issue the
-    /// remote `exists()` probe (step 5) -- exactly one, the same cold-start
-    /// cost as if there were no Bloom filter at all -- because a standalone
-    /// object can be written to the remote at any time, after the Bloom
-    /// filter's snapshot was taken, and only the probe can observe it (see
-    /// `read_standalone_step5_unescapes`, and design/02 "Why the Bloom
-    /// filter is checked before the cold-shard fetch, but never before the
-    /// remote probe"). What the Bloom filter DOES still skip is the
-    /// cold-shard *fetch* (step 7): since the filter and the cold shards
-    /// share the same `omemfs pack` snapshot with no staleness gap, a
-    /// definite miss proves the hash cannot be in any cold shard, so the
-    /// shard is never downloaded -- verified here by asserting the shard is
-    /// NOT present in objcache afterward (a fetch would have cached it).
-    ///
-    /// This test previously asserted `exists_calls == 0`, which was the
-    /// unsafe behaviour this fix removes: a Bloom-negative hash used to skip
-    /// the probe entirely, which could wrongly report NotFound for a
-    /// standalone object written after the last `omemfs pack`.
+    /// [Improvement C] When a Bloom filter is recorded and reports a hash as
+    /// "definitely absent", `locate` returns NotFound with no remote
+    /// `exists()` probe (SnapshotOnly reads never look outside the published
+    /// snapshot; design/02 "Snapshot read path") and without fetching the
+    /// cold shard: the filter and the cold shards share the same `omemfs
+    /// pack` snapshot with no staleness gap, so a definite miss proves the
+    /// hash cannot be in any cold shard. Verified by asserting zero
+    /// `exists()` calls and that the shard is NOT present in objcache
+    /// afterward (a fetch would have cached it).
     #[test]
     fn definite_absence_short_circuits_via_bloom_filter() {
         use crate::codec::pack::index::InlineEntry;

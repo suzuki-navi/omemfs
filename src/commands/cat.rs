@@ -97,7 +97,7 @@ pub fn run(opts: CatOptions) -> Result<(), Error> {
                         // for a genuinely orphaned logical object, or the
                         // unchanged pack-layer summary for an artifact hash.
                         let hash = parse_hash_for_remote(ref_str)?;
-                        match crate::commands::push::transfer_objects(
+                        match crate::commands::transfer::transfer_objects(
                             &pack_reader,
                             &local,
                             &hash,
@@ -128,7 +128,7 @@ pub fn run(opts: CatOptions) -> Result<(), Error> {
                         // so the user sees the object's content rather than a
                         // pack-layer summary.
                         let hash = resolve_prefix_on_remote(&pack_reader, ref_str)?;
-                        crate::commands::push::transfer_objects(
+                        crate::commands::transfer::transfer_objects(
                             &pack_reader,
                             &local,
                             &hash,
@@ -177,7 +177,14 @@ pub fn run(opts: CatOptions) -> Result<(), Error> {
     // The tree check must run before the --manifest branch: trees are never
     // chunked (see the "Trees are never chunked" comment below), so
     // `--manifest` on a tree is an error rather than a fabricated manifest.
-    if let Ok(tree) = Tree::deserialise(&data) {
+    // `is_tree_bytes` (the ED F1 tag alone) decides "tree or blob?" first, so
+    // a blob whose content happens to parse as valid tree JSON is never
+    // misidentified as a tree (design/01_object_model.md "Tree/blob
+    // discrimination"; D13) -- only a tag-confirmed tree is then parsed via
+    // `Tree::deserialise`, propagating a genuinely corrupt tagged tree's
+    // error instead of silently falling through to the blob branch below.
+    if Tree::is_tree_bytes(&data) {
+        let tree = Tree::deserialise(&data)?;
         if opts.manifest_only {
             return Err(Error::Other(
                 "--manifest is not applicable to a tree object".to_string(),
@@ -463,7 +470,10 @@ fn print_logical_object(
 ) -> Result<(), Error> {
     // The tree check must run before the --manifest branch, same as in
     // run(): trees are never chunked, so --manifest on a tree is an error.
-    if let Ok(tree) = Tree::deserialise(data) {
+    // See run()'s comment above for why `is_tree_bytes` gates this instead
+    // of a bare `Tree::deserialise` success check (D13).
+    if Tree::is_tree_bytes(data) {
+        let tree = Tree::deserialise(data)?;
         if manifest_only {
             return Err(Error::Other(
                 "--manifest is not applicable to a tree object".to_string(),

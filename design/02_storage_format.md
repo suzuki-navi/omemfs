@@ -673,15 +673,31 @@ locate_snapshot(target_hash):
 
 On index hit:
   inline entry     → return data bytes directly (already encrypted; caller decrypts).
-  pack entry       → obtain the pack through pack_hash single-flight, then slice locally.
+  pack entry       → obtain the whole pack into the pack cache once, then slice locally.
   standalone entry → fetch objects/<storage_key> directly from remote.
 ```
 
-The pack cache is also single-flight per `pack_hash`: the first caller fetches
-and atomically installs `.omemfs/packcache/<pack_hash>` while concurrent callers
-wait, then all serve their slices from that one file. Slice reads seek directly
-to the indexed offset; they must not read-and-discard preceding bytes. A failed
-fetch wakes waiters with the same error and leaves no completed cache entry.
+**Pack cache fetch.** The first read of a pack downloads the whole pack and
+atomically installs it as `.omemfs/packcache/<pack_hash>`; later slices of that
+pack are served from that one local file. A pack is never fetched twice by
+concurrent readers: a cache miss takes a single reader-wide fetch lock, checks
+the cache again under the lock, and only then downloads. A waiter that finds the
+pack installed by the time it gets the lock skips the download. If a download
+fails, the error is returned to the caller that ran it and no completed cache
+entry is left; a waiter then takes the lock and attempts the download itself.
+
+Two known performance limits of this implementation (correctness is not
+affected):
+
+- **The fetch lock is one lock per reader, not per `pack_hash`.** First-time
+  downloads of *different* packs are serialised, so concurrent readers cannot
+  overlap remote round trips for distinct packs. Index-file and Bloom-filter
+  loads use the same kind of reader-wide lock.
+- **A slice read opens the cached pack and discards the bytes before the
+  indexed offset** (`PACK_BODY_OFFSET` + entry offset) instead of seeking to it.
+  Packs target 4 MiB (16 MiB maximum), so an object costs on average about half
+  a pack of local reads. The `ObjectStore` trait has no seek or range-read
+  operation, and the remote is only ever read as a whole pack.
 
 All normal read-side classifications are derived from one published index root.
 This eliminates the per-object `HEAD` round trip and makes concurrent planning
@@ -837,6 +853,27 @@ Tree objects are small JSON blobs with highly repetitive field names (`"entries"
 ### Implementation note
 
 Always open object files in binary mode. Text-mode line-ending conversion on Windows would corrupt the content and invalidate the hash.
+
+### Untrusted-remote validation: decompression output size limit
+
+On an unencrypted remote, the compressed bytes read by `decompress` have no
+GCM tag protecting them, so a hostile or corrupted remote can supply a small
+`ED DE`/`ED DF` payload engineered to zstd-decompress into an arbitrarily
+large output — a decompression bomb. Because L3 chunking sits above L4 in
+the pipeline (see "Write algorithm" above), every legitimate decompressed
+result is bounded by `CDC_MAX` (≤ ~16 MiB; `src/codec/chunk.rs`) plus small
+codec overhead; a tree object (which bypasses L3 chunking, see "Streaming
+design") is bounded in practice by per-directory entry counts and is smaller
+still in every observed case. `decompress_zstd_bytes` therefore reads through
+a size-limited adapter (`Read::take`, requesting one byte more than the limit
+so that "still more data available past the limit" can be distinguished from
+"the stream ended exactly at the limit") instead of `read_to_end` with no
+bound, and returns `Error::InvalidObject` if the limit is exceeded. The limit
+is `DECOMPRESS_MAX = 64 MiB` — four times `CDC_MAX` — chosen generously above
+the ~16 MiB legitimate ceiling to leave headroom for codec/dictionary
+overhead and any future chunk-size tuning, while still keeping a hostile
+payload's worst case bounded to a two-order-of-magnitude blowup rather than
+unbounded.
 
 ---
 
@@ -1020,6 +1057,22 @@ entry_count : 4 bytes  (big-endian)
 entries     : entry × entry_count  (sorted ascending by hash)
 ```
 
+**Untrusted-remote validation of `entry_count`**: `entry_count` is attacker-
+or corruption-controlled on an unencrypted or compromised remote (there is no
+GCM tag to reject a tampered plaintext before this field is read). Before
+allocating a `Vec` sized by `entry_count`, the deserialiser caps it at the
+maximum number of entries that could possibly fit in the remaining bytes,
+computed from the smallest possible entry encoding (tag `0x03` standalone:
+1-byte tag + 32-byte hash = 33 bytes). Concretely: `entry_count =
+entry_count.min((data.len() - pos) / 33)` before it is used as a `Vec`
+capacity. A value exceeding this bound cannot be satisfied by the actual byte
+stream regardless of its truncation-check outcome, so capping first prevents
+an attacker from forcing a huge allocation (e.g. `entry_count = 0xFFFFFFFF`
+attempting a ~515 GB allocation and aborting the process) purely from a
+32-bit field in a few-KB file. The existing per-entry truncation checks
+during the parse loop are unaffected — they still reject a file whose actual
+entry count/sizes disagree with the (now-capped) count as before.
+
 Entries are sorted by hash so binary search (O(log N)) can be used. Ordering is
 **strictly** ascending: no two entries may share a hash. This is enforced on
 deserialise (`entries[i].hash <= entries[i-1].hash` is rejected as an unsorted
@@ -1088,7 +1141,7 @@ delta_hash[0..N]   : 32 × delta_count bytes  (newest first)
 cold_shard[0..2^cold_prefix_bits] : 32 × 2^cold_prefix_bits bytes
 ```
 
-Index root plaintext size at various `cold_prefix_bits` values (with `delta_count = 0`):
+Index root plaintext size at various `cold_prefix_bits` values (with `delta_count = 0`). The writer only produces 0 (fresh repository) and 8 (after the first cold shard split); the other rows are for size reference only (the reader accepts any value):
 The stored size in the remote backend adds 28 bytes (12-byte nonce + 16-byte GCM tag) when encryption is enabled.
 
 | `cold_prefix_bits` | cold_shard entries | Index root size |
@@ -1097,6 +1150,26 @@ The stored size in the remote backend adds 28 bytes (12-byte nonce + 16-byte GCM
 | 4 | 16 | ~656 bytes |
 | 8 | 256 | ~8.5 KiB |
 | 12 | 4 096 | ~128 KiB |
+
+**Untrusted-remote validation of `cold_prefix_bits`**: on an unencrypted
+remote, INDEX_ROOT is stored as plaintext with no GCM tag at all (see
+"Storage location" above), so `cold_prefix_bits` is entirely
+attacker-or-corruption-controlled. The largest value ever legitimately
+written by this client is far below the 12 shown in the table above — `pack`
+only increments it in steps of 4 bits, and each increment requires every
+`2^N` existing prefix slot to already have a dedicated shard, so reaching
+even `cold_prefix_bits = 16` (65 536 shard slots) would require the remote to
+already hold tens of thousands of split cold shards. The deserialiser rejects
+any `cold_prefix_bits > 32` (`Error::InvalidObject`) before computing
+`1u64 << cold_prefix_bits` or the downstream `delta_count * 32 + cold_shard_count
+* 32` byte-length arithmetic. 32 is chosen generously above any plausible
+operational value (comfortably above the table's largest entry, 12) while
+still being small enough that `1u64 << 32` (the shard count implied by the
+bound) times 32 bytes stays a bounded, non-overflowing `u64` computation on
+every platform — unlike `1usize << 64` and above, which either panics (debug)
+or silently wraps to 0 (release), corrupting the truncation check that
+follows. A rejected `cold_prefix_bits` never reaches the shift or the
+allocation.
 
 ### Three-tier index
 
@@ -1119,23 +1192,51 @@ The stored size in the remote backend adds 28 bytes (12-byte nonce + 16-byte GCM
 - The index root's `cold_shard[p]` field holds the hash of the shard file for hash-prefix `p`.
 - Multiple prefix slots may point to the same shard file (shared shard). A shared shard holds all entries whose prefix has not yet been split out into a dedicated file.
 
+### Appending new cold entries
+
+When `omemfs pack` moves newly-unreachable entries into the cold tier, it
+appends them to the shared shard (the shard referenced by slot 0) and
+rewrites that shard under a new hash. Because a rewrite changes the shard's
+hash, every index root slot that pointed at the *old* shared shard hash must
+be repointed at the *new* one.
+
+The update MUST be scoped to exactly the slots whose value equals the old
+shared shard hash (the value slot 0 held **before** this rewrite):
+
+1. Record the old shared shard hash (`cold_shard[0]` as read at the start of
+   this operation, or the all-zero placeholder if no shared shard exists
+   yet) before writing the new shard.
+2. Write the new shared shard (old entries + newly appended entries) and
+   obtain its hash.
+3. For every slot `p` in `cold_shard[]`: update `cold_shard[p]` to the new
+   shared shard hash **only if** `cold_shard[p]` currently equals the old
+   shared shard hash recorded in step 1.
+
+Slots that already point to a **dedicated shard** (i.e. a shard produced by
+"Cold shard splitting" below, whose hash therefore differs from the old
+shared shard hash) MUST NOT be touched by this step — a dedicated shard's
+entries are not part of the shared shard being rewritten, and overwriting
+its slot with the new shared shard hash would make those entries
+unreachable from the index root (the shard file itself would remain on the
+remote, but nothing would reference it any more).
+
 ### Cold shard splitting
 
 On each `omemfs pack` run, if any cold shard file exceeds 4 MiB:
 
 1. Load the largest cold shard file.
-2. Select the most populous hash prefix `p` within it.
+2. Select the most populous hash prefix `p` within it. The prefix is the **first byte** (8 bits) of the hash, regardless of the current `cold_prefix_bits`.
 3. Extract all entries with prefix `p` into a new dedicated shard file (2 files written).
 4. Write a new shared shard file containing the remaining entries.
 5. Update the index root: `cold_shard[p]` → new dedicated shard hash; all other slots pointing to the old shared shard → new shared shard hash.
 
 This produces exactly **2 new shard files** per `omemfs pack` invocation, regardless of the total number of entries.
 
-**Increasing `cold_prefix_bits`** (e.g., 4 → 8):
+**Raising `cold_prefix_bits` to 8**:
 
-No new shard files are needed. The `cold_shard[]` array in the index root is expanded: each existing 4-bit prefix slot `x` is replicated into sixteen 8-bit slots `x0`–`xf` pointing to the same shard hash. Only the index root is rewritten.
+Splitting addresses slots by the first hash byte, so `cold_prefix_bits` must be at least 8 before the first split. If it is lower (it is 0 on a fresh repository), it is raised **directly to 8** at that point rather than in steps: each existing slot is replicated into `2^(8 - old_bits)` slots pointing to the same shard hash, so no new shard files are needed and only the index root is rewritten.
 
-`cold_prefix_bits` is incremented (by 4) when the shared shard cannot be split further at the current bit depth — i.e., all 2^N prefixes already have dedicated shards.
+8 is the maximum the writer produces. Once it is reached, further splits only reassign slots within the 256-slot array. A shared shard that is still over 4 MiB when every slot already has a dedicated shard cannot be split further and simply grows. (The reader handles any `cold_prefix_bits`; only the writer is limited to 8.)
 
 ### Pack file consolidation (`omemfs pack`)
 
@@ -1215,60 +1316,54 @@ with a new one under a new hash.
 
 ### Read path
 
+This section describes `PackReader::locate` in detail. It is the same algorithm
+as "Snapshot read path" above, with the order in which the cold-layer steps run.
+
 ```
 load(target_hash):
   1. Check local objects/ cache — return immediately on hit.
   2. locate(target_hash) — described below — to classify the hash as
-     Entry / Standalone / NotFound.
+     Entry / NotFound.
   3. Resolve the classification to bytes per "On index hit" below.
 
 locate(target_hash):
-  1. Fetch the index root (local cache or S3 GET).
+  1. Use the index root retained at reader construction (if there is none,
+     the remote has never been pushed to: fall back to a direct fetch of
+     objects/<storage_key>).
   2. Search delta files newest-first (binary search within each).
      → found: Entry (inline or pack).
   3. Binary search the hot index.
      → found: Entry.
   4. [Improvement A] Compute p = first cold_prefix_bits bits of target_hash;
      let shard = cold_shard[p]. If shard is already present in the local
-     objects/ cache (a purely local existence check, no network call):
+     objcache/ (a purely local existence check, no network call):
        Search it now.
        → found: Entry. Done.
-       → not found: remember that this exact shard has already been
-         searched, so step 7 below is skipped later — continue to step 5.
-     Else (shard not yet cached locally): continue to step 5 without any
-     network call yet.
-  5. Issue HEAD objects/<storage_key> to the remote backend. This step is
-     unconditional — it always runs, regardless of what the Bloom filter
-     (step 6) would say — because a standalone object can be written to the
-     remote at any time, independently of when the last `omemfs pack` run
-     built the current Bloom filter snapshot (see "Why the Bloom filter is
-     checked before the cold-shard fetch, but never before the remote
-     probe" below). Skipping this probe on a Bloom "definitely absent"
-     answer would incorrectly report NotFound for such a recently-written
-     object.
-     → 200: Standalone. Done.
-     → 404: continue to step 6.
-  6. [Improvement C] If a Bloom filter is recorded for this snapshot
-     (index root's bloom_hash is set) and, once loaded (objects/ cache, or
-     fetch + decrypt + cache on first use — see above), it reports
-     target_hash as "definitely absent":
-       → the object does not exist (error). Step 7 (the cold-shard fetch)
-         is skipped: the Bloom filter and the cold shards are both built
-         from the same `omemfs pack` snapshot with no staleness gap between
-         them, so "definitely absent" from the filter is exact for "not
-         present in any cold shard" — unlike for the standalone case in
-         step 5, which is why this check must not also skip step 5.
-     Otherwise ("maybe present", no Bloom filter recorded at all, or step 4
-     already searched the covering shard): continue to step 7 exactly as
-     before this change.
-  7. If step 4 already searched this shard (cache hit, not found there), or
-     step 6 just ruled it out via the Bloom filter: skip — already known to
-     miss the cold layer, no need to fetch it. Otherwise: fetch
-     cold_shard[p] from remote, cache it in objects/, and binary search it
-     now.
+       → not found: NotFound. Done (step 6 would search this same shard).
+     Else (shard not yet cached locally): continue to step 5.
+  5. [Improvement C] If a Bloom filter is recorded for this snapshot
+     (index root's bloom_hash is set), it is structurally usable, and, once
+     loaded (objcache/, or fetch + decrypt + cache on first use — see above),
+     it reports target_hash as "definitely absent":
+       → NotFound. Step 6 (the cold-shard fetch) is skipped.
+     Otherwise ("maybe present", no Bloom filter recorded, or a structurally
+     defective filter that is ignored): continue to step 6.
+  6. Fetch cold_shard[p] from remote, cache it in objcache/, and binary
+     search it.
      → found: Entry.
-     → not found: the object does not exist (error).
+     → not found: NotFound.
+```
 
+There is **no per-object remote `HEAD`** in `locate`. A hash that is in none of
+the snapshot's indexes is `NotFound`, even if an unindexed standalone object
+with that key happens to sit on the remote. That is by design: a successful
+push publishes an index entry for every object reachable from its root before
+the index-root CAS (see "Snapshot read path" and "Membership test semantics
+(push path)" below), so an object that matters is always in the snapshot. The
+only remote `HEAD` on the read side is the diagnostic lookup that `omemfs cat`
+runs for a full hash after `locate` reports `NotFound`.
+
+```
 On index hit:
   inline entry     → return data bytes directly (already encrypted; caller decrypts).
   pack entry       → if .omemfs/packcache/<pack_hash> absent, fetch the whole pack from remote once
@@ -1278,94 +1373,39 @@ On index hit:
   standalone entry → fetch objects/<storage_key> directly from remote.
 ```
 
-**Why the cold shard is checked before the remote probe when already cached
-(Improvement A)**
+**Untrusted-remote validation of pack entry `length`**: `offset` and `length`
+come from an index-file `PackEntry` (see "Index file format" above), which on
+an unencrypted or compromised remote is not authenticated before this slice
+read runs. Before allocating the slice buffer, `fetch_pack_slice` caps
+`length` at the size of the already-locally-cached pack file (`packcache`
+holds the whole pack body once fetched, so its stat'd byte length is known
+without any extra remote call). A `length` that would read past the end of
+the cached pack — whether because it is individually absurd or because
+`offset + length` overruns the file — is rejected with
+`Error::InvalidObject` before the `vec![0u8; length as usize]` allocation, so
+a hostile or corrupted index entry cannot force a multi-gigabyte allocation
+(up to 4 GiB, the `u32` maximum) merely by writing a large `length` field.
+This bound is exact (the real pack file size) rather than a fixed constant,
+because the pack is always fetched and cached in full before any slice is
+served (see the `pack entry` row above), so its true size is always known by
+the time a slice length needs checking.
 
-The original order placed the standalone `HEAD` probe before the cold shard
-specifically to avoid fetching a whole cold shard file just to learn it does
-not contain the target hash: cold shards hold only pack and inline entries,
-never standalone entries, so on a cold shard's *first* lookup, fetching it
-before probing the remote would frequently mean paying for a multi-hundred-
-KiB-to-multi-MiB download that cannot possibly answer a standalone hash. That
-tradeoff is correct only while the shard is not yet cached.
+**Why the covering cold shard is searched before the Bloom filter (Improvement A)**
 
-Once a shard has been fetched at least once, though, it lives in `objects/`
-forever — index files are content-addressed and immutable (see "Index file
-local caching" above) — so a later search of it is a local disk read, not a
-network round trip. At that point there is no longer a reason to pay for the
-remote `HEAD` first: searching the already-cached shard is strictly cheaper
-than the probe, for any hash that shard happens to cover, whether the search
-hits or misses. Step 4 therefore checks whether the covering shard is already
-in the local cache — itself a purely local existence check — and, if so,
-searches it immediately instead of deferring to the probe. A shard that has
-never been fetched still defers to the probe exactly as before, so the
-original cold-start tradeoff this section used to describe is unchanged for
-that case; this only changes behaviour once a shard is warm.
+Once a shard has been fetched at least once it lives in `objcache/` forever, because index files are content-addressed and immutable (see "Index file local caching" above). A later search of it is then a local disk read, cheaper than loading and consulting the Bloom filter, for any hash the shard covers, whether the search hits or misses. Step 4 therefore checks whether the covering shard is already cached, which is a purely local existence check, and searches it immediately. A shard that has never been fetched is left alone, so the first lookup for it goes on to the Bloom check and, only if that cannot rule the hash out, the shard download.
 
-**Why the Bloom filter is checked before the cold-shard fetch, but never
-before the remote probe (Improvement C)**
+**Why the Bloom filter can skip the cold-shard fetch (Improvement C)**
 
-A Bloom filter answers "definitely absent" or "maybe present" for any hash
-known to the remote at all — inline, pack, or standalone (see "Bloom filter"
-below) — without touching the pack index or the object store beyond the one
-cached fetch of the filter itself. But the filter is a **snapshot**: it is
-built once during `omemfs pack` and covers exactly the hashes known to the
-remote *at that moment*. Cold shards are built from that *same* snapshot, at
-the *same* time, by the *same* `omemfs pack` run — so a Bloom "definitely
-absent" answer is safe to substitute for "this hash is definitely not in any
-cold shard either": both are derived from identical snapshot state with no
-staleness gap between them. False negatives are impossible by construction,
-so skipping the cold-shard *fetch* (step 7) on a definite miss never causes a
-missed object — if the filter is right that the hash was never known to the
-remote as of the last `pack`, it cannot be in a cold shard produced by that
-same `pack`.
+The Bloom filter and the cold shards are both built from the same `omemfs pack` snapshot, by the same run, so a "definitely absent" answer is exact for "not in any cold shard". False negatives are impossible by construction, so skipping the shard download on a definite miss never loses an object. A "maybe present" answer (a false positive, or a hash in a category the filter cannot narrow down), no filter recorded at all (`bloom_hash_opt()` returns `None`: a remote that has never run `omemfs pack`), or a structurally defective filter (see "Structural validation (push and read paths)") falls through to the shard fetch.
 
-This reasoning does **not** extend to the remote HEAD probe (step 5). A
-standalone object can be written directly to the remote (`objects/<hash>`,
-with no index entry) at **any** time, including after the last `omemfs pack`
-run that built the current Bloom filter. Such an object is real and present
-on the remote right now, but it was never inserted into the filter — it
-didn't exist yet when the filter was built — so the filter reports
-"definitely absent" for it. Trusting that answer to skip the HEAD probe would
-incorrectly report `NotFound` for an object that genuinely exists. The HEAD
-probe is therefore always run unconditionally (step 5), and the Bloom filter
-is consulted only afterwards (step 6), where its sole job is to decide
-whether it is worth paying for a cold-shard fetch — a network download of a
-whole shard file — for a hash the filter proves cannot be in any cold shard.
+**Cost only, never classification**
 
-When the filter answers "maybe present" (a false positive, or a true
-positive from a category the filter cannot narrow down — it cannot
-distinguish a pack entry from a standalone object by design), or when no
-Bloom filter is recorded at all (`bloom_hash_opt()` returns `None`: an older
-remote that predates this feature, or one that has never run `omemfs pack`),
-or when step 4 already searched the covering shard, the read path falls
-through to the cold-shard fetch exactly as it did before this change. The
-Bloom filter is therefore a pure additive fast path for skipping an
-unnecessary shard download: it never changes the final classification of a
-hash that does exist, and it never substitutes for the remote HEAD probe —
-only for the cold-shard fetch.
+Improvements A and C change *whether and when* network calls happen while resolving a hash, never *what* `locate` returns: the answer always comes from the delta, hot, and cold indexes of one snapshot.
 
-**Cost and ordering only, never classification**
-
-Improvements A and C change *when* and *whether* network calls happen while
-resolving a hash; they never change *what* `locate` ultimately returns. For
-any given hash, the final classification — Entry, Standalone, or NotFound —
-is exactly the same before and after these changes, because the same
-underlying sources of truth (the delta/hot/cold indexes, the Bloom filter,
-and the remote's own set of standalone objects) are consulted either way,
-only in a different order and with two new opportunities to stop early once
-the answer is already certain from information already at hand: a shard
-that's already warm in the cache (Improvement A, which can still resolve a
-hit or a shard-covered miss before the remote probe ever runs), or a Bloom
-filter's definite-absence answer (Improvement C, which — precisely because
-it can only ever prove absence from the cold-shard snapshot, not from the
-remote's live set of standalone objects — always runs after the remote probe
-has already missed, so it only ever skips the cold-shard fetch, never the
-probe itself).
 
 ### Bloom filter
 
-The pack stage maintains a Bloom filter over **all** known remote object hashes — inline, pack, and standalone. It is used during push to quickly determine whether an object with the same hash has already been pushed before, avoiding redundant writes; it is also consulted on the read path (see "Read path" above, Improvement C) to recognise a genuinely-absent hash without a remote probe or cold-shard fetch.
+The pack stage maintains a Bloom filter over **all** known remote object hashes — inline, pack, and standalone. It is used during push to quickly determine whether an object with the same hash has already been pushed before, avoiding redundant writes; it is also consulted on the read path (see "Read path" above, Improvement C) to recognise a genuinely-absent hash without a cold-shard fetch.
 
 **Membership test semantics (push path)**
 
@@ -1381,20 +1421,15 @@ The pack stage maintains a Bloom filter over **all** known remote object hashes 
 False negatives are impossible by design. False positives trigger an unnecessary index lookup but never cause data loss or a missing index entry.
 
 **Membership test semantics (read path, Improvement C)** — see "Read path"
-above for the full step ordering (the Bloom check runs after delta/hot/cached-
-shard lookups have already missed, **and** after the remote HEAD probe has
-already missed). In short: the remote HEAD probe (step 5) always runs first
-and is never skipped, because it is the only check that can observe a
-standalone object written after the Bloom filter's last `omemfs pack`
-snapshot. Only once the probe has also missed does `"definitely absent"`
-short-circuit `locate` straight to `NotFound`, skipping the cold-shard fetch
-(step 7) — safe because the Bloom filter and the cold shards share the same
-snapshot with no staleness gap between them. `"maybe present"` (or no Bloom
-filter recorded) falls through to the cold shard search exactly as `locate`
+above for the full step ordering. `"definitely absent"` short-circuits `locate`
+straight to `NotFound` and skips the cold-shard fetch. This is safe because the
+Bloom filter and the cold shards share one `omemfs pack` snapshot with no
+staleness gap between them, and because a read never looks outside that
+snapshot (there is no per-object remote `HEAD`). `"maybe present"`, or no Bloom
+filter recorded, falls through to the cold-shard search exactly as `locate`
 would without a Bloom filter at all. The read path's use is strictly a fast
-path for skipping an unnecessary shard download — unlike the push path, it
-never substitutes for the index or remote HEAD lookups when the filter cannot
-rule an object out, and it never skips the remote HEAD probe itself.
+path for skipping an unnecessary shard download; unlike the push path, it never
+substitutes for the index lookup when the filter cannot rule an object out.
 
 **Bloom filter file format** (stored as a CAS object, magic `ED E4`):
 
@@ -1439,7 +1474,11 @@ The final row is not just the largest table entry — it is the hard ceiling
 push:
   1. Fetch the index root → load Bloom filter (local cache or S3 GET). Any
      structurally valid filter is accepted regardless of its size relative to
-     the current design target — see "Filter sizing" below.
+     the current design target — see "Filter sizing" below. A genuine
+     absence (no bloom_hash, or an "object not found" fetch result) falls
+     back to a fresh empty filter; any other fetch/decrypt/deserialise
+     failure aborts the push instead of silently substituting one — see
+     "Filter sizing" below ("Genuine absence vs. an unreadable filter").
   2. For each object to push:
        Bloom filter → "definitely absent" → include in push batch.
        Bloom filter → "maybe present"     → verify via index / HEAD; skip if already present.
@@ -1459,10 +1498,12 @@ does not match the current design target.** A structurally valid filter —
 `num_bits >= 1` and `num_hash_functions >= 1`, successfully fetched, decrypted,
 and deserialised — is accepted and used as-is, whatever its `(num_bits,
 num_hash_functions)` happen to be. A fresh (empty) filter is only constructed
-when there is nothing valid to load at all: no snapshot, an all-zero
-`bloom_hash`, a fetch/decrypt/deserialise failure, or a structurally unusable
-filter (`num_bits == 0`, which would divide by zero inside `may_contain`, or
-`num_hash_functions == 0`, which is well-defined but useless).
+when there is nothing valid to load because the filter **genuinely does not
+exist yet**: no snapshot at all, an all-zero `bloom_hash`, or the Bloom
+object fetch failing with "object not found" — or when what was fetched is
+structurally unusable (`num_bits == 0`, which would divide by zero inside
+`may_contain`, or `num_hash_functions == 0`, which is well-defined but
+useless).
 
 This is a deliberate narrowing of the older rule ("rebuild on any size
 mismatch"), which had a sharp edge: rebuilding an empty filter for a remote
@@ -1472,6 +1513,44 @@ any structurally valid filter regardless of size removes that edge entirely —
 there is no longer a "resize the target" step that can trigger it — while
 changing nothing about correctness, since membership answers never depended on
 matching the local target in the first place.
+
+**Genuine absence vs. an unreadable filter — these are not the same failure
+and must not be handled the same way.** A missing `bloom_hash` (or a fetch
+that fails with "object not found") means the remote has no Bloom filter yet
+— a fresh empty filter is the correct, harmless answer, and this is expected
+on a brand-new repository or one whose only `pack` predates Bloom filter
+support. But once `bloom_hash` names an object that is *supposed* to exist,
+any other failure while obtaining it — a transient I/O or network error, an
+authentication failure, a GCM decrypt failure (wrong key or corrupted
+ciphertext), or a deserialisation failure (corrupted or truncated plaintext)
+— means the remote's actual Bloom filter state could not be determined at
+all. Silently substituting a fresh empty filter in that case is unsafe: for
+the rest of that push, every cold-tier object the real filter would have
+reported "maybe present" instead reports "definitely absent" and gets
+re-uploaded and re-inserted into the *published* filter, corrupting it for
+every subsequent reader until the next `omemfs pack` rebuilds it from
+scratch — a false negative disguised as a routine cache miss, breaking the
+no-false-negatives invariant the rest of this design section relies on (see
+"Bloom filter" above). Such a push must instead fail outright, surfacing the
+underlying error to the caller, so a transient or persistent problem is
+visible and never silently masked by a filter reset.
+
+`load_remote_bloom` therefore distinguishes exactly these two outcomes:
+
+- **`bloom_hash` unset, or the fetch fails with `Error::ObjectNotFound`**
+  (the object genuinely does not exist on the remote) → fall back to a
+  fresh empty filter, sized from whatever capacity hint is available (see
+  below).
+- **Any other failure** while reading the object that `bloom_hash` names —
+  a non-`ObjectNotFound` error from the fetch (I/O, auth, or any other
+  backend error), a `read_to_end` failure, a `decrypt` failure, or a
+  `BloomFilter::deserialise` failure — → propagate the error; `PackWriter`
+  construction fails and the push does not proceed.
+- A **structurally unusable but successfully decoded** filter (`num_bits ==
+  0` or `num_hash_functions == 0`) is a separate, distinct case: the object
+  was read, decrypted, and deserialised without error, so this is not
+  treated as "unreadable" — it falls back to a fresh filter sized from the
+  decoded filter's `element_count`, per the existing rule above.
 
 **Choosing a capacity (when a fresh filter must be built).** The designed
 capacity for `n` known elements is:

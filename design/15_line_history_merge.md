@@ -71,6 +71,55 @@ back to "no timestamp" on any decode failure rather than erroring out. A
 buffer that ends with `\n` does not produce a trailing empty line (the
 terminator is not itself a line); an empty buffer splits to zero lines.
 
+### Backslash-continued physical lines are merged into one logical record
+
+zsh (and other shells' history formats) writes a multi-line command — most
+commonly a `for`/`while`/`if` block entered interactively, or any line ended
+with an explicit `\` to request a continuation — as several **physical**
+lines in the history file, where every line except the last ends with a
+trailing `\`. Splitting on bare `b'\n'` (as "Lines are byte slices" above
+does on its own) treats each physical line as an independent record. That is
+wrong for two compounding reasons:
+
+- A continuation physical line never carries its own `extended_history`
+  timestamp prefix (only the first physical line of the command does) — so
+  under "Ordering" below it parses as "no timestamp" and sorts as
+  `i64::MIN` in timestamped mode, floating to the front of the merged
+  output, detached from the command line it belongs to.
+- Even without timestamped sorting, the physical lines of one logical command
+  are diffed, kept/dropped (Policy A), and reordered as independent lines,
+  so a merge can interleave unrelated content between them, or keep one
+  physical line while dropping another — silently corrupting the command.
+
+To avoid both, line splitting joins a `\`-terminated physical line with the
+physical line(s) that follow it into a single **logical record** *before*
+any diffing, Policy A, or ordering runs — every other step in this document
+(diff engine, segment aggregation, deletion policy, conflict-fallback
+trigger, ordering, output encoding) operates on logical records, not raw
+physical lines, and "line" elsewhere in this document means "logical
+record" unless stated otherwise. A logical record is one or more physical
+lines joined back together with `b'\n'` exactly as they appeared in the
+input (the trailing `\` on every non-final physical line is left in place,
+byte-for-byte — it is not stripped or interpreted); only the terminating
+physical line (the first one that does *not* end with `\`) closes the
+record. A `\` at the very end of the buffer, with no following physical
+line, is not a continuation (there is nothing to continue into) and stands
+as its own one-line record, trailing backslash included. This is a
+structural join, not shell-syntax-aware: it treats *any* physical line
+ending in `\` as continued, matching how zsh itself writes (and reads back)
+a multi-line history entry, with no attempt to parse quoting or escaping
+inside the line.
+
+Joining happens identically, and independently, for `base`, `local`, and
+`remote` before the diff engine ever sees them — a logical record that
+happens to be split differently across the three inputs (e.g. one side
+still has it as a multi-line continuation, the other rewrote it as a single
+physical line with embedded `\n` removed) is simply a different record on
+that side, diffed like any other line-level change; this document does not
+attempt to reconcile *how* a command was continued, only to keep whatever
+continuation shape each input already has intact as one atomic unit through
+the merge.
+
 ### Diff engine
 
 Line-level diffs are computed with the [`similar`](https://docs.rs/similar)
@@ -185,10 +234,15 @@ its own line wherever the algorithm above places it.
 
 ### Output encoding
 
-Merged lines are rejoined with `b'\n'` separators. A trailing `b'\n'` is
-appended iff the merged line list is non-empty (an empty merge result is the
-empty byte string, not a lone newline). Exact original trailing-newline
-presence is not preserved bit-for-bit — this is a merge, not a copy.
+Merged lines (logical records) are rejoined with `b'\n'` separators. A
+trailing `b'\n'` is appended iff the merged line list is non-empty (an empty
+merge result is the empty byte string, not a lone newline). Exact original
+trailing-newline presence is not preserved bit-for-bit — this is a merge,
+not a copy. A multi-physical-line logical record already contains its own
+internal `b'\n'`s (see "Backslash-continued physical lines are merged into
+one logical record" above), so joining records with `b'\n'` reproduces
+exactly the same physical-line layout — continuation backslashes and all —
+that record had in whichever input it came from.
 
 ## `pull` integration point
 

@@ -80,18 +80,55 @@ pub fn merge(base: &[u8], local: &[u8], remote: &[u8]) -> MergeOutcome {
 // Line splitting / joining
 // ---------------------------------------------------------------------------
 
-/// Split `content` into lines on `b'\n'`. A trailing newline does not produce
-/// a trailing empty line (the terminator is not itself a line); an empty
-/// buffer splits to zero lines.
+/// Split `content` into logical records on `b'\n'`, then join any
+/// backslash-continued physical line with the physical line(s) that follow
+/// it into one logical record (design/15_line_history_merge.md,
+/// "Backslash-continued physical lines are merged into one logical record";
+/// D17). A trailing newline does not produce a trailing empty record (the
+/// terminator is not itself a line); an empty buffer splits to zero records.
 fn split_lines(content: &[u8]) -> Vec<&[u8]> {
     if content.is_empty() {
         return Vec::new();
     }
-    let mut lines: Vec<&[u8]> = content.split(|&b| b == b'\n').collect();
-    if content.ends_with(b"\n") {
-        lines.pop();
+
+    // First pass: physical-line byte ranges (no `\n` separator included),
+    // exactly matching the old split-on-`\n` behaviour (including the "no
+    // trailing empty line" rule for a buffer that ends with `\n`).
+    let mut phys_lines: Vec<Range<usize>> = Vec::new();
+    let mut start = 0usize;
+    for i in 0..content.len() {
+        if content[i] == b'\n' {
+            phys_lines.push(start..i);
+            start = i + 1;
+        }
     }
-    lines
+    if start < content.len() {
+        phys_lines.push(start..content.len());
+    }
+
+    // Second pass: merge a run of consecutive physical lines where every
+    // line but the last ends in `\` into one logical record spanning from
+    // the run's first line start to its last line end -- a plain sub-slice
+    // of `content` that naturally includes the internal `\n` bytes (and
+    // every continuation line's trailing `\`) exactly as they appeared in
+    // the input. A physical line ending in `\` with no following physical
+    // line (the run is already at the last line) is not merged further: it
+    // has nothing left to continue into and stands as its own record,
+    // trailing backslash included.
+    let mut logical: Vec<Range<usize>> = Vec::new();
+    let mut i = 0;
+    while i < phys_lines.len() {
+        let mut end = phys_lines[i].end;
+        let mut j = i;
+        while content[phys_lines[j].clone()].ends_with(b"\\") && j + 1 < phys_lines.len() {
+            j += 1;
+            end = phys_lines[j].end;
+        }
+        logical.push(phys_lines[i].start..end);
+        i = j + 1;
+    }
+
+    logical.into_iter().map(|r| &content[r]).collect()
 }
 
 /// Join `lines` with `b'\n'`, appending a trailing `b'\n'` iff `lines` is
@@ -575,6 +612,112 @@ mod tests {
                 .any(|w| w == bad_line.as_slice()),
             "invalid-UTF-8 line not found intact in merged output: {:?}",
             bytes
+        );
+    }
+
+    // --- 14. Backslash-continued physical lines (D17, design/15
+    // "Backslash-continued physical lines are merged into one logical
+    // record") ---
+
+    #[test]
+    fn split_lines_joins_backslash_continued_physical_lines() {
+        // A single logical record spanning 3 physical lines (2 continuations).
+        let content = b": 200:0;for i in 1 2 3; do \\\necho $i\\\ndone".to_vec();
+        let split = split_lines(&content);
+        assert_eq!(
+            split,
+            vec![b": 200:0;for i in 1 2 3; do \\\necho $i\\\ndone".as_slice()],
+            "the 3 physical lines must join into exactly one logical record: {:?}",
+            split
+        );
+    }
+
+    #[test]
+    fn split_lines_does_not_join_a_line_not_ending_in_backslash() {
+        let content = b"a\nb\nc".to_vec();
+        let split = split_lines(&content);
+        assert_eq!(
+            split,
+            vec![b"a".as_slice(), b"b".as_slice(), b"c".as_slice()]
+        );
+    }
+
+    #[test]
+    fn split_lines_trailing_backslash_with_no_following_line_stands_alone() {
+        // A `\` at the very end of the buffer has nothing to continue into.
+        let content = b"a\\".to_vec();
+        let split = split_lines(&content);
+        assert_eq!(split, vec![b"a\\".as_slice()]);
+    }
+
+    #[test]
+    fn multi_line_for_loop_continuation_survives_intact_through_merge() {
+        // Direct reproduction of the D17 bug report: a zsh extended_history
+        // multi-line `for` loop, pulled apart by physical-line splitting
+        // before the fix (its continuation lines, having no timestamp
+        // prefix, sorted to the front of the merged output, detached from
+        // the loop's own header line). After the fix the 3 physical lines
+        // must survive as one intact logical record, in one contiguous
+        // block, wherever the merge places it.
+        let for_loop = b": 200:0;for i in 1 2 3; do \\\necho $i\\\ndone".to_vec();
+
+        let base = lines(&[": 100:0;echo start"]);
+        let mut local = lines(&[": 100:0;echo start"]);
+        local.push(b'\n');
+        local.extend_from_slice(&for_loop);
+        let remote = lines(&[": 100:0;echo start", ": 300:0;echo end"]);
+
+        let outcome = merge(&base, &local, &remote);
+        let bytes = clean(outcome);
+
+        // The exact 3-physical-line sequence must appear intact, byte for
+        // byte, as one contiguous block -- never split apart, reordered
+        // internally, or interleaved with other content.
+        assert!(
+            bytes
+                .windows(for_loop.len())
+                .any(|w| w == for_loop.as_slice()),
+            "the for-loop's 3 physical lines were not found intact as one \
+             contiguous block in the merged output: {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+
+        // The loop's own header line must not appear as a bare, separate
+        // logical record anywhere else in the output (i.e. it was not
+        // ALSO split out on its own by some other code path).
+        let header_alone = b": 200:0;for i in 1 2 3; do \\\n".to_vec();
+        let header_occurrences = bytes
+            .windows(header_alone.len())
+            .filter(|w| *w == header_alone.as_slice())
+            .count();
+        assert_eq!(
+            header_occurrences,
+            1,
+            "the for-loop header must appear exactly once (as part of the \
+             joined record), not duplicated or split out separately: {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+
+    #[test]
+    fn backslash_continued_record_with_no_timestamp_still_sorts_with_neighbors() {
+        // Even in fallback (no-timestamp) mode, a joined multi-physical-line
+        // record must be treated as one unit by Policy A / segment
+        // aggregation -- not as 3 independent lines that could be partially
+        // kept/dropped.
+        let record = b"start\\\nmiddle\\\nend".to_vec();
+        let base = lines(&["a"]);
+        let mut local = lines(&["a"]);
+        local.push(b'\n');
+        local.extend_from_slice(&record);
+        let remote = lines(&["a"]);
+
+        let outcome = merge(&base, &local, &remote);
+        let bytes = clean(outcome);
+        assert!(
+            bytes.windows(record.len()).any(|w| w == record.as_slice()),
+            "the 3-physical-line record was not found intact: {:?}",
+            String::from_utf8_lossy(&bytes)
         );
     }
 }

@@ -335,3 +335,32 @@ append_legacy_pack_detail_record() {
     [[ "$output" != *'"bloom_designed_capacity"'* ]]
     [[ "$output" != *'"bloom_estimated_fp_rate"'* ]]
 }
+
+# ---------------------------------------------------------------------------
+# stats: a blob whose content is well-formed tree JSON is classified as a
+# blob, not a tree (D13, design/01_object_model.md "Tree/blob
+# discrimination"). classify_object's tree branch is gated by the ED F1
+# type-tag prefix, but before Tree::is_tree_bytes existed it went on to
+# treat ANY successful Tree::deserialise on tagged-looking-or-not content
+# as confirmation; a local object store never stores an untagged tree, so
+# this specifically guards the tag-check ordering rather than reproducing
+# transfer.rs's push-side bug (see push.bats and cat.bats for that one).
+# ---------------------------------------------------------------------------
+
+@test "stats_cost: a blob whose content is well-formed tree JSON is counted as blob, not tree" {
+    printf '{"kind":"normal","entries":[]}' > tree_shaped.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    run "$OMEMFS" stats --json
+    [ "$status" -eq 0 ]
+    # Scope the match to the "by_type" object specifically: a bare
+    # '"blob": [0-9]+' pattern also partially matches
+    # "compression_ratio"."blob" (a float like 0.570, whose integer part
+    # before the decimal point satisfies [0-9]+ on its own), which broke
+    # this test with two matches instead of one.
+    local blob_count
+    blob_count="$(echo "$output" | python3 -c 'import json,sys; print(json.load(sys.stdin)["by_type"]["blob"])')"
+    [ -n "$blob_count" ]
+    [ "$blob_count" -ge 1 ]
+}

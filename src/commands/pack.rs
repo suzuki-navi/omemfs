@@ -98,10 +98,13 @@ pub fn run(opts: PackOptions) -> Result<(), Error> {
         .and_then(|h| remote.size(&h).ok())
         .unwrap_or(0);
 
+    let objcache = repo.objcache_store();
+
     // -----------------------------------------------------------------------
     // 1. Merge delta indexes into hot index
     // -----------------------------------------------------------------------
-    let hot_entries = merge_deltas_into_hot(&remote, remote_key.as_ref(), &mut index_root)?;
+    let hot_entries =
+        merge_deltas_into_hot(&remote, &objcache, remote_key.as_ref(), &mut index_root)?;
 
     // -----------------------------------------------------------------------
     // 2. Move unreachable entries from hot to cold
@@ -133,13 +136,14 @@ pub fn run(opts: PackOptions) -> Result<(), Error> {
         cold_entries_extra,
         &mut index_root,
         &remote,
+        &objcache,
         remote_key.as_ref(),
     )?;
 
     // -----------------------------------------------------------------------
     // 4. Split oversized cold shards
     // -----------------------------------------------------------------------
-    let did_split = split_cold_shards(&mut index_root, &remote, remote_key.as_ref())?;
+    let did_split = split_cold_shards(&mut index_root, &remote, &objcache, remote_key.as_ref())?;
     detail.cold_splits = if did_split { 1 } else { 0 };
 
     // -----------------------------------------------------------------------
@@ -147,7 +151,8 @@ pub fn run(opts: PackOptions) -> Result<(), Error> {
     // after split_cold_shards, so bloom regeneration can share these index
     // files instead of re-reading them from the remote.
     // -----------------------------------------------------------------------
-    let cold_shard_files = load_cold_shard_files(&remote, remote_key.as_ref(), &index_root)?;
+    let cold_shard_files =
+        load_cold_shard_files(&remote, &objcache, remote_key.as_ref(), &index_root)?;
 
     // -----------------------------------------------------------------------
     // 5. Regenerate Bloom filter
@@ -165,7 +170,8 @@ pub fn run(opts: PackOptions) -> Result<(), Error> {
     // -----------------------------------------------------------------------
     // 6. CAS-update INDEX_ROOT
     // -----------------------------------------------------------------------
-    let new_index_root_bytes = encrypt_index_root(&index_root, remote_key.as_ref())?;
+    let new_index_root_bytes =
+        crate::codec::pack::encrypt_index_root_bytes(&index_root, remote_key.as_ref())?;
     // A concurrent push or pack updated the index root between our snapshot read
     // and this CAS write. Remap the shared CasFailed (whose default message tells
     // the user to pull and retry a *push*) to pack-specific guidance via
@@ -180,7 +186,7 @@ pub fn run(opts: PackOptions) -> Result<(), Error> {
     // Record real I/O counts (GET/PUT/HEAD/bytes via the StatsStore wrapper)
     // together with the pack-layer tuning metrics. The index-root CAS file ops
     // are not counted (see comment above).
-    let omemfs_dir = repo.work_dir.join(".omemfs");
+    let omemfs_dir = repo.omemfs_dir();
     let duration_ms = started.elapsed().as_millis() as u64;
     io_stats::append_record_with_detail(
         &omemfs_dir,
@@ -200,6 +206,7 @@ pub fn run(opts: PackOptions) -> Result<(), Error> {
 
 fn merge_deltas_into_hot(
     remote: &dyn ObjectStore,
+    objcache: &LocalStore,
     key: Option<&EncryptKey>,
     index_root: &mut IndexRoot,
 ) -> Result<Vec<IndexEntry>, Error> {
@@ -207,7 +214,7 @@ fn merge_deltas_into_hot(
 
     // Load hot index first (lowest priority — overwritten by deltas).
     if let Some(hot_hash_bytes) = index_root.hot_hash_opt() {
-        let idx = load_index_file(remote, key, &hot_hash_bytes)?;
+        let idx = crate::codec::pack::load_index_file(remote, objcache, key, &hot_hash_bytes)?;
         for entry in idx.entries() {
             merged.insert(entry.hash().as_str().to_string(), entry.clone());
         }
@@ -215,7 +222,7 @@ fn merge_deltas_into_hot(
 
     // Apply delta indexes newest-first (newest overrides older).
     for delta_hash in index_root.delta_hashes_as_hashes().into_iter().rev() {
-        let idx = load_index_file(remote, key, &delta_hash)?;
+        let idx = crate::codec::pack::load_index_file(remote, objcache, key, &delta_hash)?;
         for entry in idx.entries() {
             merged.insert(entry.hash().as_str().to_string(), entry.clone());
         }
@@ -501,7 +508,7 @@ fn consolidate_pack_files(
             let buf = pack_bufs
                 .get(pe.pack_hash.as_str())
                 .ok_or_else(|| Error::ObjectNotFound(pe.pack_hash.as_str().to_string()))?;
-            let start = 2 + pe.offset as usize;
+            let start = crate::codec::pack::reader::PACK_BODY_OFFSET as usize + pe.offset as usize;
             let end = start + pe.length as usize;
             // Guard against a malformed offset/length slicing out of bounds.
             // The old seek-based read_pack_slice used read_exact, which
@@ -598,6 +605,7 @@ fn apply_cold_entries(
     cold_entries: Vec<IndexEntry>,
     index_root: &mut IndexRoot,
     remote: &dyn ObjectStore,
+    objcache: &LocalStore,
     key: Option<&EncryptKey>,
 ) -> Result<(), Error> {
     if cold_entries.is_empty() {
@@ -608,20 +616,36 @@ fn apply_cold_entries(
         return Ok(());
     }
 
+    // Record the old shared shard hash (slot 0, before this rewrite) so we
+    // can later repoint only the slots that still match it. This may be the
+    // all-zero placeholder when no shared shard exists yet.
+    let old_shared_bytes: [u8; 32] = if index_root.cold_shards.is_empty() {
+        [0u8; 32]
+    } else {
+        index_root.cold_shards[0]
+    };
+
     // Load existing shared shard (slot 0) and append.
     let mut shard_entries: Vec<IndexEntry> = Vec::new();
-    if !index_root.cold_shards.is_empty() && index_root.cold_shards[0] != [0u8; 32] {
-        let shard_hash = Hash::from_bytes(index_root.cold_shards[0]);
-        let idx = load_index_file(remote, key, &shard_hash)?;
+    if old_shared_bytes != [0u8; 32] {
+        let shard_hash = Hash::from_bytes(old_shared_bytes);
+        let idx = crate::codec::pack::load_index_file(remote, objcache, key, &shard_hash)?;
         shard_entries.extend_from_slice(idx.entries());
     }
     shard_entries.extend(cold_entries);
 
     let new_shard_hash = write_index_file(&shard_entries, remote, key)?;
     let new_bytes = *new_shard_hash.as_bytes_array();
-    // Update all slots pointing to the old shared shard.
+    // Update only the slots that still point to the old shared shard.
+    // Slots holding a dedicated shard hash (produced by cold shard
+    // splitting, see design/02_storage_format.md "Appending new cold
+    // entries") differ from `old_shared_bytes` and must be left untouched —
+    // otherwise their entries become unreachable from the index root even
+    // though the dedicated shard file itself remains on the remote.
     for slot in index_root.cold_shards.iter_mut() {
-        *slot = new_bytes;
+        if *slot == old_shared_bytes {
+            *slot = new_bytes;
+        }
     }
     Ok(())
 }
@@ -633,6 +657,7 @@ const COLD_SHARD_SPLIT_THRESHOLD: u64 = 4 * 1024 * 1024; // 4 MiB
 fn split_cold_shards(
     index_root: &mut IndexRoot,
     remote: &dyn ObjectStore,
+    objcache: &LocalStore,
     key: Option<&EncryptKey>,
 ) -> Result<bool, Error> {
     // Find the largest cold shard that exceeds the threshold.
@@ -664,7 +689,7 @@ fn split_cold_shards(
     };
 
     let shard_hash = Hash::from_bytes(index_root.cold_shards[split_idx]);
-    let idx = load_index_file(remote, key, &shard_hash)?;
+    let idx = crate::codec::pack::load_index_file(remote, objcache, key, &shard_hash)?;
 
     // Find the most populous hash prefix among the entries.
     let mut prefix_counts: HashMap<u8, usize> = HashMap::new();
@@ -764,6 +789,7 @@ fn regenerate_bloom(
 /// the same shard, so duplicates are loaded only once.
 fn load_cold_shard_files(
     remote: &dyn ObjectStore,
+    objcache: &LocalStore,
     key: Option<&EncryptKey>,
     index_root: &IndexRoot,
 ) -> Result<HashMap<String, IndexFile>, Error> {
@@ -777,44 +803,14 @@ fn load_cold_shard_files(
         if map.contains_key(&key_str) {
             continue;
         }
-        let idx = load_index_file(remote, key, &sh)?;
+        let idx = crate::codec::pack::load_index_file(remote, objcache, key, &sh)?;
         map.insert(key_str, idx);
     }
     Ok(map)
 }
 
-fn load_index_file(
-    remote: &dyn ObjectStore,
-    key: Option<&EncryptKey>,
-    hash: &Hash,
-) -> Result<IndexFile, Error> {
-    let mut r = remote.open_read(hash)?;
-    let mut stored = Vec::new();
-    use std::io::Read;
-    r.read_to_end(&mut stored).map_err(Error::Io)?;
-    let plaintext = crate::codec::encrypt::decrypt(stored, key, hash.as_bytes_array())?;
-    IndexFile::deserialise(&plaintext)
-}
-
 fn encrypt_object(data: &[u8], key: Option<&EncryptKey>, hash: &Hash) -> Vec<u8> {
     crate::codec::encrypt::encrypt(data.to_vec(), key, hash.as_bytes_array())
-}
-
-fn encrypt_index_root(root: &IndexRoot, key: Option<&EncryptKey>) -> Result<Vec<u8>, Error> {
-    let plaintext = root.serialise()?;
-    let Some(key) = key else {
-        return Ok(plaintext);
-    };
-    use rand::RngCore;
-    let mut nonce = [0u8; 12];
-    rand::rng().fill_bytes(&mut nonce);
-    let mut pseudo_hash = [0u8; 32];
-    pseudo_hash[..12].copy_from_slice(&nonce);
-    let encrypted = crate::codec::encrypt::encrypt(plaintext, Some(key), &pseudo_hash);
-    let mut out = Vec::with_capacity(12 + encrypted.len());
-    out.extend_from_slice(&nonce);
-    out.extend_from_slice(&encrypted);
-    Ok(out)
 }
 
 /// Translate a storage-layer `Error::CasFailed` into pack-specific guidance.
@@ -837,6 +833,153 @@ fn remap_cas_failure(e: Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::pack::index::StandaloneEntry;
+    use tempfile::TempDir;
+
+    fn setup_remote(tmp: &TempDir) -> LocalStore {
+        let base = tmp.path().to_path_buf();
+        std::fs::create_dir_all(base.join("objects")).unwrap();
+        std::fs::create_dir_all(base.join("tmp")).unwrap();
+        LocalStore::for_remote(&base)
+    }
+
+    fn setup_objcache(tmp: &TempDir) -> LocalStore {
+        LocalStore::for_cache(tmp.path().join("objcache"))
+    }
+
+    /// A distinct 32-byte hash per `byte`, with a minimal inline payload.
+    /// `apply_cold_entries` does not inspect an entry's hash prefix at all
+    /// (it only appends to the shared shard referenced by slot 0), so which
+    /// actual hash-prefix slot an entry would resolve to under
+    /// `hash_prefix()` is irrelevant here — this test manipulates
+    /// `index_root.cold_shards[..]` directly to set up the dedicated/shared
+    /// slot layout instead.
+    fn inline_entry(byte: u8) -> IndexEntry {
+        let hash = Hash::compute(&[byte]);
+        IndexEntry::Inline(crate::codec::pack::index::InlineEntry {
+            hash,
+            data: vec![0xAA],
+        })
+    }
+
+    #[test]
+    fn apply_cold_entries_does_not_overwrite_dedicated_shard_slots() {
+        // Regression test for D2: a second `apply_cold_entries` call must not
+        // clobber slots that already point at a dedicated shard (a shard
+        // produced by splitting, whose hash differs from the shared shard's
+        // hash). Only slots still equal to the *old* shared shard hash may be
+        // repointed at the new shared shard hash.
+        let tmp = TempDir::new().unwrap();
+        let remote = setup_remote(&tmp);
+        let objcache = setup_objcache(&tmp);
+        let key: Option<&EncryptKey> = None;
+
+        // cold_prefix_bits = 8 → 256 slots.
+        let mut index_root = IndexRoot {
+            remote_root: [0u8; 32],
+            hot_hash: [0u8; 32],
+            bloom_hash: [0u8; 32],
+            cold_prefix_bits: 8,
+            delta_hashes: Vec::new(),
+            cold_shards: vec![[0u8; 32]; 256],
+        };
+
+        // Write an initial shared shard and point every slot at it, as if a
+        // prior `pack` run had created it before any splitting occurred.
+        let initial_entry = inline_entry(1);
+        let old_shared_hash = write_index_file(&[initial_entry], &remote, key).unwrap();
+        let old_shared_bytes = *old_shared_hash.as_bytes_array();
+        for slot in index_root.cold_shards.iter_mut() {
+            *slot = old_shared_bytes;
+        }
+
+        // Simulate a dedicated shard having been split out for prefix 0x12
+        // (see "Cold shard splitting" in design/02_storage_format.md): slot
+        // 0x12 now points at a distinct dedicated shard hash, and slot 0
+        // (the shared shard) points at a freshly rewritten shared shard that
+        // no longer contains the 0x12 entries. (Note: `apply_cold_entries`
+        // never inspects an entry's own hash prefix, so the entry content
+        // used to build each shard here is unrelated to the `0x12` slot
+        // index — the slot layout is set up directly via
+        // `index_root.cold_shards[..]` below.)
+        let dedicated_entry = inline_entry(2);
+        let dedicated_hash = write_index_file(&[dedicated_entry], &remote, key).unwrap();
+        let dedicated_bytes = *dedicated_hash.as_bytes_array();
+        index_root.cold_shards[0x12] = dedicated_bytes;
+
+        let post_split_shared_entry = inline_entry(3);
+        let post_split_shared_hash =
+            write_index_file(&[post_split_shared_entry], &remote, key).unwrap();
+        let post_split_shared_bytes = *post_split_shared_hash.as_bytes_array();
+        for (slot_idx, slot) in index_root.cold_shards.iter_mut().enumerate() {
+            if slot_idx != 0x12 {
+                *slot = post_split_shared_bytes;
+            }
+        }
+
+        // Now `pack` runs again and moves a newly-unreachable entry into the
+        // cold tier. It must append to the *shared* shard (slot 0) and
+        // repoint only the slots that still match the pre-append shared
+        // shard hash — slot 0x12 (dedicated) must be left untouched.
+        let new_cold_entry = IndexEntry::Standalone(StandaloneEntry {
+            hash: Hash::compute(&[4u8]),
+        });
+        apply_cold_entries(
+            vec![new_cold_entry],
+            &mut index_root,
+            &remote,
+            &objcache,
+            key,
+        )
+        .unwrap();
+
+        // The dedicated shard slot must be unchanged.
+        assert_eq!(
+            index_root.cold_shards[0x12], dedicated_bytes,
+            "dedicated shard slot 0x12 must not be overwritten by a shared-shard append"
+        );
+
+        // Slots that pointed at the old shared shard must now point at the
+        // new shared shard (a different hash than before, since an entry was
+        // appended).
+        let new_shared_bytes = index_root.cold_shards[0x34];
+        assert_ne!(
+            new_shared_bytes, post_split_shared_bytes,
+            "shared shard hash must change after appending a new cold entry"
+        );
+        assert_ne!(
+            new_shared_bytes, dedicated_bytes,
+            "shared shard slots must never end up pointing at the dedicated shard hash"
+        );
+        for (slot_idx, slot) in index_root.cold_shards.iter().enumerate() {
+            if slot_idx == 0x12 {
+                continue;
+            }
+            assert_eq!(
+                *slot, new_shared_bytes,
+                "slot {slot_idx:#x} must be repointed at the new shared shard"
+            );
+        }
+
+        // Entries from the dedicated shard must still be reachable (the bug
+        // this test guards against: overwriting the dedicated slot makes its
+        // entries unreachable even though the shard file itself remains on
+        // the remote).
+        let dedicated_idx =
+            crate::codec::pack::load_index_file(&remote, &objcache, key, &dedicated_hash).unwrap();
+        assert_eq!(dedicated_idx.len(), 1);
+
+        // And the new shared shard must contain both the pre-existing
+        // post-split-shared entry and the newly appended entry.
+        let new_shared_idx = crate::codec::pack::load_index_file(
+            &remote,
+            &objcache,
+            key,
+            &Hash::from_bytes(new_shared_bytes),
+        )
+        .unwrap();
+        assert_eq!(new_shared_idx.len(), 2);
+    }
 
     #[test]
     fn remap_cas_failure_gives_pack_specific_guidance() {

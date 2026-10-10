@@ -80,7 +80,7 @@ omemfs clone [<directory>]
 
 **Options**
 - `--stub-threshold <size>`: entries at or above this size are stubbed instead of downloaded (default: `1M`). Accepted forms: plain bytes (`1024`), or a number followed by `K`, `M`, or `G` (e.g. `100K`, `1M`, `2G`). Use `0` to expand everything. Invalid size strings (e.g. `1GB`, non-numeric input) are a hard CLI error.
-- `--force`: allow cloning into a non-empty directory (existing paths are skipped)
+- `--force`: allow cloning into a non-empty directory (existing paths are skipped). `--force` never bypasses the check for an already-existing `.omemfs/` directory below: if `<directory>/.omemfs` exists, clone always refuses, regardless of `--force`. This keeps `--force` scoped to "non-empty directory that is not already an omemfs repository" — it must never let `clone` re-initialise (and thereby overwrite) an existing repository's config, which for an encrypted remote holds the DEK. To re-clone on top of an existing checkout, remove or rename its `.omemfs/` directory first (after confirming you no longer need its config/DEK), or clone into a fresh directory.
 - `--url <url>`: remote URL to clone from. When provided, skips the URL prompt and uses the given URL directly.
 - `--new`: declare that the remote is a new (empty) repository. Mutually exclusive with `--existing`. Implies the repository is being created; the remote prefix must be empty.
 - `--existing`: declare that the remote is an existing repository. Mutually exclusive with `--new`. The index root must be present on the remote.
@@ -351,6 +351,7 @@ The cloned repository will have origin pointing at the backup URL and the backup
 
 **Errors**
 
+- Destination already contains an `.omemfs/` directory (regardless of `--force`; checked before the empty-directory check below, since it takes priority): `error: directory '<dir>' already contains an .omemfs/ repository; refusing to overwrite it (even with --force)`
 - Destination not empty (without `--force`): `error: directory '<dir>' is not empty`
 - Non-TTY with no `--new`/`--existing` flag (and no connection string / `--encrypt`):
   ```
@@ -499,6 +500,7 @@ Same as full pull, but:
 - All diffs across all specified paths are collected and conflict-checked together before any changes are applied. If any path has a conflict, the entire pull is aborted.
 - `clone_root` is updated by splicing each remote root subtree into the current clone root tree (all splices applied, then written once).
 - A scope naming a regular file or symlink is treated as a leaf entry, so only that entry is applied and updated in `clone_root`.
+- With multiple `<path>` arguments, each path's own remote/local diff maps use keys relative to *that* path's scoped subtree root (e.g. pulling `a` and `b`, a conflict on `f` inside each is the key `f` in both `a`'s and `b`'s diff maps). Conflict tracking across paths — the set reported by `conflict list` (and by the "Conflict:" summary this command itself prints), and the set that determines which path's helper files get written — keys on the repo-root-relative path (`a/f`, `b/f`), never the scoped-relative key, so a same-named conflict under two different scoped paths is never merged into one entry or overwrites the other's helper files.
 
 **Output example**
 
@@ -1012,7 +1014,7 @@ $ omemfs cat index-root
   "remote_root": "a3f89b2c...",
   "hot_hash": "b4c5d6e7...",
   "bloom_hash": "c5d6e7f8...",
-  "cold_prefix_bits": 4,
+  "cold_prefix_bits": 8,
   "delta_hashes": [
     "d6e7f8a9..."
   ],
@@ -1689,7 +1691,7 @@ omemfs conflict accept-remote [--dry-run] [<path>...]
 **Behaviour** for all conflicting paths `<p>` in scope, in this order (see `03_sync_model.md`, "Advancing clone_root on resolution", "Ordering guarantee"):
 
 1. Compute the advanced `clone_root` for every `<p>` (splicing in the value observed on the remote when the conflict was detected) and write it once, durably, before touching any helper file or sidecar. Reading the intermediate clone_root tree objects needed for this may transparently fetch a locally-missing one from the remote through the same lazy tree store `pull`/`ls` use (`03_sync_model.md`, "Lazy tree reads").
-2. For each `<p>`: if `<p>.omemfs-conflict-remote` exists, overwrite `<p>` with its contents, then restore the remote side's tracked `mtime` and `mode` from the conflict metadata sidecar (if present) so the result is idempotent — a subsequent `push` does not re-upload an unchanged file. If `<p>.omemfs-conflict-remote` does not exist (local-add vs remote-delete conflict), delete `<p>`.
+2. For each `<p>`: if `<p>.omemfs-conflict-remote` exists, overwrite `<p>` with its contents, then restore the remote side's tracked `mtime` and `mode` from the conflict metadata sidecar (if present) so the result is idempotent — a subsequent `push` does not re-upload an unchanged file. If `<p>.omemfs-conflict-remote` does not exist, this is one of two shapes recorded in the sidecar's `remote_resolution` (`03_sync_model.md`, "Missing sides", "Remote side is a symlink"): a local-add vs remote-delete conflict (`Deleted`) deletes `<p>`; a local-edit vs remote-turned-into-a-symlink conflict (`Symlink { target, mtime }`) instead replaces whatever is at `<p>` with a symlink to `target` and restores its `mtime` (symlinks have no executable-bit `mode`).
 3. Only after step 1's `clone_root` write has succeeded: delete all three helper files for `<p>` (whichever exist), plus the `<p>.omemfs-conflict-meta` sidecar.
 
 For `accept-remote`, the advancement in step 1 matches what the working tree already holds, so it changes nothing observable on its own — it is applied for consistency with `accept-local`/`accept-base` and so a later `pull` does not re-detect the same conflict.

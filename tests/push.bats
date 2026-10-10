@@ -29,6 +29,49 @@ teardown() {
     [ "$clone_root" = "$remote_root" ]
 }
 
+# design/11 "Self-healing after interruption": a crash after the remote root
+# advanced but before clone_root was written leaves clone_root one push behind.
+# Rolling clone_root back by hand reproduces that state without fault injection.
+@test "push: recovers when clone_root lags the remote and the working tree is unchanged" {
+    echo "one" > a.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cp .omemfs/clone_root "$TEST_DIR/clone_root.old"
+    echo "two" > b.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    local pushed_root
+    pushed_root="$(get_clone_root)"
+
+    cp "$TEST_DIR/clone_root.old" .omemfs/clone_root
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    [ "$(get_clone_root)" = "$pushed_root" ]
+}
+
+@test "push: rejected when clone_root lags the remote and the working tree changed; pull recovers" {
+    echo "one" > a.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cp .omemfs/clone_root "$TEST_DIR/clone_root.old"
+    echo "two" > b.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    local pushed_root
+    pushed_root="$(get_clone_root)"
+
+    cp "$TEST_DIR/clone_root.old" .omemfs/clone_root
+    echo "edited after the interruption" > c.txt
+    run "$OMEMFS" push
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"remote has been updated since last sync"* ]]
+
+    run "$OMEMFS" pull
+    [ "$status" -eq 0 ]
+    [ "$(get_clone_root)" = "$pushed_root" ]
+    [ "$(cat c.txt)" = "edited after the interruption" ]
+}
+
 @test "push: nothing to push when working tree matches clone root" {
     echo "hello" > file.txt
     run "$OMEMFS" push
@@ -1311,4 +1354,292 @@ PY
     sum2_after="$(sha256sum verify_seal_recovery/sealtest/f2.txt | awk '{print $1}')"
     [ "$sum2_after" = "$sum2_before" ]
     [ "$(cat verify_seal_recovery/sealtest/new.txt)" = "new" ]
+}
+
+# ---------------------------------------------------------------------------
+# push: scoped push must detect a mode-only change (D14, design/03
+# "Path-scoped push" step 1c). Before the fix, push_scoped's unchanged-path
+# skip compares tree_ops::navigate's Hash-only result against the freshly
+# scanned blob hash, which never changes on chmod alone, so a mode-only
+# scoped push wrongly reports "Nothing to push."
+# ---------------------------------------------------------------------------
+
+@test "push: scoped push of a mode-only change (chmod +x) is detected, not reported as nothing to push" {
+    echo "hello" > file.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    # Content unchanged; only the executable bit is added. A scoped push of
+    # exactly this file must see it as a real change.
+    chmod +x file.txt
+    run "$OMEMFS" push file.txt
+    [ "$status" -eq 0 ]
+    [[ "${output,,}" != *"nothing to push"* ]]
+
+    # A fresh clone must observe the executable bit.
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" verify_mode_push
+    [ "$status" -eq 0 ]
+    [ -x verify_mode_push/file.txt ]
+}
+
+@test "push: scoped push of a mode-only change (chmod -x) is detected, not reported as nothing to push" {
+    echo "hello" > script.sh
+    chmod +x script.sh
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    # Content unchanged; only the executable bit is removed.
+    chmod -x script.sh
+    run "$OMEMFS" push script.sh
+    [ "$status" -eq 0 ]
+    [[ "${output,,}" != *"nothing to push"* ]]
+
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" verify_mode_push2
+    [ "$status" -eq 0 ]
+    [ ! -x verify_mode_push2/script.sh ]
+}
+
+@test "push: scoped push does not overwrite a remote-side mode-only change with a stale local mode" {
+    # Regression for the "lost update" half of D14: a scoped push whose
+    # content and mode are actually UNCHANGED relative to clone_root must not
+    # blindly splice its own (stale) mode over a remote-side mode-only change
+    # that this clone has not observed yet. Before the fix, comparing only
+    # the blob hash treats this path as "unchanged" and skips the per-path
+    # divergence check that would otherwise catch the remote's mode change.
+    echo "hello" > file.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    # A second clone flips the executable bit and pushes -- a remote-side
+    # mode-only change this clone's clone_root does not yet know about.
+    local other
+    other="$(mktemp -d)"
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" "$other"
+    [ "$status" -eq 0 ]
+    chmod +x "$other/file.txt"
+    local other_status
+    ( cd "$other" && "$OMEMFS" push )
+    other_status=$?
+    [ "$other_status" -eq 0 ]
+
+    # Back in the original clone, file.txt's content and mode are still
+    # exactly what clone_root recorded (nothing changed locally). A scoped
+    # push must not silently re-push a "nothing changed here" leaf and, in
+    # doing so, blindly overwrite the remote's mode change: it must either
+    # detect the divergence and fail, or recognise the leaf as genuinely
+    # unchanged and skip it -- either way, the remote's chmod must survive.
+    run "$OMEMFS" push file.txt
+
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" verify_mode_no_overwrite
+    [ "$status" -eq 0 ]
+    [ -x verify_mode_no_overwrite/file.txt ]
+
+    rm -rf "$other"
+}
+
+# ---------------------------------------------------------------------------
+# push: a plain file whose CONTENT happens to parse as valid tree JSON must
+# not be permanently unpushable (D13, design/01_object_model.md "Tree/blob
+# discrimination"). Before the fix, transfer.rs's child_hashes() decided
+# "is this a tree?" by whether Tree::deserialise succeeded, not by whether
+# the ED F1 tag was present -- a blob whose bytes happen to be well-formed
+# tree JSON was misidentified as a tree, and its JSON content was walked as
+# if it were a list of child object references. Those "child hashes" do not
+# exist locally, so upload fails with "a referenced local object is
+# missing" -- permanently: a retry re-hits the exact same misidentification
+# every time, since the blob's content never changes.
+# ---------------------------------------------------------------------------
+
+@test "push: a file whose content is well-formed tree JSON pushes successfully as a blob" {
+    # This exact byte sequence is valid Tree JSON (an empty normal tree) but
+    # has no ED F1 tag -- it is ordinary file content, not a tree object.
+    printf '{"kind":"normal","entries":[]}' > tree_shaped.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    [[ "${output,,}" != *"missing"* ]]
+
+    # A retry (the documented recovery step for a genuine missing-object
+    # failure) must not be needed -- the first push already succeeded.
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" verify_tree_shaped
+    [ "$status" -eq 0 ]
+    [ "$(cat verify_tree_shaped/tree_shaped.txt)" = '{"kind":"normal","entries":[]}' ]
+}
+
+@test "push: a file whose content parses as a tree JSON with a bogus child hash pushes successfully" {
+    # A sharper variant of the case above: the JSON also names a "child"
+    # blob hash. If this content were ever (mis)treated as a tree, its
+    # walk would look for that hash's own object and never find it (it
+    # does not exist -- it is just a string embedded in this blob's text),
+    # failing permanently with "a referenced local object is missing".
+    local fake_hash
+    fake_hash="$(printf '1%.0s' $(seq 1 64))"
+    printf '{"kind":"normal","entries":[{"kind":"blob","name":"x","hash":"%s","mtime":null,"size":0}]}' \
+        "$fake_hash" > tree_shaped2.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    [[ "${output,,}" != *"missing"* ]]
+
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" verify_tree_shaped2
+    [ "$status" -eq 0 ]
+    diff tree_shaped2.txt verify_tree_shaped2/tree_shaped2.txt
+}
+
+# ---------------------------------------------------------------------------
+# push: partial-expansion merge through a lazy, stub-aware clone (D15).
+#
+# After `clone --stub-threshold` stubs a directory as a whole, its recorded
+# tree object is never downloaded (design/08_stub_system.md, "Stub
+# threshold"). Adding a real file directly inside the stub marker (a
+# documented, legitimate workflow -- design/08 "Partial expansion") and then
+# pushing must merge the stub's never-locally-cached recorded entries with
+# the new on-disk file, fetching the stub's tree object from the remote on
+# demand instead of hard-failing with "object not found".
+# ---------------------------------------------------------------------------
+
+@test "push: full push merges a partial expansion whose stub tree was never fetched by a lazy clone (D15)" {
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" origin_repo
+    [ "$status" -eq 0 ]
+    cd origin_repo
+    mkdir -p bigdir
+    printf '%020d' 0 > bigdir/a.txt
+    printf '%020d' 1 > bigdir/b.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    # A fresh clone with a tiny threshold whole-stubs bigdir: its tree object
+    # is never fetched.
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" --stub-threshold 10 lazy_repo
+    [ "$status" -eq 0 ]
+    cd lazy_repo
+    [ -f bigdir/.omemfs-stub ]
+    [ ! -f bigdir/a.txt ]
+
+    # Add a real file directly inside the stubbed directory (partial
+    # expansion) without ever running `expand`.
+    echo "new-c" > bigdir/c.txt
+
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"object not found"* ]]
+    cd ..
+
+    # A fully-materialised verification clone must show every original file
+    # plus the new one.
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" --stub-threshold 0 verify_full
+    [ "$status" -eq 0 ]
+    [ -f verify_full/bigdir/a.txt ]
+    [ -f verify_full/bigdir/b.txt ]
+    [ -f verify_full/bigdir/c.txt ]
+    [ "$(cat verify_full/bigdir/c.txt)" = "new-c" ]
+}
+
+@test "push: scoped push (to the stub directory) merges a partial expansion whose stub tree was never fetched (D15)" {
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" origin_repo
+    [ "$status" -eq 0 ]
+    cd origin_repo
+    mkdir -p bigdir
+    printf '%020d' 0 > bigdir/a.txt
+    printf '%020d' 1 > bigdir/b.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" --stub-threshold 10 lazy_repo
+    [ "$status" -eq 0 ]
+    cd lazy_repo
+    echo "new-c" > bigdir/c.txt
+
+    run "$OMEMFS" push bigdir
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"object not found"* ]]
+    cd ..
+
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" --stub-threshold 0 verify_scoped
+    [ "$status" -eq 0 ]
+    [ -f verify_scoped/bigdir/a.txt ]
+    [ -f verify_scoped/bigdir/c.txt ]
+}
+
+@test "push: reconciles a partial-expansion stub's recorded hash to match the new clone_root (design/08:93, D15)" {
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" origin_repo
+    [ "$status" -eq 0 ]
+    cd origin_repo
+    mkdir -p bigdir
+    printf '%020d' 0 > bigdir/a.txt
+    printf '%020d' 1 > bigdir/b.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" --stub-threshold 10 lazy_repo
+    [ "$status" -eq 0 ]
+    cd lazy_repo
+    local stub_hash_before
+    stub_hash_before="$(python3 -c "import json; print(json.load(open('bigdir/.omemfs-stub'))['hash'])")"
+
+    echo "new-c" > bigdir/c.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    # The push must have advanced the on-disk stub record: after a merge, the
+    # stub is no longer purely stubbed content -- it must now reflect the new
+    # merged tree hash, not the pre-push one (design/08_stub_system.md,
+    # "Partial expansion": "After push, the stub's hash field is updated to
+    # reflect the merged tree.").
+    [ -f bigdir/.omemfs-stub ]
+    local stub_hash_after clone_root_bigdir_hash
+    stub_hash_after="$(python3 -c "import json; print(json.load(open('bigdir/.omemfs-stub'))['hash'])")"
+    [ "$stub_hash_after" != "$stub_hash_before" ]
+
+    clone_root_bigdir_hash="$("$OMEMFS" cat "$(cat .omemfs/clone_root)" \
+        | python3 -c "import json,sys; d=json.load(sys.stdin); print([e['hash'] for e in d['entries'] if e['name']=='bigdir'][0])")"
+    [ "$stub_hash_after" = "$clone_root_bigdir_hash" ]
+
+    # A second push must be a true no-op: nothing left to reconcile.
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Nothing to push"* ]]
+}
+
+@test "push: a CAS-rejected push leaves a partial-expansion stub's record byte-for-byte untouched" {
+    # The stub reconcile step must run only strictly after clone_root has been
+    # durably advanced -- a push that fails before that point (here, a CAS
+    # rejection because the remote advanced since this clone's last sync)
+    # must never touch the on-disk .omemfs-stub record.
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" origin_repo
+    [ "$status" -eq 0 ]
+    cd origin_repo
+    mkdir -p bigdir
+    printf '%020d' 0 > bigdir/a.txt
+    printf '%020d' 1 > bigdir/b.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" --stub-threshold 10 lazy_repo
+    [ "$status" -eq 0 ]
+
+    # A second clone races ahead and pushes first, so lazy_repo's next push
+    # is rejected by the CAS precheck.
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" racer
+    [ "$status" -eq 0 ]
+    cd racer
+    echo "raced ahead" > racer.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+
+    cd lazy_repo
+    local stub_hash_before
+    stub_hash_before="$(python3 -c "import json; print(json.load(open('bigdir/.omemfs-stub'))['hash'])")"
+    echo "new-c" > bigdir/c.txt
+
+    run "$OMEMFS" push
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"remote has been updated since last sync"* ]]
+
+    local stub_hash_after
+    stub_hash_after="$(python3 -c "import json; print(json.load(open('bigdir/.omemfs-stub'))['hash'])")"
+    [ "$stub_hash_before" = "$stub_hash_after" ]
 }

@@ -90,7 +90,29 @@ The next `push` merges the stub's recorded entries with the real files (real fil
 take priority over same-name stub entries), and writes the combined tree to the
 remote.
 
-After push, the stub's hash field is updated to reflect the merged tree.
+The stub's recorded tree object may not be in the local object cache: after a
+lazy, stub-aware clone (see "Stub threshold" below) a stubbed directory's tree
+object is never downloaded in the first place. Reading it to perform the merge
+therefore goes through the same read-through, remote-fetching store `pull`
+already uses for its own clone-root/remote-root reads (`LazyTreeStore` --
+`03_sync_model.md`, "Lazy tree reads") rather than the raw local cache: a local
+miss is fetched from the remote on demand and cached locally, so only
+partial-expansion directories actually present in the scanned scope ever incur
+a fetch. This remote-fetching store is used ONLY for that one read -- every
+other local-presence decision the same scan makes (most importantly a
+blob-writing scan's sealed-blob verification) stays strictly local-only; see
+`03_sync_model.md`, "Path-scoped push", for why the two must never be the same
+store value.
+
+After push, the stub's hash field is updated to reflect the merged tree. `push`
+does this by reusing `pull`'s own stub-reconcile step (`reconcile_stubs`/
+`reconcile_leaf_stub`, described in "Stub reconcile (pull and restore)" below)
+once the new `clone_root` has been durably written: a full push reconciles
+every stub under the working tree, a scoped push reconciles only the stubs
+under each pushed path. This is the same mechanism and the same "blob | file
+stub" / "tree | dir stub" reconcile rules pull already applies -- push does not
+duplicate the decision logic, only triggers it at a different point (after its
+own `clone_root` advancement instead of pull's).
 
 ---
 
@@ -141,7 +163,11 @@ entry without fetching the actual object:
 
 **`push`**: The working tree scan reads stub records and contributes their recorded
 hash to the tree. If a real file exists alongside a stub (partial expansion), the
-real file takes priority and its content is hashed normally.
+real file takes priority and its content is hashed normally. After `clone_root`
+has been durably advanced to the new pushed root, every stub touched by the
+push is reconciled against it (a full push reconciles the whole working tree;
+a scoped push reconciles only the stubs under each pushed path) using the same
+mechanism `pull` uses -- see "Stub reconcile" below.
 
 **`pull` (fast-forward)**: After applying remote changes to the working tree, all
 stubs are reconciled against the new `clone_root` (stub reconcile). See below.
@@ -170,6 +196,85 @@ real files are assumed to still match the user's intent (they were intentionally
 expanded). Recursing into a fully-stubbed directory (no real files) is also
 incorrect because blob objects are not guaranteed to be in the local cache for
 stubbed paths; the reconcile simply updates the stub record.
+
+#### Interaction with pull's ordinary diff/apply
+
+`pull`'s remote-side diff (`clone_root` vs `remote_root`) is computed purely
+from tree objects; it has no notion of which `clone_root` paths are currently
+directory-stubbed in the working tree. If the content underneath a
+directory-stubbed path changes on the remote, the diff still reports ordinary
+per-entry `Modified`/`Added`/`Deleted` changes for the files inside it (the
+diff never stops early there — only reconcile's own decision to skip a
+dir-stubbed path, described above, is stub-aware). Applying those per-entry
+changes literally would write real files underneath a directory that is
+supposed to be a whole-unit stub, corrupting the partial/full-stub
+distinction. `pull`'s apply step must therefore skip any diff entry whose
+path is inside a locally directory-stubbed path (i.e. some proper ancestor
+directory currently holds a `.omemfs-stub` marker) — the same way stub
+reconcile itself only ever updates that one directory stub's record and
+never descends into it. Reconcile (this section) is what brings the
+directory stub's own record up to date afterward; the ordinary apply step
+must not race it by writing individual files inside the stubbed subtree
+first.
+
+This also applies to a `Deleted` entry for a single file inside a
+directory-stubbed path (the remote deleted just one of the stubbed
+directory's files, not the whole subtree): a naive "the directory now
+contains only its `.omemfs-stub` marker, so the whole stub must have been
+deleted on the remote" cleanup cannot tell this case apart from a genuine
+whole-subtree deletion, because the working tree looks identical either
+way (only the marker is ever on disk for a fully-stubbed directory,
+regardless of how much of the *logical* subtree the remote still has).
+Whether the directory stub itself should be removed is therefore
+decidable only by consulting the new `clone_root` — exactly reconcile's
+`absent (deleted on remote) → remove stub` row above, keyed on whether
+`clone_root` still has *any* entry at the stubbed path, not on the
+apply step's per-file `Deleted` entries for paths underneath it. Apply
+must not remove a directory stub marker itself as a side effect of
+processing `Deleted` entries under it; only reconcile removes it, and
+only when the whole path is gone from the new `clone_root`.
+
+The same deferral applies when the directory-stubbed path **itself** is the
+one whose entry changed kind (`tree → blob`/`tree → symlink` on the
+remote) -- e.g. `Added(bigdir)` for a dir-stubbed `bigdir` whose remote
+`clone_root` entry became a blob. Apply's ordinary `Added`/`Symlink`
+handling assumes it is writing into an *absent or plain-file* path; it does
+not (and, for a locally directory-stubbed path, must not) know how to
+replace a whole directory-stub directory with new content, because doing
+so correctly is exactly reconcile's `blob | dir stub` /
+`symlink | any stub` table rows (`SwitchToFileStub`/`MaterialiseSymlink`)
+above -- remove the marker, remove the directory, write the new stub or
+symlink in its place. Apply must therefore skip a diff entry whose path
+**is itself** a locally directory-stubbed path (not only entries under
+one), the same way it already skips entries under one, and leave the
+whole transition to reconcile. Concretely: attempting the naive
+"write/stub the new content, then delete whatever was there" sequence
+apply otherwise uses for a plain-file `Added` fails outright for a
+directory-stubbed path either way round -- deleting a non-empty directory
+via the same tolerant single-file remove apply uses for a stale plain file
+raises `EISDIR`, and writing new content in its place before the directory
+is gone raises `ENOTEMPTY`/`EISDIR` from the rename.
+
+The mirror-image case must be deferred to reconcile the same way: a **file**
+stub whose remote `clone_root` entry changed kind from blob to tree (`Added`
+or `AddedTree` for a path that is currently a file stub -- e.g. `f.txt`
+stubbed locally, replaced by a directory `f.txt/` on the remote). The diff
+represents this as `Deleted(f.txt)` for the old blob plus `Added(f.txt/...)`
+entries for the new tree's contents (or a single `AddedTree(f.txt)` if the
+new tree meets the stub threshold). Apply's `Deleted` handling (the
+delete-first phase) must not unconditionally remove the file stub marker
+here: doing so before the type change is recognised loses the one signal
+("this path was a stub") reconcile would otherwise use, and lets the
+subsequent `Added` entries for `f.txt/...` materialise as ordinary real
+files under `f.txt/` -- exactly the `tree | file stub` reconcile table row
+(`SwitchToDirStub`: remove the file stub marker, create `f.txt/`, write a
+directory stub inside), silently bypassed. Apply must therefore recognise
+a `Deleted` entry for a path that is currently a file stub as potentially
+the old side of such a transition, leave the stub marker in place instead of
+removing it, and skip every entry (`Added`/`AddedTree`/`Symlink`) whose path
+is at or under that same path in the SAME way the dir-stub-ancestor skip
+above already does -- reconcile alone decides and applies the kind switch
+once the new `clone_root` is current.
 
 The table above covers every path that **is** a stub. It says nothing about a
 third state: a path present in `clone_root` but currently neither a stub nor a
@@ -294,6 +399,31 @@ transparently:
 - **Real file present, stub also present**: the real file takes priority; the
   `.omemfs-stub` sidecar is treated as stale and ignored.
 
+### Malformed stub records are fail-closed
+
+A stub marker's content is read and JSON-parsed while scanning (both the file
+stub and the directory stub case above). If that read or parse fails — the
+marker file is truncated, holds invalid JSON, or otherwise fails to decode as
+a `StubRecord` — the scan aborts with a hard error instead of silently
+proceeding.
+
+This matters because the real file/directory the stub replaces is, by
+definition, absent from the working tree (that is what "stubbed" means): if
+an unreadable or corrupt stub marker were instead treated as "no stub here,"
+the scan would see nothing at all at that path and record it as **absent**,
+which `push` then faithfully uploads as a deletion — silently destroying the
+remote's copy of content that in truth still exists (only its local marker
+is damaged). Failing the whole scan closed, rather than treating the
+corrupted marker as an ordinary miss, is the only response that cannot lose
+data: it forces the operator to notice and repair the marker (or restore it,
+e.g. from `omemfs pull`/a backup) before any push can proceed.
+
+This applies uniformly to both call sites in `src/scan.rs`: the file-stub
+branch in `scan_dir` and the directory-stub branch in `classify_dir_stub`
+(used both for a directory encountered as a child, and for a scan rooted
+directly on a stubbed directory). See `tests/stub.bats` for the regression
+covering a corrupted stub marker.
+
 ---
 
 ## Interaction with `pull`
@@ -323,6 +453,26 @@ A few paths still need a skipped blob's content, in which case it is fetched
   inside a materialised worktree), so its blob is fetched when written.
 - A conflicting path's remote content is needed to write the
   `.omemfs-conflict-remote` helper file.
+
+### Path-scoped pull's local-change check must resolve a stubbed leaf
+
+Path-scoped `pull <path>`'s local-change check (design/03_sync_model.md,
+"Path-scoped pull" step 3) computes the working tree's `<path>` hash to diff
+against `clone_root`. When `<path>` is a leaf scope (a file or symlink) that
+is currently a **file stub** (`<path>.omemfs-stub` present, the real file
+absent), this must resolve to the stub record's own `hash` — exactly the way
+`push`'s scan (`scan_and_store_with_cache`, "Interaction with `push`" above)
+treats a file stub transparently as its recorded content, never as an
+absence. Treating the stub the same way `push_scoped`'s
+`resolve_scoped_stub` already does for the scoped-push case (splice the
+stub's recorded `TreeEntry` in directly) is the correct fix, applied on the
+pull side to the working-tree side of the local-change check: a stubbed leaf
+is "content exists, not materialised," so an on-disk-absence check alone
+(without also consulting the stub) would misreport it as a local deletion of
+`<path>`, producing a spurious conflict against any remote change to
+`<path>` that the local side never actually made (contrast with a genuine
+local deletion, which correctly IS a local change and must still be
+detected as one — "Whole-root absence" in design/03).
 
 ---
 

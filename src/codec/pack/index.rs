@@ -215,6 +215,26 @@ impl IndexFile {
             u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
         pos += 4;
 
+        // Untrusted-remote validation (see design/02_storage_format.md,
+        // "Untrusted-remote validation of `entry_count`"): `entry_count` is
+        // attacker- or corruption-controlled on an unencrypted or
+        // compromised remote, with no GCM tag protecting it here. Reject any
+        // `entry_count` exceeding the maximum number of entries that could
+        // possibly fit in the remaining bytes (smallest entry encoding: tag
+        // 0x03 standalone = 1-byte tag + 32-byte hash = 33 bytes) BEFORE it
+        // is used as a `Vec` capacity, so a huge claimed count (e.g.
+        // 0xFFFFFFFF) can never reach `Vec::with_capacity` and force a huge
+        // allocation.
+        const MIN_ENTRY_SIZE: usize = 33;
+        let remaining = data.len().saturating_sub(pos);
+        let max_possible_entries = remaining / MIN_ENTRY_SIZE;
+        if entry_count > max_possible_entries {
+            return Err(Error::InvalidObject(format!(
+                "index file entry_count {} exceeds what the remaining {} bytes could hold (max {})",
+                entry_count, remaining, max_possible_entries
+            )));
+        }
+
         let mut entries: Vec<IndexEntry> = Vec::with_capacity(entry_count);
 
         for _ in 0..entry_count {
@@ -464,6 +484,31 @@ mod tests {
             idx2.len(),
             1,
             "pushing the same hash twice must not create two entries"
+        );
+    }
+
+    // Security regression: an untrusted or corrupted remote controls
+    // `entry_count` directly (it is read from plaintext bytes with no prior
+    // integrity check on an unencrypted remote). Before the deserialiser
+    // caps `entry_count` at what the remaining bytes could possibly hold,
+    // `Vec::with_capacity(entry_count)` would request memory sized for
+    // 0xFFFFFFFF `IndexEntry`s -- reproduced during code review as an abort
+    // ("memory allocation of 515396075400 bytes failed"), not a catchable
+    // panic, so this test cannot literally re-trigger that abort inside the
+    // test binary. Instead it exercises the same crafted input (a huge
+    // `entry_count` claimed over a file with no entry bytes at all) and
+    // asserts the *fixed* deserialiser rejects it before any such
+    // allocation is attempted.
+    #[test]
+    fn entry_count_far_exceeding_remaining_bytes_rejected() {
+        let mut bytes = vec![0xED, 0xE2, 0x01, 0x00]; // magic, version, reserved
+        bytes.extend_from_slice(&0xFFFFFFFFu32.to_be_bytes()); // entry_count
+        // No entry bytes follow -- the file is truncated relative to the
+        // claimed entry_count in exactly the way a hostile/corrupted index
+        // file would be.
+        assert!(
+            IndexFile::deserialise(&bytes).is_err(),
+            "entry_count far exceeding what the remaining bytes could hold must be rejected"
         );
     }
 

@@ -145,20 +145,17 @@ pub fn run_timers(opts: LogTimersOptions) -> Result<(), Error> {
 // ---------------------------------------------------------------------------
 
 fn find_logs_dir(work_dir: &std::path::Path) -> Result<PathBuf, Error> {
-    let mut dir = work_dir;
-    loop {
-        let candidate = dir.join(".omemfs").join("logs");
-        if candidate.is_dir() {
-            return Ok(candidate);
-        }
-        match dir.parent() {
-            Some(parent) => dir = parent,
-            None => break,
-        }
+    // `work_dir` is the repository root already discovered by `Repo::discover`
+    // in main.rs; do not re-search upward from here, or a nested repository
+    // with no logs of its own would fall back to an outer repository's logs.
+    let candidate = work_dir.join(".omemfs").join("logs");
+    if candidate.is_dir() {
+        Ok(candidate)
+    } else {
+        Err(Error::Other(
+            "no .omemfs/logs/ found; run a command first".to_string(),
+        ))
     }
-    Err(Error::Other(
-        "no .omemfs/logs/ found; run a command first".to_string(),
-    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -257,7 +254,7 @@ fn fmt_size(bytes: u64) -> String {
 /// Resolve a REF string (or None) to a log file path.
 ///
 /// Resolution order:
-///   1. None          → latest.log (walk up directory tree)
+///   1. None          → latest.log under the already-discovered repo root
 ///   2. "@N"          → N-th entry from scan_log_entries (1-based)
 ///   3. logical name  → <logs_dir>/<name>.log (no '/', no '.', not starting with '@')
 ///   4. otherwise     → treat as PathBuf directly
@@ -279,16 +276,11 @@ fn resolve_ref(file_ref: Option<&str>, work_dir: &std::path::Path) -> Result<Pat
 }
 
 fn resolve_latest(work_dir: &std::path::Path) -> Result<PathBuf, Error> {
-    let mut dir = work_dir;
-    loop {
-        let candidate = dir.join(".omemfs").join("logs").join("latest.log");
-        if candidate.exists() {
-            return Ok(candidate);
-        }
-        match dir.parent() {
-            Some(parent) => dir = parent,
-            None => break,
-        }
+    // Same rationale as `find_logs_dir`: `work_dir` is already the discovered
+    // repository root, so no further upward search is performed here.
+    let candidate = work_dir.join(".omemfs").join("logs").join("latest.log");
+    if candidate.exists() {
+        return Ok(candidate);
     }
     Err(Error::Other(
         "no .omemfs/logs/latest.log found; run a command first or provide a REF argument"

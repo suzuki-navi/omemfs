@@ -10,7 +10,7 @@ use crate::codec::pack::reader::PackReader;
 use crate::dtimer_l1;
 use crate::error::Error;
 use crate::io_stats::{self, IoStatsRecord, PackDetail};
-use crate::object::{Hash, TYPE_TAG_CHUNK, TYPE_TAG_MANIFEST, TYPE_TAG_TREE};
+use crate::object::{Hash, TYPE_TAG_CHUNK, TYPE_TAG_MANIFEST};
 use crate::repo::Repo;
 use crate::store::ObjectStore;
 use crate::store::local::LocalStore;
@@ -610,7 +610,15 @@ fn classify_object(stored: &[u8], stats: &mut Stats) {
                 stats.chunk_manifest_count += 1;
             } else if logical.starts_with(&TYPE_TAG_CHUNK) {
                 stats.chunk_body_count += 1;
-            } else if logical.starts_with(&TYPE_TAG_TREE) {
+            } else if crate::object::Tree::is_tree_bytes(&logical) {
+                // is_tree_bytes (the ED F1 tag alone) already confirmed this
+                // is meant to be a tree, replacing the equivalent
+                // `starts_with(&TYPE_TAG_TREE)` check with the named
+                // discriminator shared by the other three call sites
+                // (design/01_object_model.md "Tree/blob discrimination";
+                // D13). Tree::deserialise below can now only fail on a
+                // genuinely corrupt tagged tree, never on a blob whose
+                // content coincidentally parses as tree JSON.
                 use crate::object::Tree;
                 if Tree::deserialise(&logical).is_ok() {
                     stats.tree_stats.add(stored_len, logical_len);
@@ -721,7 +729,7 @@ pub fn run(opts: StatsOptions) -> Result<(), Error> {
     }
     phase.complete(format!("{} objects", stats.total));
 
-    let omemfs_dir = repo.work_dir.join(".omemfs");
+    let omemfs_dir = repo.omemfs_dir();
     let io_recent = io_stats::read_recent(&omemfs_dir, 20);
     let io_all = if io_recent.is_empty() {
         Vec::new()

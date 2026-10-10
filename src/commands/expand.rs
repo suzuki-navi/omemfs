@@ -187,7 +187,7 @@ pub fn run(opts: ExpandOptions) -> Result<(), Error> {
                 }
             }
         }
-        crate::commands::push::transfer_objects_many(
+        crate::commands::transfer::transfer_objects_many(
             &pack_reader,
             &local,
             &pending,
@@ -253,7 +253,7 @@ pub fn run(opts: ExpandOptions) -> Result<(), Error> {
                 // objects" (design/04_cli_spec.md) for the failure this
                 // guards against.
                 if !codec::chunk::blob_fully_cached(&local, &record.hash)? {
-                    crate::commands::push::transfer_objects(
+                    crate::commands::transfer::transfer_objects(
                         &pack_reader,
                         &local,
                         &record.hash,
@@ -350,7 +350,7 @@ pub fn run(opts: ExpandOptions) -> Result<(), Error> {
     }
 
     if !opts.dry_run {
-        let omemfs_dir = repo.work_dir.join(".omemfs");
+        let omemfs_dir = repo.omemfs_dir();
         let duration_ms = started.elapsed().as_millis() as u64;
         io_stats::append_record(
             &omemfs_dir,
@@ -469,7 +469,7 @@ fn expand_tree(
         stub_threshold,
         &mut pending,
     )?;
-    crate::commands::push::transfer_objects_many(remote, local, &pending, remote_key, true)?;
+    crate::commands::transfer::transfer_objects_many(remote, local, &pending, remote_key, true)?;
 
     expand_tree_materialise(
         tree_hash,
@@ -561,7 +561,7 @@ fn expand_tree_materialise(
                 // (design/04_cli_spec.md) for the full incident this bug
                 // caused in practice.
                 if !codec::chunk::blob_fully_cached(local, &hash)? {
-                    crate::commands::push::transfer_objects(
+                    crate::commands::transfer::transfer_objects(
                         remote, local, &hash, remote_key, true,
                     )?;
                 }
@@ -732,7 +732,7 @@ fn lower_one_child(
             let stub_path = stub::file_stub_path_for(&abs_path);
             if stub::stub_would_be_visible_to_git(&stub_path, work_dir) {
                 if !local.exists(hash)? {
-                    crate::commands::push::transfer_objects(remote, local, hash, remote_key, true)?;
+                    crate::commands::transfer::transfer_objects(remote, local, hash, remote_key, true)?;
                 }
                 crate::fsmeta::materialise_blob_at(work_dir, local, hash, &abs_path, mtime, mode)?;
                 Ok(1)

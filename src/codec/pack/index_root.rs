@@ -153,6 +153,26 @@ impl IndexRoot {
         pos += 2;
         pos += 2; // padding
 
+        // Untrusted-remote validation (see design/02_storage_format.md,
+        // "Untrusted-remote validation of `cold_prefix_bits`"): on an
+        // unencrypted remote INDEX_ROOT has no GCM tag at all, so
+        // `cold_prefix_bits` (a raw untrusted byte, 0-255) is fully
+        // attacker-or-corruption-controlled. This client only ever
+        // increments it by 4 and only when every existing slot already has
+        // a dedicated shard, so any operationally-reachable value stays far
+        // below this cap. Reject anything above 32 BEFORE computing
+        // `1usize << cold_prefix_bits`: for `cold_prefix_bits >= 64` that
+        // shift is out-of-range for a 64-bit `usize` (panics in debug,
+        // silently wraps in release), and even below 64 an untrusted huge
+        // shard count would corrupt the truncation-check arithmetic below.
+        const MAX_COLD_PREFIX_BITS: u8 = 32;
+        if cold_prefix_bits > MAX_COLD_PREFIX_BITS {
+            return Err(Error::InvalidObject(format!(
+                "INDEX_ROOT cold_prefix_bits {} exceeds the maximum of {}",
+                cold_prefix_bits, MAX_COLD_PREFIX_BITS
+            )));
+        }
+
         let cold_shard_count = 1usize << (cold_prefix_bits as usize);
 
         let needed = delta_count * 32 + cold_shard_count * 32;
@@ -287,6 +307,72 @@ mod tests {
         let root = IndexRoot::new_empty();
         let bytes = root.serialise().unwrap();
         assert!(IndexRoot::deserialise(&bytes[..FIXED_HEADER_LEN - 1]).is_err());
+    }
+
+    // Security regression: `cold_prefix_bits` is a single untrusted byte
+    // (0-255) read directly from remote plaintext bytes with no prior
+    // integrity check on an unencrypted remote. `cold_shard_count()` and
+    // `deserialise` both compute `1usize << cold_prefix_bits`; for
+    // `cold_prefix_bits >= 64` (the usize bit width on this platform) this
+    // is an out-of-range shift. In a debug build this panics ("attempt to
+    // shift left with overflow"); in a release build (no overflow checks)
+    // it silently wraps, most often to 0, which then corrupts the
+    // downstream `delta_count * 32 + cold_shard_count * 32` truncation-check
+    // arithmetic in `deserialise` rather than rejecting the malformed input.
+    // The fixed deserialiser must reject any `cold_prefix_bits` above the
+    // documented cap (32, see design/02_storage_format.md) before that
+    // shift ever runs.
+    #[test]
+    fn cold_prefix_bits_above_cap_rejected() {
+        let mut root = IndexRoot::new_empty();
+        root.cold_prefix_bits = 64; // shift-overflow boundary on a 64-bit usize
+        root.cold_shards = vec![[0u8; 32]; 1]; // won't matter -- rejected first
+        // Bypass IndexRoot::serialise's own shard-count validation (which
+        // would reject this cold_prefix_bits/cold_shards mismatch before we
+        // even get to exercise deserialise) by building the wire bytes by
+        // hand: a minimal, otherwise well-formed header with
+        // cold_prefix_bits = 64 and delta_count = 0.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&MAGIC);
+        bytes.push(VERSION);
+        bytes.push(0x00); // reserved
+        bytes.extend_from_slice(&[0u8; 32]); // remote_root
+        bytes.extend_from_slice(&[0u8; 32]); // hot_hash
+        bytes.extend_from_slice(&[0u8; 32]); // bloom_hash
+        bytes.push(64); // cold_prefix_bits -- the malicious value
+        bytes.extend_from_slice(&[0u8; 3]); // reserved2
+        bytes.extend_from_slice(&0u16.to_be_bytes()); // delta_count
+        bytes.extend_from_slice(&[0u8; 2]); // padding
+        assert_eq!(bytes.len(), FIXED_HEADER_LEN);
+
+        assert!(
+            IndexRoot::deserialise(&bytes).is_err(),
+            "cold_prefix_bits >= 64 must be rejected before it is used as a shift amount"
+        );
+    }
+
+    #[test]
+    fn cold_prefix_bits_just_above_documented_cap_rejected() {
+        // 33 is one past the documented cap of 32 (design/02_storage_format.md)
+        // and stays well clear of any shift-overflow boundary, so this
+        // exercises the policy cap itself rather than the arithmetic hazard.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&MAGIC);
+        bytes.push(VERSION);
+        bytes.push(0x00);
+        bytes.extend_from_slice(&[0u8; 32]);
+        bytes.extend_from_slice(&[0u8; 32]);
+        bytes.extend_from_slice(&[0u8; 32]);
+        bytes.push(33); // cold_prefix_bits -- one past the documented cap
+        bytes.extend_from_slice(&[0u8; 3]);
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        bytes.extend_from_slice(&[0u8; 2]);
+        assert_eq!(bytes.len(), FIXED_HEADER_LEN);
+
+        assert!(
+            IndexRoot::deserialise(&bytes).is_err(),
+            "cold_prefix_bits exceeding the documented cap of 32 must be rejected"
+        );
     }
 
     #[test]
