@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::io::Read;
 use std::path::Path;
 use std::sync::OnceLock;
 use std::time::SystemTime;
@@ -12,6 +12,7 @@ use crate::dlog_l1;
 use crate::dtimer_l1;
 use crate::error::Error;
 use crate::filter::FilterSet;
+use crate::fsguard::{EntryKind, EntryStat, GuardedDir};
 use crate::object::{Hash, TreeEntry};
 use crate::stat_cache::{RACY_THRESHOLD_SECS, StatCache};
 use crate::store::ObjectStore;
@@ -84,6 +85,12 @@ pub struct ScanSideData {
     /// at scan time. The real file is absent by design, so `pull` expects it to
     /// stay absent (design/03, "A file stub is a path with no file on disk").
     pub seen_stub: HashSet<String>,
+    /// Partially expanded directories whose recorded tree could not be read, so
+    /// they were not merged and stand for their recorded tree. Only a tolerant
+    /// scan (`scan_and_store_tolerating_unresolved_stubs`, used by `ls`) records
+    /// these; every other scan fails instead (design/04, "Self-healing during
+    /// the working-tree scan").
+    pub unresolved_stubs: HashSet<String>,
 }
 
 /// Result of `scan_and_store_with_cache`. Returns the root tree hash together
@@ -183,14 +190,84 @@ pub fn scan_and_store_with_stub_store(
     stat_cache: &StatCache,
     write_blobs: bool,
 ) -> Result<ScanResult, Error> {
+    scan_impl(
+        work_dir,
+        dir,
+        store,
+        stub_store,
+        clone_root_entries,
+        stat_cache,
+        write_blobs,
+        false,
+    )
+}
+
+/// Like [`scan_and_store_with_stub_store`] for a read-only scan (`ls`), except
+/// that a partially expanded directory whose recorded tree cannot be read
+/// (`ObjectNotFound` from `stub_store`) does not fail the scan. It is left
+/// unmerged, standing for its recorded tree, and reported in
+/// `ScanResult.side.unresolved_stubs` (design/04, "Self-healing during the
+/// working-tree scan"). Any other error still fails.
+pub fn scan_and_store_tolerating_unresolved_stubs(
+    work_dir: &Path,
+    dir: &Path,
+    store: &dyn ObjectStore,
+    stub_store: &dyn ObjectStore,
+    clone_root_entries: Option<&HashMap<String, TreeEntry>>,
+    stat_cache: &StatCache,
+) -> Result<ScanResult, Error> {
+    scan_impl(
+        work_dir,
+        dir,
+        store,
+        stub_store,
+        clone_root_entries,
+        stat_cache,
+        false,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_impl(
+    work_dir: &Path,
+    dir: &Path,
+    store: &dyn ObjectStore,
+    stub_store: &dyn ObjectStore,
+    clone_root_entries: Option<&HashMap<String, TreeEntry>>,
+    stat_cache: &StatCache,
+    write_blobs: bool,
+    tolerate_unresolved_stubs: bool,
+) -> Result<ScanResult, Error> {
     let _t = dtimer_l1!("scan");
     let now = SystemTime::now();
     let rel_prefix = dir
         .strip_prefix(work_dir)
-        .unwrap_or(std::path::Path::new(""))
+        .map_err(|_| {
+            Error::Other(format!(
+                "{} is not inside the working tree {}",
+                dir.display(),
+                work_dir.display()
+            ))
+        })?
         .to_string_lossy()
         .into_owned();
     let rel_prefix = rel_prefix.trim_matches('/').to_string();
+    // The scan root is opened once, component by component, without following
+    // a symlink below `work_dir`; everything below it is reached through this
+    // fd (design/03 "The read side: the working-tree scan and content
+    // capture"). A root that vanished since the caller looked is the same
+    // live-path race as a directory that vanished mid-scan.
+    let root_dir = match crate::fsguard::open_dir(work_dir, &rel_prefix) {
+        Ok(d) => d,
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(Error::SourceChanged(dir.display().to_string()));
+        }
+        Err(Error::SymlinkEscape(_)) => {
+            return Err(Error::SourceChanged(dir.display().to_string()));
+        }
+        Err(e) => return Err(e),
+    };
     // Scope-limited filter load (design/05): when scanning a subtree (`dir` is a
     // descendant of `work_dir`), load only the filters that can affect in-scope
     // paths instead of walking the whole tree. An empty prefix (whole-tree scan)
@@ -204,6 +281,7 @@ pub fn scan_and_store_with_stub_store(
         stat_cache: Some(stat_cache),
         now,
         write_blobs,
+        tolerate_unresolved_stubs,
     };
     // Run the whole recursive walk inside the persistent scan pool so that the
     // top-level `rayon::scope` / `par_iter` and every nested one share the same
@@ -215,7 +293,21 @@ pub fn scan_and_store_with_stub_store(
         mut side,
         vanished,
         ..
-    } = scan_pool().install(|| scan_dir(dir, &rel_prefix, &cfg, &filters))?;
+    } = scan_pool().install(|| {
+        let recheck = || crate::fsguard::lstat_path(work_dir, dir);
+        let recheck: &RecheckFn<'_> = &recheck;
+        scan_dir(
+            &root_dir,
+            &rel_prefix,
+            if rel_prefix.is_empty() {
+                None
+            } else {
+                Some(recheck)
+            },
+            &cfg,
+            &filters,
+        )
+    })?;
     if vanished {
         return Err(Error::SourceChanged(dir.display().to_string()));
     }
@@ -225,10 +317,17 @@ pub fn scan_and_store_with_stub_store(
     // Without this, a scan rooted on a stubbed directory — every `ls <path>` /
     // `push <path>` landing exactly on one — would return a tree holding only the
     // on-disk entries and drop the stub-only ones.
-    let root_hash = match classify_dir_stub(dir, &rel_prefix, &mut side)? {
+    let root_hash = match classify_dir_stub(&root_dir, &rel_prefix, &mut side)? {
         DirStubKind::Full(record) => record.hash,
         DirStubKind::Partial(record) => {
-            merge_partial_expansion(&record.hash, &disk_hash, stub_store, store)?.0
+            match merge_partial_expansion(&record.hash, &disk_hash, stub_store, store) {
+                Ok(merged) => merged.0,
+                Err(Error::ObjectNotFound(_)) if tolerate_unresolved_stubs => {
+                    side.unresolved_stubs.insert(rel_prefix.clone());
+                    record.hash
+                }
+                Err(e) => return Err(e),
+            }
         }
         DirStubKind::None => disk_hash,
     };
@@ -358,6 +457,11 @@ pub fn refresh_stat_cache(
     }
 }
 
+/// Re-stat the scanned directory's own name in its parent (`None` = gone), so a
+/// directory removed or replaced while it was being listed can be told apart
+/// from a legitimately empty one.
+type RecheckFn<'a> = dyn Fn() -> Result<Option<EntryStat>, Error> + Sync + 'a;
+
 /// Local result of scanning one directory level. `scan_dir` is a pure function:
 /// it returns this struct instead of pushing into a shared `&mut`, so sibling
 /// subdirectories can be scanned concurrently with no locking. The caller merges
@@ -380,14 +484,18 @@ struct DirScan {
 
 /// A subdirectory to recurse into, classified during the (sequential) name-walk
 /// of the parent level. The recursion itself runs in parallel across siblings.
-struct SubdirJob {
+struct SubdirJob<'a> {
     name: String,
     rel_path: String,
-    child: std::path::PathBuf,
-    /// `Some(stub_hash)` for a partially-expanded directory stub: after the disk
+    /// The already-open directory this subdirectory is listed in; the child
+    /// is opened relative to it (`openat(O_NOFOLLOW)`), never by path.
+    parent: &'a GuardedDir,
+    /// The subdirectory itself, opened from `parent` while classifying it.
+    dir: GuardedDir,
+    /// `Some(record)` for a partially-expanded directory stub: after the disk
     /// subtree is scanned, its result is merged with the stub's recorded tree
     /// (design/08 "Partial expansion"). `None` for an ordinary directory.
-    partial_stub_hash: Option<Hash>,
+    partial_stub: Option<stub::StubRecord>,
 }
 
 /// Merge a child's scan result into the parent's accumulators (files map and
@@ -402,6 +510,7 @@ fn merge_child(files: &mut HashMap<String, ScannedFile>, side: &mut ScanSideData
     side.unstable_paths.extend(child.side.unstable_paths);
     side.seen_other.extend(child.side.seen_other);
     side.seen_stub.extend(child.side.seen_stub);
+    side.unresolved_stubs.extend(child.side.unresolved_stubs);
 }
 
 /// Scan one directory level, building and storing its tree object and returning
@@ -414,8 +523,9 @@ fn merge_child(files: &mut HashMap<String, ScannedFile>, side: &mut ScanSideData
 /// The `rayon::scope` join point waits for every child before this level builds
 /// its own tree, preserving the parent-after-child ordering the tree hash needs.
 fn scan_dir(
-    dir: &Path,
+    dir: &GuardedDir,
     rel_prefix: &str,
+    recheck: Option<&RecheckFn<'_>>,
     cfg: &FileJobConfig<'_>,
     filters: &FilterSet,
 ) -> Result<DirScan, Error> {
@@ -423,24 +533,20 @@ fn scan_dir(
     let mut files: HashMap<String, ScannedFile> = HashMap::new();
     let mut side = ScanSideData::default();
     // Deferred work for this level, classified sequentially then run in parallel.
-    let mut file_jobs: Vec<FileJob> = Vec::new();
-    let mut subdir_jobs: Vec<SubdirJob> = Vec::new();
+    let mut file_jobs: Vec<FileJob<'_>> = Vec::new();
+    let mut subdir_jobs: Vec<SubdirJob<'_>> = Vec::new();
 
-    // Single read_dir for this level. We keep the DirEntry so we can use its
-    // file_type() (satisfied from getdents64 on Linux in the common case, i.e.
-    // no extra statx). raw_name_set is the set of all in-scope names at this
-    // level, used to decide stub/real-file presence without an extra statx.
-    let mut dir_entries: Vec<(String, fs::DirEntry)> = Vec::new();
+    // Single listing of this level through the directory fd. We keep the entry
+    // kind (`d_type`, satisfied from getdents64 on Linux in the common case,
+    // i.e. no extra statx). raw_name_set is the set of all in-scope names at
+    // this level, used to decide stub/real-file presence without an extra
+    // statx. A directory removed after it was opened lists as empty rather than
+    // failing; the `recheck` at the end of this function catches that.
+    let mut dir_entries: Vec<(String, EntryKind)> = Vec::new();
     let mut raw_name_set: HashSet<String> = HashSet::new();
-    match fs::read_dir(dir) {
-        Ok(rd) => {
-            for item in rd {
-                let e = match item {
-                    Ok(e) => e,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(e) => return Err(Error::Io(e)),
-                };
-                let n = e.file_name().to_string_lossy().into_owned();
+    {
+        {
+            for (n, e) in dir.entries()? {
                 if n == ".omemfs" {
                     continue;
                 }
@@ -484,21 +590,6 @@ fn scan_dir(
                 dir_entries.push((n, e));
             }
         }
-        // Vanished between being listed by the parent and being scanned here.
-        // Return a distinct outcome: treating this as an empty directory would
-        // silently replace its previous subtree with an empty one.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(DirScan {
-                hash: Hash::compute(b"vanished-directory"),
-                mtime: None,
-                size: 0,
-                blob_count: 0,
-                files,
-                side,
-                vanished: true,
-            });
-        }
-        Err(e) => return Err(Error::Io(e)),
     }
 
     // Build the set of logical names. Stub files contribute their logical name
@@ -508,10 +599,10 @@ fn scan_dir(
     // The directory stub marker (.omemfs-stub inside a dir) is excluded here —
     // it is handled in the is_dir branch below.
     //
-    // We map logical name -> the DirEntry that materialises it (the real file's
-    // entry; for a stub-only name there is no real-file entry so it is None and
-    // resolved purely from the stub file).
-    let mut logical: Vec<(String, Option<fs::DirEntry>)> = Vec::new();
+    // We map logical name -> the listed kind of the entry that materialises it
+    // (the real file's entry; for a stub-only name there is no real-file entry
+    // so it is None and resolved purely from the stub file).
+    let mut logical: Vec<(String, Option<EntryKind>)> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for (raw, entry) in dir_entries {
         if raw == stub::DIR_STUB_NAME {
@@ -541,6 +632,11 @@ fn scan_dir(
     // Deterministic integration-test hook for list→open races. It is compiled
     // only in debug builds and has no effect unless explicitly requested.
     #[cfg(debug_assertions)]
+    if let Ok(marker) = std::env::var("OMEMFS_TEST_SCAN_AFTER_LIST_MARKER") {
+        // Tell the test that a listing is over, so it can swap a name now.
+        let _ = std::fs::File::create(marker);
+    }
+    #[cfg(debug_assertions)]
     if let Ok(ms) = std::env::var("OMEMFS_TEST_SCAN_AFTER_LIST_DELAY_MS")
         && let Ok(ms) = ms.parse::<u64>()
     {
@@ -552,31 +648,32 @@ fn scan_dir(
 
         // Skip paths matched by [ignore] patterns; record them as side data
         // (with directory-ness) so ls can display them without another walk.
-        // The directory-ness comes from the already-listed DirEntry's file_type
-        // when available (no extra statx); only a stub-only name needs a stat.
+        // The directory-ness comes from the already-listed entry kind when
+        // available (no extra statx); only a stub-only name or a filesystem
+        // that did not report a type needs a stat.
         if filters.is_ignored(&rel_path) {
-            let is_dir = match &real_entry {
-                Some(e) => e.file_type().map(|t| t.is_dir()).unwrap_or(false),
-                None => dir.join(&name).is_dir(),
+            let is_dir = match real_entry {
+                Some(EntryKind::Dir) => true,
+                Some(EntryKind::Unknown) | None => {
+                    dir.lstat(&name).map(|st| st.is_dir()).unwrap_or(false)
+                }
+                Some(_) => false,
             };
             side.ignored.push((rel_path, is_dir));
             continue;
         }
 
-        let child = dir.join(&name);
-
         // Check for a file-adjacent stub (<name>.omemfs-stub). Its presence is a
         // set lookup against the names already listed at this level (no statx).
         let stub_name = format!("{}{}", name, stub::STUB_SUFFIX);
         if raw_name_set.contains(&stub_name) {
-            let stub_file = dir.join(&stub_name);
-            match read_file_stub(&stub_file) {
+            match read_file_stub(dir, &stub_name) {
                 Ok(record) => {
                     // Record the stub as side data even when stale (real file
                     // present); display logic decides how to treat it.
                     side.stubs.push((rel_path.clone(), record.clone()));
                     // The real file is present iff this logical name carried a
-                    // real DirEntry (set membership, no statx).
+                    // real entry (set membership, no statx).
                     if real_entry.is_none() {
                         side.seen_stub.insert(rel_path.clone());
                         entries.push(TreeEntry::Blob {
@@ -611,107 +708,141 @@ fn scan_dir(
             }
         }
 
-        // Resolve the entry's type from the listed DirEntry's file_type() when
-        // possible (no extra statx). Only fetch full metadata once, where mode /
-        // size / mtime are genuinely needed (regular files and symlinks).
-        let ftype = match &real_entry {
-            Some(e) => match e.file_type() {
-                Ok(t) => t,
-                // file_type() can fail (e.g. the entry vanished); fall back to a
-                // single symlink_metadata. NotFound there confirms a vanish race
-                // (skip); any other error (e.g. permission denied) fails the scan
-                // rather than silently treating the entry as absent.
-                Err(_) => match fs::symlink_metadata(&child) {
-                    Ok(m) => m.file_type(),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        preserve_unstable_entry(&mut entries, &mut side, cfg, &rel_path);
-                        continue;
-                    }
-                    Err(e) => return Err(Error::Io(e)),
-                },
+        // Resolve the entry's type from the listed kind when possible (no extra
+        // statx). Only fetch full metadata once, where mode / size / mtime are
+        // genuinely needed (regular files and symlinks).
+        let kind = match real_entry {
+            Some(EntryKind::Unknown) => match dir.lstat(&name) {
+                Ok(st) if st.is_dir() => EntryKind::Dir,
+                Ok(st) if st.is_symlink() => EntryKind::Symlink,
+                Ok(st) if st.is_file() => EntryKind::File,
+                Ok(_) => EntryKind::Other,
+                // The entry vanished (confirms a race: skip); any other error
+                // (e.g. permission denied) fails the scan rather than silently
+                // treating the entry as absent.
+                Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                    preserve_unstable_entry(&mut entries, &mut side, cfg, &rel_path);
+                    continue;
+                }
+                Err(e) => return Err(e),
             },
+            Some(k) => k,
             // Stub-only name with no real file: nothing on disk to classify.
             None => continue,
         };
 
-        if ftype.is_symlink() {
-            let metadata = match fs::symlink_metadata(&child) {
-                Ok(m) => m,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    preserve_unstable_entry(&mut entries, &mut side, cfg, &rel_path);
-                    continue;
-                }
-                Err(e) => return Err(Error::Io(e)),
-            };
-            let target = match fs::read_link(&child) {
-                Ok(target) => target.to_string_lossy().into_owned(),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    preserve_unstable_entry(&mut entries, &mut side, cfg, &rel_path);
-                    continue;
-                }
-                Err(e) => return Err(Error::Io(e)),
-            };
-            let mtime = system_time_to_datetime(metadata.modified().ok());
-            side.seen_other.insert(rel_path.clone());
-            entries.push(TreeEntry::Symlink {
-                name,
-                target,
-                mtime,
-            });
-        } else if ftype.is_dir() {
-            side.seen_other.insert(rel_path.clone());
-            match classify_dir_stub(&child, &rel_path, &mut side)? {
-                // Fully stubbed: use the recorded tree hash directly without
-                // scanning the subtree.
-                DirStubKind::Full(record) => {
-                    entries.push(TreeEntry::Tree {
-                        name,
-                        hash: record.hash,
-                        mtime: record.mtime,
-                        size: record.size,
-                        blob_count: record.blob_count,
-                    });
-                    continue;
-                }
-                // Partial expansion: scan the disk subtree, then merge with the
-                // stub's recorded tree after recursion.
-                DirStubKind::Partial(record) => {
-                    subdir_jobs.push(SubdirJob {
-                        name,
-                        rel_path,
-                        child,
-                        partial_stub_hash: Some(record.hash),
-                    });
-                    continue;
-                }
-                DirStubKind::None => {}
+        match kind {
+            EntryKind::Symlink => {
+                let metadata = match dir.lstat(&name) {
+                    Ok(m) => m,
+                    Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                        preserve_unstable_entry(&mut entries, &mut side, cfg, &rel_path);
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
+                let target = match dir.read_link(&name) {
+                    Ok(target) => target,
+                    // NotFound: removed; EINVAL: replaced by a non-symlink after
+                    // it was listed. Both are live-path races.
+                    Err(Error::Io(e))
+                        if e.kind() == std::io::ErrorKind::NotFound
+                            || e.raw_os_error() == Some(libc::EINVAL) =>
+                    {
+                        preserve_unstable_entry(&mut entries, &mut side, cfg, &rel_path);
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
+                let mtime = system_time_to_datetime(metadata.modified());
+                side.seen_other.insert(rel_path.clone());
+                entries.push(TreeEntry::Symlink {
+                    name,
+                    target,
+                    mtime,
+                });
             }
-            subdir_jobs.push(SubdirJob {
-                name,
-                rel_path,
-                child,
-                partial_stub_hash: None,
-            });
-        } else if ftype.is_file() {
-            // A regular file: fetch metadata once for mode / size / mtime, then
-            // defer the (optionally parallel) hash. The body is read later, in
-            // process_file_job, only on a STAT_CACHE / clone-root miss.
-            let metadata = match fs::symlink_metadata(&child) {
-                Ok(m) => m,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            EntryKind::Dir => {
+                side.seen_other.insert(rel_path.clone());
+                // Open the child relative to this directory's fd. A name that
+                // was a directory when listed but is a symlink (or gone) now is
+                // a live-path race: never followed, previous entry preserved.
+                let child_dir = match dir.open_subdir(&name) {
+                    Ok(d) => d,
+                    Err(Error::SymlinkEscape(_)) => {
+                        preserve_unstable_entry(&mut entries, &mut side, cfg, &rel_path);
+                        continue;
+                    }
+                    Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                        preserve_unstable_entry(&mut entries, &mut side, cfg, &rel_path);
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
+                match classify_dir_stub(&child_dir, &rel_path, &mut side)? {
+                    // Fully stubbed: use the recorded tree hash directly without
+                    // scanning the subtree.
+                    DirStubKind::Full(record) => {
+                        entries.push(TreeEntry::Tree {
+                            name,
+                            hash: record.hash,
+                            mtime: record.mtime,
+                            size: record.size,
+                            blob_count: record.blob_count,
+                        });
+                        continue;
+                    }
+                    // Partial expansion: scan the disk subtree, then merge with the
+                    // stub's recorded tree after recursion.
+                    DirStubKind::Partial(record) => {
+                        subdir_jobs.push(SubdirJob {
+                            name,
+                            rel_path,
+                            parent: dir,
+                            dir: child_dir,
+                            partial_stub: Some(record),
+                        });
+                        continue;
+                    }
+                    DirStubKind::None => {}
+                }
+                subdir_jobs.push(SubdirJob {
+                    name,
+                    rel_path,
+                    parent: dir,
+                    dir: child_dir,
+                    partial_stub: None,
+                });
+            }
+            EntryKind::File => {
+                // A regular file: fetch metadata once for mode / size / mtime, then
+                // defer the (optionally parallel) hash. The body is read later, in
+                // process_file_job, only on a STAT_CACHE / clone-root miss.
+                let metadata = match dir.lstat(&name) {
+                    Ok(m) => m,
+                    Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                        preserve_unstable_entry(&mut entries, &mut side, cfg, &rel_path);
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
+                if !metadata.is_file() {
+                    // Replaced by a symlink, directory or FIFO after it was
+                    // listed: not a stable regular file.
                     preserve_unstable_entry(&mut entries, &mut side, cfg, &rel_path);
                     continue;
                 }
-                Err(e) => return Err(Error::Io(e)),
-            };
-            file_jobs.push(FileJob {
-                name,
-                rel_path,
-                file_size: metadata.len(),
-                fs_mtime_st: metadata.modified().ok(),
-                mode: crate::fsmeta::mode_from_metadata(&metadata),
-                child,
-            });
+                file_jobs.push(FileJob {
+                    name,
+                    rel_path,
+                    file_size: metadata.size,
+                    fs_mtime_st: metadata.modified(),
+                    mode: crate::fsmeta::mode_from_bits(metadata.mode),
+                    dir,
+                });
+            }
+            // FIFO, socket, device: not tracked content.
+            EntryKind::Other | EntryKind::Unknown => {}
         }
     }
 
@@ -778,48 +909,42 @@ fn scan_dir(
             {
                 continue;
             }
-            match fs::symlink_metadata(dir.join(old_entry.name())) {
+            match dir.lstat(old_entry.name()) {
                 Ok(_) => {
                     side.unstable_paths.insert(path.clone());
                     entries.push(old_entry.clone());
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(Error::Io(e)),
+                Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
             }
         }
     }
 
-    // The directory may have been removed after `read_dir` succeeded (an open
-    // directory iterator can otherwise look like a legitimately emptied
-    // directory). Let the parent preserve the whole previous subtree.
-    if !rel_prefix.is_empty() {
-        match fs::symlink_metadata(dir) {
-            Ok(metadata) if metadata.is_dir() => {}
-            Ok(_) => {
+    // The directory may have been removed, or replaced by something else, after
+    // it was opened (an open directory fd can otherwise look like a legitimately
+    // emptied directory). Compare what its name resolves to now with the
+    // directory this scan actually read; a mismatch lets the parent preserve the
+    // whole previous subtree.
+    if let Some(recheck) = recheck {
+        let vanished = |hash: &'static [u8], side: ScanSideData| DirScan {
+            hash: Hash::compute(hash),
+            mtime: None,
+            size: 0,
+            blob_count: 0,
+            files: HashMap::new(),
+            side,
+            vanished: true,
+        };
+        match recheck()? {
+            Some(now) if now.is_dir() && now.same_object(&dir.fstat()?) => {}
+            Some(_) => {
                 side.unstable_paths.insert(rel_prefix.to_string());
-                return Ok(DirScan {
-                    hash: Hash::compute(b"replaced-directory"),
-                    mtime: None,
-                    size: 0,
-                    blob_count: 0,
-                    files: HashMap::new(),
-                    side,
-                    vanished: true,
-                });
+                return Ok(vanished(b"replaced-directory", side));
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            None => {
                 side.unstable_paths.insert(rel_prefix.to_string());
-                return Ok(DirScan {
-                    hash: Hash::compute(b"vanished-directory"),
-                    mtime: None,
-                    size: 0,
-                    blob_count: 0,
-                    files: HashMap::new(),
-                    side,
-                    vanished: true,
-                });
+                return Ok(vanished(b"vanished-directory", side));
             }
-            Err(e) => return Err(Error::Io(e)),
         }
     }
 
@@ -854,7 +979,13 @@ fn scan_subdir(
     cfg: &FileJobConfig<'_>,
     filters: &FilterSet,
 ) -> Result<(SubdirEntry, DirScan), Error> {
-    let mut child_scan = scan_dir(&job.child, &job.rel_path, cfg, filters)?;
+    let recheck = || match job.parent.lstat(&job.name) {
+        Ok(st) => Ok(Some(st)),
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    };
+    let recheck: &RecheckFn<'_> = &recheck;
+    let mut child_scan = scan_dir(&job.dir, &job.rel_path, Some(recheck), cfg, filters)?;
     if child_scan.vanished {
         child_scan.side.unstable_paths.insert(job.rel_path.clone());
         return Ok((
@@ -864,16 +995,30 @@ fn scan_subdir(
             child_scan,
         ));
     }
-    let entry = match &job.partial_stub_hash {
-        Some(stub_hash) => {
-            let (merged_hash, mtime, size, blob_count) =
-                merge_partial_expansion(stub_hash, &child_scan.hash, cfg.stub_store, cfg.store)?;
-            TreeEntry::Tree {
-                name: job.name.clone(),
-                hash: merged_hash,
-                mtime,
-                size,
-                blob_count,
+    let entry = match &job.partial_stub {
+        Some(record) => {
+            match merge_partial_expansion(&record.hash, &child_scan.hash, cfg.stub_store, cfg.store)
+            {
+                Ok((merged_hash, mtime, size, blob_count)) => TreeEntry::Tree {
+                    name: job.name.clone(),
+                    hash: merged_hash,
+                    mtime,
+                    size,
+                    blob_count,
+                },
+                Err(Error::ObjectNotFound(_)) if cfg.tolerate_unresolved_stubs => {
+                    // Not merged: the directory stands for its recorded tree,
+                    // exactly as a fully stubbed one does.
+                    child_scan.side.unresolved_stubs.insert(job.rel_path.clone());
+                    TreeEntry::Tree {
+                        name: job.name.clone(),
+                        hash: record.hash.clone(),
+                        mtime: record.mtime,
+                        size: record.size,
+                        blob_count: record.blob_count,
+                    }
+                }
+                Err(e) => return Err(e),
             }
         }
         None => TreeEntry::Tree {
@@ -890,10 +1035,18 @@ fn scan_subdir(
 /// Read and parse a file-stub marker (`<name>.omemfs-stub`). Any I/O or JSON
 /// error propagates as-is; callers decide whether that is fatal (see
 /// design/08_stub_system.md, "Malformed stub records are fail-closed").
-fn read_file_stub(stub_file: &Path) -> Result<stub::StubRecord, Error> {
-    let s = fs::read_to_string(stub_file)?;
+fn read_file_stub(dir: &GuardedDir, stub_name: &str) -> Result<stub::StubRecord, Error> {
+    let s = read_to_string_at(dir, stub_name)?;
     let record = serde_json::from_str(&s)?;
     Ok(record)
+}
+
+/// Read a small marker file as `name` inside `dir` (never through a path and
+/// never through a symlink at `name`).
+fn read_to_string_at(dir: &GuardedDir, name: &str) -> Result<String, Error> {
+    let mut text = String::new();
+    dir.open_file(name)?.read_to_string(&mut text)?;
+    Ok(text)
 }
 
 /// Join a relative-path prefix with a name (`""` prefix → bare name).
@@ -936,13 +1089,14 @@ fn preserve_unstable_entry(
 /// A deferred regular-file entry collected during the directory walk. Holds
 /// everything needed to resolve the file's tree entry; the file body is read
 /// only if the STAT_CACHE and clone-root fallback both miss.
-struct FileJob {
+struct FileJob<'a> {
     name: String,
     rel_path: String,
     file_size: u64,
     fs_mtime_st: Option<SystemTime>,
     mode: Option<String>,
-    child: std::path::PathBuf,
+    /// The directory the file was listed in; it is opened relative to it.
+    dir: &'a GuardedDir,
 }
 
 /// Read-only inputs shared by every file job in one `scan_dir` call. All fields
@@ -971,6 +1125,9 @@ struct FileJobConfig<'a> {
     stat_cache: Option<&'a StatCache>,
     now: SystemTime,
     write_blobs: bool,
+    /// `ls`: a partial expansion whose recorded tree cannot be read is left
+    /// unmerged and reported instead of failing the scan.
+    tolerate_unresolved_stubs: bool,
 }
 
 /// Result of one file job: optional entry (new transient files may disappear),
@@ -984,7 +1141,7 @@ type FileJobResult = (
 /// Resolve a single regular file to its tree entry, applying the same
 /// three-stage check as the serial scan: STAT_CACHE hit, clone-root
 /// `(mtime, size)` fallback, then full read + hash.
-fn process_file_job(job: &FileJob, cfg: &FileJobConfig<'_>) -> Result<FileJobResult, Error> {
+fn process_file_job(job: &FileJob<'_>, cfg: &FileJobConfig<'_>) -> Result<FileJobResult, Error> {
     let name = job.name.clone();
     let rel_path = &job.rel_path;
     let file_size = job.file_size;
@@ -1102,7 +1259,7 @@ fn process_file_job(job: &FileJob, cfg: &FileJobConfig<'_>) -> Result<FileJobRes
         cfg.write_blobs
     );
     let captured = if cfg.write_blobs {
-        match codec::chunk::store_file_snapshot(cfg.store, &job.child, None) {
+        match codec::chunk::store_file_snapshot_at(cfg.store, job.dir, &job.name, None) {
             Ok(stored) => Some(stored),
             Err(Error::SourceChanged(_)) => {
                 return Ok((previous_entry(cfg, rel_path), None, Some(rel_path.clone())));
@@ -1117,7 +1274,13 @@ fn process_file_job(job: &FileJob, cfg: &FileJobConfig<'_>) -> Result<FileJobRes
     };
     let hash = match &captured {
         Some(stored) => stored.hash.clone(),
-        None => codec::chunk::hash_file(&job.child)?,
+        None => match codec::chunk::hash_file_at(job.dir, &job.name) {
+            Ok(hash) => hash,
+            Err(Error::SourceChanged(_)) => {
+                return Ok((previous_entry(cfg, rel_path), None, Some(rel_path.clone())));
+            }
+            Err(e) => return Err(e),
+        },
     };
     let effective_mtime_st = captured
         .as_ref()
@@ -1188,15 +1351,20 @@ enum DirStubKind {
 /// The stub is recorded as side data regardless of target type (matches stub
 /// enumeration semantics).
 fn classify_dir_stub(
-    dir: &Path,
+    dir: &GuardedDir,
     rel_path: &str,
     side: &mut ScanSideData,
 ) -> Result<DirStubKind, Error> {
     // The marker is not part of the parent level's name set, so its presence
-    // requires one statx (kept to a single call).
-    let dir_stub_path = dir.join(stub::DIR_STUB_NAME);
-    if !dir_stub_path.is_file() {
-        return Ok(DirStubKind::None);
+    // requires one statx (kept to a single call). It is a marker only when it
+    // is a regular file itself: a symlink by that name is not followed.
+    match dir.lstat(stub::DIR_STUB_NAME) {
+        Ok(st) if st.is_file() => {}
+        Ok(_) => return Ok(DirStubKind::None),
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(DirStubKind::None);
+        }
+        Err(e) => return Err(e),
     }
     // Fail-closed (design/08_stub_system.md, "Malformed stub records are
     // fail-closed"): the marker existing means the real directory content is
@@ -1206,7 +1374,7 @@ fn classify_dir_stub(
     // uploads as a deletion -- silently destroying the remote's copy of
     // content that in truth still exists, only its local marker is damaged.
     // Abort the whole scan instead so the operator notices and repairs it.
-    let text = fs::read_to_string(&dir_stub_path)?;
+    let text = read_to_string_at(dir, stub::DIR_STUB_NAME)?;
     let record: stub::StubRecord = serde_json::from_str(&text)?;
     side.stubs.push((rel_path.to_string(), record.clone()));
     if record.target_type != stub::StubTargetType::Tree {
@@ -1222,11 +1390,9 @@ fn classify_dir_stub(
 /// Returns true if `dir` contains any entry other than the directory stub
 /// marker (`.omemfs-stub`). Used to distinguish a fully-stubbed directory from
 /// a partially expanded one.
-fn dir_has_real_children(dir: &Path) -> bool {
-    match fs::read_dir(dir) {
-        Ok(rd) => rd
-            .flatten()
-            .any(|e| e.file_name().to_string_lossy() != stub::DIR_STUB_NAME),
+fn dir_has_real_children(dir: &GuardedDir) -> bool {
+    match dir.entries() {
+        Ok(entries) => entries.iter().any(|(n, _)| n != stub::DIR_STUB_NAME),
         Err(_) => false,
     }
 }
@@ -2707,6 +2873,154 @@ mod tests {
         assert!(
             local.exists(&hash).unwrap(),
             "the recaptured blob must now be staged in the local cache"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ls: tolerating a partial expansion whose recorded tree cannot be read
+    // (design/04 "Self-healing during the working-tree scan")
+    // -----------------------------------------------------------------------
+
+    fn write_partial_stub(work: &Path, rel: &str, tree: &Hash) {
+        let dir = work.join(rel);
+        fs::create_dir_all(&dir).unwrap();
+        stub::write_dir_stub(
+            work,
+            rel,
+            &stub::StubRecord {
+                target_type: stub::StubTargetType::Tree,
+                hash: tree.clone(),
+                size: 25,
+                mtime: None,
+                mode: None,
+                blob_count: 1,
+            },
+        )
+        .unwrap();
+        fs::write(dir.join("new.txt"), b"new local content").unwrap();
+    }
+
+    #[test]
+    fn tolerant_scan_leaves_an_unreadable_partial_stub_as_its_recorded_tree() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pack_dir = tmp.path().join("pack");
+        fs::create_dir_all(&pack_dir).unwrap();
+        let (mut writer, _reader, local) = setup_pack(&pack_dir);
+        let stub_tree = publish_remote_only_stub_tree(&mut writer);
+        let work = tempfile::TempDir::new().unwrap();
+        write_partial_stub(work.path(), "sub", &stub_tree);
+
+        // The stub's recorded tree is not in the local cache and `stub_store`
+        // is the plain local cache: the read misses.
+        let result = scan_and_store_tolerating_unresolved_stubs(
+            work.path(),
+            work.path(),
+            &local,
+            &local,
+            None,
+            &StatCache::default(),
+        )
+        .expect("an unreadable recorded tree must not fail a tolerant scan");
+
+        let entries = tree_ops::load_all_entries(&result.root_hash, &local).unwrap();
+        let sub = entries.iter().find(|e| e.name() == "sub").expect("sub entry");
+        assert_eq!(
+            sub.hash(),
+            Some(&stub_tree),
+            "the unresolved directory stands for its recorded tree, unmerged"
+        );
+        assert!(
+            result.side.unresolved_stubs.contains("sub"),
+            "the directory must be reported as unresolved"
+        );
+    }
+
+    #[test]
+    fn tolerant_scan_still_merges_when_the_recorded_tree_is_readable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pack_dir = tmp.path().join("pack");
+        fs::create_dir_all(&pack_dir).unwrap();
+        let (mut writer, reader, local) = setup_pack(&pack_dir);
+        let stub_tree = publish_remote_only_stub_tree(&mut writer);
+        let work = tempfile::TempDir::new().unwrap();
+        write_partial_stub(work.path(), "sub", &stub_tree);
+
+        let lazy = tree_ops::LazyTreeStore::new(&local, &reader, None);
+        let result = scan_and_store_tolerating_unresolved_stubs(
+            work.path(),
+            work.path(),
+            &local,
+            &lazy,
+            None,
+            &StatCache::default(),
+        )
+        .unwrap();
+
+        assert!(result.side.unresolved_stubs.is_empty());
+        let entries = tree_ops::load_all_entries(&result.root_hash, &local).unwrap();
+        let sub_hash = entries
+            .iter()
+            .find(|e| e.name() == "sub")
+            .and_then(|e| e.hash().cloned())
+            .unwrap();
+        let names: std::collections::HashSet<String> =
+            tree_ops::load_all_entries(&sub_hash, &local)
+                .unwrap()
+                .iter()
+                .map(|e| e.name().to_string())
+                .collect();
+        assert_eq!(
+            names,
+            std::collections::HashSet::from(["orig.txt".to_string(), "new.txt".to_string()])
+        );
+    }
+
+    #[test]
+    fn tolerant_scan_rooted_on_an_unreadable_partial_stub_reports_the_root() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pack_dir = tmp.path().join("pack");
+        fs::create_dir_all(&pack_dir).unwrap();
+        let (mut writer, _reader, local) = setup_pack(&pack_dir);
+        let stub_tree = publish_remote_only_stub_tree(&mut writer);
+        let work = tempfile::TempDir::new().unwrap();
+        write_partial_stub(work.path(), "sub", &stub_tree);
+
+        let result = scan_and_store_tolerating_unresolved_stubs(
+            work.path(),
+            &work.path().join("sub"),
+            &local,
+            &local,
+            None,
+            &StatCache::default(),
+        )
+        .unwrap();
+
+        assert_eq!(result.root_hash, stub_tree);
+        assert!(result.side.unresolved_stubs.contains("sub"));
+    }
+
+    #[test]
+    fn strict_scan_still_fails_on_an_unreadable_partial_stub() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pack_dir = tmp.path().join("pack");
+        fs::create_dir_all(&pack_dir).unwrap();
+        let (mut writer, _reader, local) = setup_pack(&pack_dir);
+        let stub_tree = publish_remote_only_stub_tree(&mut writer);
+        let work = tempfile::TempDir::new().unwrap();
+        write_partial_stub(work.path(), "sub", &stub_tree);
+
+        let result = scan_and_store_with_stub_store(
+            work.path(),
+            work.path(),
+            &local,
+            &local,
+            None,
+            &StatCache::default(),
+            false,
+        );
+        assert!(
+            matches!(result, Err(Error::ObjectNotFound(_))),
+            "push and pull must keep failing instead of tolerating the gap"
         );
     }
 }

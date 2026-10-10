@@ -1913,3 +1913,124 @@ setup_two_clones_for_ls() {
     [[ -n "$top_line" ]]
     [[ "${top_line:1:1}" == " " ]]
 }
+
+# ---------------------------------------------------------------------------
+# Self-healing during the working-tree scan
+# (design/04 "Self-healing during the working-tree scan")
+#
+# After `clone --stub-threshold` whole-stubs a directory, its recorded tree
+# object is never downloaded. Adding a real file inside the stub marker
+# (partial expansion, design/08) makes the scan merge that recorded tree with
+# the on-disk files, so `ls` must fetch it (bounded) or degrade to `?`.
+# ---------------------------------------------------------------------------
+
+# Push a two-file `bigdir` from a source clone, then lazy-clone it with a tiny
+# threshold into `lazy_repo` and add `bigdir/c.txt` without expanding.
+make_partially_expanded_lazy_clone() {
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" origin_repo
+    [ "$status" -eq 0 ]
+    (
+        cd origin_repo
+        mkdir -p bigdir
+        printf '%020d' 0 > bigdir/a.txt
+        printf '%020d' 1 > bigdir/b.txt
+        "$OMEMFS" push
+    )
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" --stub-threshold 10 lazy_repo
+    [ "$status" -eq 0 ]
+    cd lazy_repo
+    [ -f bigdir/.omemfs-stub ]
+    echo "new-c" > bigdir/c.txt
+}
+
+@test "ls: heals a never-fetched partial-expansion stub tree and shows the merged status" {
+    make_partially_expanded_lazy_clone
+
+    run "$OMEMFS" ls -r
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"object not found"* ]]
+    # The root is modified (the new file is added), not unknown. (In an
+    # unscoped listing a child directory's own X column stays blank, as for
+    # any directory; the scoped case below shows it.)
+    root_line=$(echo "$output" | grep ' \.$')
+    [[ "${root_line:1:1}" == "M" ]]
+    c_line=$(echo "$output" | grep ' bigdir/c\.txt$')
+    [[ "${c_line:1:1}" == "A" ]]
+    # The stub's own files are still there: never reported as deleted.
+    ! echo "$output" | grep -q '^D .* bigdir/a\.txt$'
+}
+
+@test "ls: a scoped ls of the partially expanded directory heals the same way" {
+    make_partially_expanded_lazy_clone
+
+    run "$OMEMFS" ls bigdir
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"object not found"* ]]
+    dir_line=$(echo "$output" | grep ' bigdir/$')
+    [[ "${dir_line:1:1}" == "M" ]]
+}
+
+@test "ls: --dirty heals a never-fetched partial-expansion stub tree" {
+    make_partially_expanded_lazy_clone
+
+    run "$OMEMFS" ls --dirty
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"object not found"* ]]
+    echo "$output" | grep -q 'bigdir/c\.txt$'
+}
+
+@test "ls: the healed stub tree is cached, so a second ls needs no remote" {
+    make_partially_expanded_lazy_clone
+    run "$OMEMFS" ls
+    [ "$status" -eq 0 ]
+
+    # Make the remote unreachable: the first ls cached the object locally.
+    mv "$REMOTE_DIR" "${REMOTE_DIR}.gone"
+    run "$OMEMFS" ls
+    mv "${REMOTE_DIR}.gone" "$REMOTE_DIR"
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"object not found"* ]]
+    dir_line=$(echo "$output" | grep ' bigdir/$')
+    [[ "${dir_line:1:1}" == "M" ]]
+}
+
+@test "ls: degrades to '?' instead of failing when the stub tree cannot be fetched" {
+    make_partially_expanded_lazy_clone
+
+    # The remote is gone and the recorded tree was never cached locally.
+    mv "$REMOTE_DIR" "${REMOTE_DIR}.gone"
+    run "$OMEMFS" ls -r
+    mv "${REMOTE_DIR}.gone" "$REMOTE_DIR"
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"object not found"* ]]
+    dir_line=$(echo "$output" | grep ' bigdir/$')
+    [[ -n "$dir_line" ]]
+    [[ "${dir_line:1:1}" == "?" ]]
+    # The root cannot vouch for it either.
+    root_line=$(echo "$output" | grep ' \.$')
+    [[ "${root_line:1:1}" == "?" ]]
+}
+
+@test "ls: --dirty lists an unresolvable partial-expansion stub with '?'" {
+    make_partially_expanded_lazy_clone
+
+    mv "$REMOTE_DIR" "${REMOTE_DIR}.gone"
+    run "$OMEMFS" ls --dirty
+    mv "${REMOTE_DIR}.gone" "$REMOTE_DIR"
+    [ "$status" -eq 0 ]
+    echo "$output" | grep -qE '^ \? .* bigdir/$'
+}
+
+@test "ls: push still merges the partial expansion after ls healed the stub tree" {
+    make_partially_expanded_lazy_clone
+    run "$OMEMFS" ls
+    [ "$status" -eq 0 ]
+
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+    cd ..
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" --stub-threshold 0 verify_full
+    [ "$status" -eq 0 ]
+    [ -f verify_full/bigdir/a.txt ]
+    [ -f verify_full/bigdir/c.txt ]
+}

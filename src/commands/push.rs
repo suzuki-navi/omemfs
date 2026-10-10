@@ -402,12 +402,16 @@ fn push_scoped(
         // (most importantly `PermissionDenied`) is distinguished from
         // "confirmed absent" and aborts the whole push instead of being
         // mistaken for a deletion.
-        match std::fs::symlink_metadata(&abs_path) {
-            Ok(_) => {
-                // Path exists (as of this check) -- fall through to the scan
-                // branch below.
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        //
+        // The lookup resolves every ancestor by directory fd
+        // (`fsguard::lstat_path`), so an ancestor swapped for a symlink after
+        // the `is_real_dir` check above cannot make a path that still exists
+        // report `NotFound` and be pushed as a deletion. The kind it returns
+        // also decides the branch below (directory scan vs single file), so
+        // the branch and the later read agree on what was observed.
+        let observed = match crate::fsguard::lstat_path(&repo.work_dir, &abs_path) {
+            Ok(Some(st)) => st,
+            Ok(None) => {
                 // Deletion intent. Whether this is a real removal or a no-op
                 // (the path is already absent on the remote) is decided
                 // later, in the splice loop, against the remote-root
@@ -422,16 +426,22 @@ fn push_scoped(
                 });
                 continue;
             }
+            // An ancestor turned into a symlink between the check above and
+            // this lookup: the path is live, not deleted and not readable.
+            Err(Error::SymlinkEscape(_)) => {
+                unstable_paths.insert(rel.clone());
+                continue;
+            }
             Err(e) => {
                 return Err(Error::Other(format!(
                     "cannot stat '{}': {} — aborting push rather than risk treating it as deleted",
                     rel, e
                 )));
             }
-        }
+        };
 
         let phase = crate::progress::begin_phase(format!("Scan {}", rel));
-        let scoped_hash = if abs_path.is_dir() {
+        let scoped_hash = if observed.is_dir() {
             // Scoped flatten (design/03 "Path-scoped push"): build the mtime
             // pre-filter map from only `rel`'s subtree of the clone root,
             // instead of flattening the whole clone root for every path.
@@ -480,9 +490,15 @@ fn push_scoped(
             phase.complete(format!("{} files", count));
             scan_result.root_hash
         } else {
-            let stored = match crate::codec::chunk::store_file_snapshot(local, &abs_path, None) {
+            // Opened as (parent directory fd, name): a path swapped for a
+            // symlink or FIFO since `lstat_path` is a live-path race, never
+            // followed (design/03 "The read side").
+            let stored = match crate::fsguard::open_leaf(&repo.work_dir, rel, false)
+                .and_then(|(parent, leaf)| {
+                    crate::codec::chunk::store_file_snapshot_at(local, &parent, &leaf, None)
+                }) {
                 Ok(stored) => stored,
-                Err(e) if e.is_live_path_race() => {
+                Err(e) if e.is_live_path_race() || matches!(e, Error::SymlinkEscape(_)) => {
                     unstable_paths.insert(rel.clone());
                     phase.complete("skipped active path");
                     continue;
@@ -535,7 +551,7 @@ fn push_scoped(
             rel: rel.clone(),
             components: components.iter().map(|s| s.to_string()).collect(),
             scoped_hash,
-            abs_path_is_dir: abs_path.is_dir(),
+            abs_path_is_dir: observed.is_dir(),
             is_delete: false,
         });
     }

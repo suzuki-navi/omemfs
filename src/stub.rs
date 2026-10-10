@@ -290,7 +290,16 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<(String, StubRecord)>) -> Resu
             continue;
         }
 
-        if path.is_file() && name == DIR_STUB_NAME {
+        // Classified by the entry's own type, which does not follow a symlink:
+        // a directory symlink is a link, never a directory to descend into
+        // (design/03 "The read side"), and a symlink named like a stub marker
+        // is not a marker.
+        let (is_dir, is_file) = match entry.file_type() {
+            Ok(t) => (t.is_dir(), t.is_file()),
+            Err(_) => continue,
+        };
+
+        if is_file && name == DIR_STUB_NAME {
             // Directory stub for this directory.
             if let Ok(Some(record)) = read_from_path(&path) {
                 let rel = dir
@@ -305,12 +314,12 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<(String, StubRecord)>) -> Resu
             continue;
         }
 
-        if path.is_dir() {
+        if is_dir {
             entries_to_recurse.push(path);
             continue;
         }
 
-        if path.is_file() && name.ends_with(STUB_SUFFIX) {
+        if is_file && name.ends_with(STUB_SUFFIX) {
             // File stub: derive logical rel_path by stripping suffix.
             let logical_path = path.with_file_name(&name[..name.len() - STUB_SUFFIX.len()]);
             let rel = logical_path
@@ -629,6 +638,38 @@ mod tests {
         let found = list_under(dir.path(), &dir.path().join("sub")).unwrap();
         let rels: Vec<&str> = found.iter().map(|(rel, _)| rel.as_str()).collect();
         assert_eq!(rels, vec!["sub/inner.txt"]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn list_does_not_descend_into_a_directory_symlink() {
+        // A directory symlink is a link, not a directory. Following it reports
+        // the same stub again under the link's name and, for a link to an
+        // ancestor, never terminates in practice.
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "sub/inner.txt", &dummy_record()).unwrap();
+        std::os::unix::fs::symlink(".", dir.path().join("sub/l1")).unwrap();
+        std::os::unix::fs::symlink(".", dir.path().join("sub/l2")).unwrap();
+        std::os::unix::fs::symlink("sub", dir.path().join("alias")).unwrap();
+
+        let found = list(dir.path()).unwrap();
+        let rels: Vec<&str> = found.iter().map(|(rel, _)| rel.as_str()).collect();
+        assert_eq!(rels, vec!["sub/inner.txt"]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn list_ignores_a_symlink_named_like_a_stub_file() {
+        let dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        write(outside.path(), "x.txt", &dummy_record()).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("x.txt.omemfs-stub"),
+            dir.path().join("y.txt.omemfs-stub"),
+        )
+        .unwrap();
+
+        assert!(list(dir.path()).unwrap().is_empty());
     }
 
     #[test]

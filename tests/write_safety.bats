@@ -111,18 +111,27 @@ teardown() {
     outside="$(mktemp -d)"
     mkdir -p "$outside/.omemfs"
     # Simulate the directory having been swapped for a symlink after clone:
-    # carry the stub marker over to $outside so expand's stub-record read
-    # (unguarded, by design -- only the write side is in scope here) still
-    # succeeds and proceeds to try to materialise "child.txt" there.
+    # carry the stub marker over to $outside, so a stub enumeration that
+    # followed the link would find a stub there and try to materialise
+    # "child.txt" into it.
     cp dest/sub/.omemfs-stub "$outside/.omemfs-stub"
     rm -rf dest/sub
     ln -s "$outside" dest/sub
 
+    # Naming the link itself: the enumeration does not follow it (design/03
+    # "The read side"), so there is no stub to expand and nothing is written.
     cd dest
     run "$OMEMFS" expand sub
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Nothing to expand"* ]]
+    [ ! -e "$outside/child.txt" ]
+
+    # Naming a path below the link reaches the guarded write, which refuses.
+    run "$OMEMFS" expand sub/child.txt
     cd ..
 
     [ "$status" -ne 0 ]
+    [[ "$output" == *"symlinked directory"* ]]
     [ ! -e "$outside/child.txt" ]
     [ -L dest/sub ]
     [ "$(readlink dest/sub)" = "$outside" ]

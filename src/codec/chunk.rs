@@ -127,8 +127,34 @@ pub fn store_file_snapshot(
     path: &Path,
     key: Option<&codec::encrypt::EncryptKey>,
 ) -> Result<StoredFile, Error> {
+    store_snapshot_with(store, key, &path.display().to_string(), || {
+        Ok(fs::File::open(path)?)
+    })
+}
+
+/// Like [`store_file_snapshot`], but the file is opened as `name` inside the
+/// already-open directory `dir` (`openat(O_NOFOLLOW)`), so a directory or file
+/// swapped for a symlink after `dir` was listed cannot redirect the read
+/// (design/03 "The read side: the working-tree scan and content capture").
+pub fn store_file_snapshot_at(
+    store: &dyn ObjectStore,
+    dir: &crate::fsguard::GuardedDir,
+    name: &str,
+    key: Option<&codec::encrypt::EncryptKey>,
+) -> Result<StoredFile, Error> {
+    store_snapshot_with(store, key, &dir.abs(name).display().to_string(), || {
+        dir.open_file(name)
+    })
+}
+
+fn store_snapshot_with(
+    store: &dyn ObjectStore,
+    key: Option<&codec::encrypt::EncryptKey>,
+    label: &str,
+    open: impl Fn() -> Result<fs::File, Error>,
+) -> Result<StoredFile, Error> {
     for _ in 0..SNAPSHOT_ATTEMPTS {
-        let mut file = fs::File::open(path)?;
+        let mut file = open()?;
         let before_md = file.metadata()?;
         let before = file_stat(&before_md);
         let mode = crate::fsmeta::mode_from_metadata(&before_md);
@@ -166,7 +192,7 @@ pub fn store_file_snapshot(
         });
     }
 
-    Err(Error::SourceChanged(path.display().to_string()))
+    Err(Error::SourceChanged(label.to_string()))
 }
 
 #[cfg(debug_assertions)]
@@ -193,7 +219,14 @@ fn test_post_read_delay() {}
 /// regardless of file size. See design/02 "Hash-only variant" and design/03
 /// "Scan blob-write mode".
 pub fn hash_file(path: &Path) -> Result<Hash, Error> {
-    let (hash, _needs_escape) = pass1_hash_and_prefix(path)?;
+    let (hash, _needs_escape) = pass1_hash_and_prefix(fs::File::open(path)?)?;
+    Ok(hash)
+}
+
+/// [`hash_file`] for `name` inside the already-open directory `dir`
+/// (`openat(O_NOFOLLOW)`; see [`store_file_snapshot_at`]).
+pub fn hash_file_at(dir: &crate::fsguard::GuardedDir, name: &str) -> Result<Hash, Error> {
+    let (hash, _needs_escape) = pass1_hash_and_prefix(dir.open_file(name)?)?;
     Ok(hash)
 }
 
@@ -253,8 +286,7 @@ impl<R: Read> Read for PrefixReader<R> {
 /// Hash-only path: stream the file in fixed buffers, computing the logical blob hash
 /// (`SHA256(ED F0 | content)`, matching `object::blob_hash`) and whether the
 /// `ED F0` escape prefix is needed for the serialised stream.
-fn pass1_hash_and_prefix(path: &Path) -> Result<(Hash, bool), Error> {
-    let mut file = fs::File::open(path)?;
+fn pass1_hash_and_prefix(mut file: fs::File) -> Result<(Hash, bool), Error> {
     // Logical hash anchor always includes the ED F0 tag (see object::blob_hash).
     let mut hasher = Sha256::new();
     hasher.update(object::TYPE_TAG_BLOB);

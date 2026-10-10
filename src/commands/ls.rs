@@ -10,7 +10,7 @@ use crate::error::Error;
 use crate::object::{Hash, Tree, TreeEntry};
 use crate::repo::Repo;
 use crate::scan::{
-    ScanResult, ScanSideData, ScannedFile, refresh_stat_cache, scan_and_store_with_cache,
+    ScanResult, ScanSideData, ScannedFile, refresh_stat_cache, scan_and_store_tolerating_unresolved_stubs,
 };
 use crate::stat_cache::StatCache;
 use crate::store::ObjectStore;
@@ -136,12 +136,14 @@ pub fn run(mut opts: LsOptions) -> Result<(), Error> {
         };
         // ls is read-only: hash files but skip blob writes (design/03
         // "Scan blob-write mode"). Tree objects are still written for diffing.
+        let stub_store_dirty = scan_stub_store(&repo, &local);
         let scan_result_dirty = scan_scoped_for_ls(
             &opts.work_dir,
             &opts.paths,
             clone_root.as_ref(),
             clone_root_flat_dirty.as_ref(),
             &local,
+            &*stub_store_dirty,
             &stat_cache_dirty,
         )?;
         // ls is always a read-only (write_blobs = false) scan; its writeback
@@ -153,7 +155,10 @@ pub fn run(mut opts: LsOptions) -> Result<(), Error> {
             false,
         );
         let working_hash = scan_result_dirty.root_hash;
-        if clone_root.as_ref() == Some(&working_hash) {
+        let unresolved_dirty = unresolved_stub_paths(&scan_result_dirty.side);
+        // An unresolved partial expansion stands for its recorded tree, which
+        // can equal the clone root's: the hash alone would then say "clean".
+        if clone_root.as_ref() == Some(&working_hash) && unresolved_dirty.is_empty() {
             phase.complete("0 entries");
             return Ok(());
         }
@@ -168,14 +173,19 @@ pub fn run(mut opts: LsOptions) -> Result<(), Error> {
             })
             .collect();
         let scope_dirty = ScopeFilter::new(&scoped_prefixes_dirty);
-        let (diff, unknown_dirty) = diff_trees_with_heal(
-            &repo,
-            clone_root.as_ref(),
-            working_hash,
-            &local,
-            &scope_dirty,
-            &scoped_prefixes_dirty,
-        )?;
+        let (diff, mut unknown_dirty) = if clone_root.as_ref() == Some(&working_hash) {
+            (HashMap::new(), HashSet::new())
+        } else {
+            diff_trees_with_heal(
+                &repo,
+                clone_root.as_ref(),
+                working_hash,
+                &local,
+                &scope_dirty,
+                &scoped_prefixes_dirty,
+            )?
+        };
+        unknown_dirty.extend(unresolved_dirty);
         let mut paths: Vec<&String> = diff.keys().collect();
         paths.sort();
         let mut rows: Vec<Row> = Vec::new();
@@ -288,12 +298,14 @@ pub fn run(mut opts: LsOptions) -> Result<(), Error> {
     // empty tree when none exists) to reconstruct a full working-tree root hash.
     // Out-of-scope paths reuse the clone-root tree objects unchanged and incur
     // no working-tree I/O. With no <path>, the full working tree is scanned.
+    let stub_store = scan_stub_store(&repo, &local);
     let scan_result = scan_scoped_for_ls(
         &opts.work_dir,
         &opts.paths,
         clone_root.as_ref(),
         clone_root_flat.as_ref(),
         &local,
+        &*stub_store,
         &stat_cache,
     )?;
     let working_hash = scan_result.root_hash.clone();
@@ -356,6 +368,10 @@ pub fn run(mut opts: LsOptions) -> Result<(), Error> {
         } else {
             (HashMap::new(), HashSet::new())
         };
+    // Partially expanded directories whose recorded tree could not be read are
+    // unknown too (design/04 "Self-healing during the working-tree scan").
+    let mut unknown_paths = unknown_paths;
+    unknown_paths.extend(unresolved_stub_paths(&scan_result.side));
 
     // The no-clone-root top-level listing applies only to an unscoped ls. With a
     // path scope, fall through to the scoped branch using the working_hash
@@ -1178,11 +1194,14 @@ fn scan_scoped_for_ls(
     clone_root: Option<&Hash>,
     clone_root_flat: Option<&HashMap<String, TreeEntry>>,
     store: &dyn ObjectStore,
+    stub_store: &dyn ObjectStore,
     stat_cache: &StatCache,
 ) -> Result<ScanResult, Error> {
-    // ls is read-only: hash files but skip blob writes (design/03 "Scan
-    // blob-write mode"). Tree objects are still written so diffing can read them.
-    const WRITE_BLOBS: bool = false;
+    // ls is read-only (write_blobs = false): hash files but skip blob writes
+    // (design/03 "Scan blob-write mode"). Tree objects are still written so
+    // diffing can read them. `stub_store` is used only to read a partially
+    // expanded directory's recorded tree (design/04 "Self-healing during the
+    // working-tree scan"); every other read stays on `store`.
 
     // Observation time for every file this scan hashes (design/07 "Racily clean
     // detection"): taken up front, so it can only be earlier than the actual
@@ -1191,13 +1210,13 @@ fn scan_scoped_for_ls(
 
     // Unscoped: scan the whole working tree exactly as before.
     if paths.is_empty() {
-        return scan_and_store_with_cache(
+        return scan_and_store_tolerating_unresolved_stubs(
             work_dir,
             work_dir,
             store,
+            stub_store,
             clone_root_flat,
             stat_cache,
-            WRITE_BLOBS,
         );
     }
 
@@ -1232,13 +1251,13 @@ fn scan_scoped_for_ls(
 
         // Root scope (".") degenerates to a full scan; do it and return.
         if rel_str.is_empty() {
-            return scan_and_store_with_cache(
+            return scan_and_store_tolerating_unresolved_stubs(
                 work_dir,
                 work_dir,
                 store,
+                stub_store,
                 clone_root_flat,
                 stat_cache,
-                WRITE_BLOBS,
             );
         }
 
@@ -1285,13 +1304,13 @@ fn scan_scoped_for_ls(
             // Scan only this subtree. `scan_and_store_with_cache` derives the
             // rel_prefix from `dir` against `work_dir`, so the recorded `files`
             // and `side` keys are already repo-relative.
-            let sub = scan_and_store_with_cache(
+            let sub = scan_and_store_tolerating_unresolved_stubs(
                 work_dir,
                 &abs,
                 store,
+                stub_store,
                 clone_root_flat,
                 stat_cache,
-                WRITE_BLOBS,
             )?;
             files.extend(sub.files);
             merge_side_data(&mut side, sub.side);
@@ -1323,7 +1342,7 @@ fn scan_scoped_for_ls(
             let cached = fs_mtime.and_then(|t| stat_cache.lookup_current_entry(&rel_str, t, size));
             let (hash, cache_hit, blob_sealed) = match cached {
                 Some(entry) => (entry.hash.clone(), true, entry.sealed),
-                // This whole function only ever scans with WRITE_BLOBS =
+                // This whole function only ever scans with write_blobs =
                 // false (ls is read-only), so a cache miss is never sealed.
                 None => (codec::chunk::hash_file(&abs)?, false, false),
             };
@@ -1392,6 +1411,7 @@ fn merge_side_data(dst: &mut ScanSideData, src: ScanSideData) {
     dst.stubs.extend(src.stubs);
     dst.ignored.extend(src.ignored);
     dst.unknown_reserved.extend(src.unknown_reserved);
+    dst.unresolved_stubs.extend(src.unresolved_stubs);
 }
 
 // ---------------------------------------------------------------------------
@@ -2096,6 +2116,45 @@ fn mark_deleted(
     Ok(())
 }
 
+/// The scan's unresolved partial expansions in the form `unknown` paths use: a
+/// bare path, `"."` for the root.
+fn unresolved_stub_paths(side: &ScanSideData) -> HashSet<String> {
+    side.unresolved_stubs
+        .iter()
+        .map(|p| if p.is_empty() { ".".to_string() } else { p.clone() })
+        .collect()
+}
+
+/// Total time budget for the fetches one `ls` working-tree scan may make to
+/// read partially expanded directories' recorded trees (design/04
+/// "Self-healing during the working-tree scan"). The same figure as
+/// [`LOCAL_DIFF_HEAL_TIMEOUT`].
+const SCAN_HEAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The store `ls`'s working-tree scan reads a partially expanded directory's
+/// recorded tree through: `local` plus, when `origin` is configured, a
+/// time-budgeted fetch of a missing object from it. With no `origin` it is just
+/// `local`, so a miss is an ordinary `ObjectNotFound` the tolerant scan handles.
+fn scan_stub_store(
+    repo: &Repo,
+    local: &crate::store::local::LocalStore,
+) -> Box<dyn ObjectStore> {
+    let Ok((pack_reader, _remote, remote_key)) = repo.pack_reader("origin", None) else {
+        return Box::new(local.clone());
+    };
+    let local_for_fetch = local.clone();
+    let fetch: std::sync::Arc<crate::tree_ops::FetchFn> =
+        std::sync::Arc::new(move |hash: &Hash| {
+            let plaintext = codec::store_read(&pack_reader, hash, remote_key.as_ref())?;
+            codec::store_write(&local_for_fetch, hash, &plaintext, None)
+        });
+    Box::new(crate::tree_ops::BudgetedFetchStore::new(
+        local.clone(),
+        fetch,
+        SCAN_HEAL_BUDGET,
+    ))
+}
+
 /// Maximum time budget for the `LazyTreeStore`-backed local diff walk in
 /// [`diff_trees_with_heal`]. Unlike [`REMOTE_LOOKUP_TIMEOUT`] (below, which
 /// bounds a single `INDEX_ROOT` read), this bounds the *whole* recursive
@@ -2632,6 +2691,7 @@ mod tests {
             None,
             None,
             &store,
+            &store,
             &stat_cache,
         )
         .unwrap();
@@ -2675,6 +2735,7 @@ mod tests {
             &[work.join("dir")],
             Some(&clone_root_hash),
             None,
+            &store,
             &store,
             &stat_cache,
         )

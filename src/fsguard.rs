@@ -647,6 +647,11 @@ impl GuardedDir {
         if dirp.is_null() {
             return Err(Error::Io(io::Error::last_os_error()));
         }
+        // The dup'd fd shares its file offset with `self.fd`, so a directory
+        // listed before (the scan lists and classifies the same directory
+        // more than once) would otherwise start at its end.
+        // SAFETY: `dirp` is a valid, freshly opened directory stream.
+        unsafe { libc::rewinddir(dirp) };
         let mut out = Vec::new();
         let result: Result<(), Error> = (|| {
             loop {
@@ -747,6 +752,241 @@ impl GuardedDir {
             }
         }
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Read side: fd-relative listing, stat and open for the working-tree scan
+// (design/03_sync_model.md, "The read side: the working-tree scan and content
+// capture"). Nothing here takes a path string once a directory is open.
+// ---------------------------------------------------------------------------
+
+/// The kind of a directory entry as reported by the listing (`d_type`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    Dir,
+    File,
+    Symlink,
+    /// FIFO, socket, device.
+    Other,
+    /// The filesystem did not report a type; use [`GuardedDir::lstat`].
+    Unknown,
+}
+
+impl EntryKind {
+    fn from_d_type(d_type: u8) -> Self {
+        match d_type {
+            libc::DT_DIR => EntryKind::Dir,
+            libc::DT_REG => EntryKind::File,
+            libc::DT_LNK => EntryKind::Symlink,
+            libc::DT_UNKNOWN => EntryKind::Unknown,
+            _ => EntryKind::Other,
+        }
+    }
+}
+
+/// `stat` data for one entry, taken without following a symlink.
+#[derive(Debug, Clone, Copy)]
+pub struct EntryStat {
+    pub mode: u32,
+    pub size: u64,
+    pub dev: u64,
+    pub ino: u64,
+    mtime_sec: i64,
+    mtime_nsec: i64,
+}
+
+impl EntryStat {
+    fn from_stat(st: &libc::stat) -> Self {
+        EntryStat {
+            mode: st.st_mode as u32,
+            size: st.st_size as u64,
+            dev: st.st_dev as u64,
+            ino: st.st_ino as u64,
+            mtime_sec: st.st_mtime as i64,
+            mtime_nsec: st.st_mtime_nsec as i64,
+        }
+    }
+
+    fn file_type(&self) -> u32 {
+        self.mode & libc::S_IFMT as u32
+    }
+
+    pub fn is_dir(&self) -> bool {
+        self.file_type() == libc::S_IFDIR as u32
+    }
+
+    pub fn is_file(&self) -> bool {
+        self.file_type() == libc::S_IFREG as u32
+    }
+
+    pub fn is_symlink(&self) -> bool {
+        self.file_type() == libc::S_IFLNK as u32
+    }
+
+    /// The same `(dev, ino)` names the same filesystem object.
+    pub fn same_object(&self, other: &EntryStat) -> bool {
+        self.dev == other.dev && self.ino == other.ino
+    }
+
+    pub fn modified(&self) -> Option<std::time::SystemTime> {
+        use std::time::{Duration, UNIX_EPOCH};
+        let base = if self.mtime_sec >= 0 {
+            UNIX_EPOCH.checked_add(Duration::from_secs(self.mtime_sec as u64))?
+        } else {
+            UNIX_EPOCH.checked_sub(Duration::from_secs(self.mtime_sec.unsigned_abs()))?
+        };
+        base.checked_add(Duration::from_nanos(self.mtime_nsec as u64))
+    }
+}
+
+impl GuardedDir {
+    /// Open the subdirectory `name` relative to this directory's fd, refusing a
+    /// symlink (`Error::SymlinkEscape`) and reporting a missing name as
+    /// `Error::Io(NotFound)`.
+    pub fn open_subdir(&self, name: &str) -> Result<GuardedDir, Error> {
+        descend(self, name, false)
+    }
+
+    /// List this directory's entries with their `d_type`, skipping `.`/`..`.
+    /// Safe to call repeatedly: every call starts from the beginning.
+    pub fn entries(&self) -> Result<Vec<(String, EntryKind)>, Error> {
+        Ok(self
+            .list_entries()?
+            .into_iter()
+            .map(|(name, d_type)| (name, EntryKind::from_d_type(d_type)))
+            .collect())
+    }
+
+    /// `fstatat(AT_SYMLINK_NOFOLLOW)` of `name` in this directory.
+    pub fn lstat(&self, name: &str) -> Result<EntryStat, Error> {
+        validate_component(name)?;
+        let c_name = to_cstring(name)?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `st` is zeroed stack storage for `fstatat` to fill in;
+        // `self.fd` is a valid open directory fd and `c_name` is a validated,
+        // `/`-free component.
+        let ret = unsafe {
+            libc::fstatat(
+                self.fd.as_raw_fd(),
+                c_name.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if ret != 0 {
+            return Err(Error::Io(io::Error::last_os_error()));
+        }
+        Ok(EntryStat::from_stat(&st))
+    }
+
+    /// `fstat` of this directory itself.
+    pub fn fstat(&self) -> Result<EntryStat, Error> {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `st` is zeroed stack storage; `self.fd` is a valid open fd.
+        let ret = unsafe { libc::fstat(self.fd.as_raw_fd(), &mut st) };
+        if ret != 0 {
+            return Err(Error::Io(io::Error::last_os_error()));
+        }
+        Ok(EntryStat::from_stat(&st))
+    }
+
+    /// `readlinkat` of the symlink `name` in this directory.
+    pub fn read_link(&self, name: &str) -> Result<String, Error> {
+        validate_component(name)?;
+        let c_name = to_cstring(name)?;
+        let mut buf = vec![0u8; 4096];
+        loop {
+            // SAFETY: `buf` is a valid writable buffer of `buf.len()` bytes;
+            // `self.fd` is a valid open directory fd; `c_name` is a validated,
+            // `/`-free component.
+            let n = unsafe {
+                libc::readlinkat(
+                    self.fd.as_raw_fd(),
+                    c_name.as_ptr(),
+                    buf.as_mut_ptr() as *mut libc::c_char,
+                    buf.len(),
+                )
+            };
+            if n < 0 {
+                return Err(Error::Io(io::Error::last_os_error()));
+            }
+            let n = n as usize;
+            if n < buf.len() {
+                buf.truncate(n);
+                return Ok(String::from_utf8_lossy(&buf).into_owned());
+            }
+            buf.resize(buf.len() * 2, 0);
+        }
+    }
+
+    /// Open the regular file `name` in this directory for reading.
+    ///
+    /// `O_NOFOLLOW` refuses a symlink at `name`; `O_NONBLOCK` keeps the open
+    /// of a FIFO swapped in after listing from blocking. Anything that is not
+    /// a regular file once opened (checked on the handle itself) is reported
+    /// as `Error::SourceChanged`, the scan's "the path changed under us"
+    /// outcome. A missing name is `Error::Io(NotFound)`.
+    pub fn open_file(&self, name: &str) -> Result<std::fs::File, Error> {
+        validate_component(name)?;
+        let c_name = to_cstring(name)?;
+        // SAFETY: `self.fd` is a valid open directory fd; `c_name` is a
+        // validated, `/`-free component, so the open cannot leave this
+        // directory.
+        let fd = unsafe {
+            libc::openat(
+                self.fd.as_raw_fd(),
+                c_name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                0,
+            )
+        };
+        if fd < 0 {
+            let e = io::Error::last_os_error();
+            return match e.raw_os_error() {
+                // A symlink (ELOOP) or a socket/device node (ENXIO) replaced
+                // the file after it was listed.
+                Some(libc::ELOOP) | Some(libc::ENXIO) => {
+                    Err(Error::SourceChanged(self.abs(name).display().to_string()))
+                }
+                _ => Err(Error::Io(e)),
+            };
+        }
+        // SAFETY: `fd` was just returned by a successful `openat` and is not
+        // owned by anything else yet.
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        if !file.metadata().map_err(Error::Io)?.file_type().is_file() {
+            return Err(Error::SourceChanged(self.abs(name).display().to_string()));
+        }
+        Ok(file)
+    }
+}
+
+/// Open the directory `rel` (relative to `work_dir`, `""` = `work_dir`)
+/// without following a symlink at any component below `work_dir`.
+pub fn open_dir(work_dir: &Path, rel: &str) -> Result<GuardedDir, Error> {
+    resolve_dir(work_dir, rel.trim_matches('/'), false)
+}
+
+/// `lstat` of `abs_path` with every ancestor below `work_dir` resolved by fd.
+/// `Ok(None)` means nothing exists there (or an ancestor is missing). A
+/// symlinked ancestor is `Error::SymlinkEscape`; a symlink at the leaf is
+/// reported as such (`EntryStat::is_symlink`), not followed.
+pub fn lstat_path(work_dir: &Path, abs_path: &Path) -> Result<Option<EntryStat>, Error> {
+    let rel = to_rel_string(work_dir, abs_path)?;
+    let rel = rel.trim_matches('/');
+    if rel.is_empty() {
+        return Ok(Some(open_root(work_dir)?.fstat()?));
+    }
+    let (dir, leaf) = match open_leaf(work_dir, rel, false) {
+        Ok(v) => v,
+        Err(Error::Io(e)) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    match dir.lstat(&leaf) {
+        Ok(st) => Ok(Some(st)),
+        Err(Error::Io(e)) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
@@ -1734,6 +1974,125 @@ mod tests {
 
         let err = remove_dir_if_empty(work_dir.path(), &work_dir.path().join("sub/child"))
             .unwrap_err();
+        assert!(matches!(err, Error::SymlinkEscape(_)), "got {err:?}");
+    }
+
+    // --- read side (fd-relative listing, stat, open) ---
+
+    #[test]
+    fn entries_lists_every_time_from_the_start() {
+        let work_dir = TempDir::new().unwrap();
+        fs::write(work_dir.path().join("a"), "x").unwrap();
+        fs::create_dir(work_dir.path().join("d")).unwrap();
+        let dir = open_dir(work_dir.path(), "").unwrap();
+        let mut first: Vec<_> = dir.entries().unwrap();
+        let mut second: Vec<_> = dir.entries().unwrap();
+        first.sort_by(|a, b| a.0.cmp(&b.0));
+        second.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(first, second);
+        assert_eq!(
+            first,
+            vec![
+                ("a".to_string(), EntryKind::File),
+                ("d".to_string(), EntryKind::Dir)
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn open_file_refuses_a_symlink_as_source_changed() {
+        let work_dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::write(outside.path().join("secret"), "SECRET").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), work_dir.path().join("f"))
+            .unwrap();
+        let dir = open_dir(work_dir.path(), "").unwrap();
+        let err = dir.open_file("f").unwrap_err();
+        assert!(matches!(err, Error::SourceChanged(_)), "got {err:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn open_file_on_a_fifo_does_not_block_and_is_source_changed() {
+        let work_dir = TempDir::new().unwrap();
+        let fifo = std::ffi::CString::new(work_dir.path().join("f").as_os_str().as_bytes())
+            .unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+        let dir = open_dir(work_dir.path(), "").unwrap();
+        let err = dir.open_file("f").unwrap_err();
+        assert!(matches!(err, Error::SourceChanged(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn open_file_reports_a_missing_name_as_not_found() {
+        let work_dir = TempDir::new().unwrap();
+        let dir = open_dir(work_dir.path(), "").unwrap();
+        let err = dir.open_file("nope").unwrap_err();
+        assert!(
+            matches!(&err, Error::Io(e) if e.kind() == io::ErrorKind::NotFound),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn open_subdir_refuses_a_symlink() {
+        let work_dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), work_dir.path().join("d")).unwrap();
+        let dir = open_dir(work_dir.path(), "").unwrap();
+        let err = dir.open_subdir("d").unwrap_err();
+        assert!(matches!(err, Error::SymlinkEscape(_)), "got {err:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_opened_directory_keeps_reading_the_original_after_its_name_is_swapped() {
+        let work_dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::write(outside.path().join("secret"), "SECRET").unwrap();
+        fs::create_dir(work_dir.path().join("d")).unwrap();
+        fs::write(work_dir.path().join("d/inside"), "inside").unwrap();
+
+        let dir = open_dir(work_dir.path(), "d").unwrap();
+        // Swap the name for a symlink to the outside directory.
+        fs::rename(work_dir.path().join("d"), work_dir.path().join("d.real")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), work_dir.path().join("d")).unwrap();
+
+        let names: Vec<_> = dir.entries().unwrap().into_iter().map(|e| e.0).collect();
+        assert_eq!(names, vec!["inside".to_string()]);
+        let mut text = String::new();
+        io::Read::read_to_string(&mut dir.open_file("inside").unwrap(), &mut text).unwrap();
+        assert_eq!(text, "inside");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn lstat_path_reports_absent_present_and_symlinked_ancestor() {
+        let work_dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::write(outside.path().join("f"), "x").unwrap();
+        fs::write(work_dir.path().join("here"), "x").unwrap();
+        std::os::unix::fs::symlink(outside.path(), work_dir.path().join("link")).unwrap();
+
+        assert!(lstat_path(work_dir.path(), &work_dir.path().join("nope"))
+            .unwrap()
+            .is_none());
+        assert!(lstat_path(work_dir.path(), &work_dir.path().join("a/b"))
+            .unwrap()
+            .is_none());
+        assert!(lstat_path(work_dir.path(), &work_dir.path().join("here"))
+            .unwrap()
+            .unwrap()
+            .is_file());
+        // A symlink at the leaf is reported as a symlink, not followed.
+        assert!(lstat_path(work_dir.path(), &work_dir.path().join("link"))
+            .unwrap()
+            .unwrap()
+            .is_symlink());
+        // A symlinked ancestor is refused rather than reported as present.
+        let err = lstat_path(work_dir.path(), &work_dir.path().join("link/f")).unwrap_err();
         assert!(matches!(err, Error::SymlinkEscape(_)), "got {err:?}");
     }
 }

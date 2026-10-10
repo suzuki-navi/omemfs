@@ -308,7 +308,8 @@ impl FilterSet {
                     continue;
                 }
                 let child = entry.path();
-                if child.is_dir() {
+                // Not followed through a symlink (see `collect_filter_files`).
+                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                     let child_prefix = format!("{}/{}", cur_prefix, name);
                     if is_ignored_by_loaded(&set.files, &child_prefix) {
                         continue;
@@ -399,7 +400,10 @@ fn collect_filter_files(
             continue;
         }
         let child = entry.path();
-        if child.is_dir() {
+        // `file_type()` does not follow a symlink, matching the scan (which
+        // records a directory symlink as a link and never descends into it);
+        // following one here made `ln -s . l1/l2/l3` loops walk exponentially.
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             let child_prefix = if rel_prefix.is_empty() {
                 name.clone()
             } else {

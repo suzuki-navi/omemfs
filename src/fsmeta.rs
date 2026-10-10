@@ -73,7 +73,13 @@ pub fn mode_matches(path: &Path, mode: &Option<String>) -> bool {
 /// Consolidates a derivation that was previously copy-pasted at scan.rs,
 /// commands/push.rs (x2), and commands/ls.rs (refactor-instructions.md D1).
 pub fn mode_from_metadata(meta: &std::fs::Metadata) -> Option<String> {
-    if meta.permissions().mode() & 0o100 != 0 {
+    mode_from_bits(meta.permissions().mode())
+}
+
+/// [`mode_from_metadata`] for raw `st_mode` bits (an fd-relative `fstatat`
+/// has no `Metadata`).
+pub fn mode_from_bits(mode_bits: u32) -> Option<String> {
+    if mode_bits & 0o100 != 0 {
         Some("755".to_string())
     } else {
         None

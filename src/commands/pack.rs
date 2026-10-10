@@ -417,9 +417,13 @@ fn collect_stub_paths_recursive(
         if name == ".omemfs" {
             continue;
         }
-        if path.is_dir() {
+        // Entry type without following a symlink (design/03 "The read side").
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
             collect_stub_paths_recursive(&path, work_dir, out);
-        } else if path.is_file()
+        } else if file_type.is_file()
             && let Some(logical_name) = crate::stub::logical_name(&name)
         {
             // Derive the logical path (without the stub suffix).

@@ -265,6 +265,15 @@ in. The two scans would then disagree about that directory's hash, and a
 subsequent diff against `clone_root` would report the missing entries as
 spurious deletions, propagated up to every ancestor row shown by `ls`.
 
+The merge needs the stub's recorded tree *content*, which may not be in the
+local cache after a lazy clone. The scan therefore reads it through a store the
+caller chooses. `push` and `pull` pass the lazy tree store and fetch without a
+budget: if the fetch fails, the command fails. `ls` passes a time-budgeted one
+and tolerates a failure — the unresolved directory stands for its recorded tree
+and is reported as unknown (`04_cli_spec.md`, "Self-healing during the
+working-tree scan"). Every other store read in a scan, and every
+local-existence decision, stays local-only in all callers.
+
 The merge is therefore scan-root-independent: a given partially expanded
 directory produces the same merged tree hash whether `scan_dir` reaches it as
 a child of an enumerating parent or is invoked on it directly as the scan
@@ -851,6 +860,24 @@ The following call sites are all inside this boundary; each is either walking th
 - `omemfs restore`'s conflict-helper cleanup (`src/commands/restore.rs`, `remove_conflict_helpers`): removes the three conflict helper files and the metadata sidecar via `fsguard::remove_file_tolerant`, tolerating a helper that is already gone, instead of a bare `fs::remove_file` that both follows a symlinked ancestor and silently swallows every error.
 - `omemfs conflict clean`'s helper-file and metadata-sidecar deletion (`src/commands/conflict.rs`, `run_clean`): removes each collected helper path, and each base path's `.omemfs-conflict-meta` sidecar, via `fsguard::remove_file_tolerant`.
 - Path-scoped `push` (`src/commands/push.rs`, `push_scoped`): before scanning or reading a scoped path's content for upload, every path component from `work_dir` down to (and including) the scoped path itself is verified to be symlink-free via `fsguard::is_real_dir`/`fsguard`'s component walk, so a symlinked ancestor of the scoped path can never be traversed to read — and upload — content from outside `work_dir`.
+
+#### The read side: the working-tree scan and content capture
+
+The guarantee above used to stop at mutation. The scan that feeds `push` built every path by joining names onto a `Path` and then calling `read_dir`, `symlink_metadata`, `read_link` and `File::open` on the result, so a directory swapped for a symlink *after* the parent was listed (or after `is_real_dir` approved a scoped path) was followed, and whatever lives behind the link was hashed and uploaded. Reproduction: swap a directory and a symlink to an outside directory with `renameat2(RENAME_EXCHANGE)` in a tight loop while `omemfs push` runs; outside files reach the remote. A one-shot `is_real_dir` check cannot close this, because the check and the later use resolve the path independently.
+
+The scan therefore walks the tree the way the write side does: by directory fd.
+
+- The scan root is opened once with `fsguard` (component-by-component `openat(O_DIRECTORY|O_NOFOLLOW)` from `work_dir`). Every deeper directory is opened with `openat(O_DIRECTORY|O_NOFOLLOW)` *relative to its parent's fd*. Listing (`fdopendir`), `fstatat(AT_SYMLINK_NOFOLLOW)`, `readlinkat` and the file open (`openat(O_NOFOLLOW|O_NONBLOCK)`) all go through the fd of the directory that was listed, never through a path string. No step can be redirected by replacing a name after it was listed.
+- A name that was listed as a directory or regular file but is no longer one when it is opened (`ELOOP`/`ENOTDIR` from `O_NOFOLLOW`, `ENOENT`, or an `fstat` of the opened handle that is not a regular file) is a live-path race, not an error and not a deletion: the path is reported as unstable and its previous tree entry is preserved, exactly like a file that vanished after listing (see "Scan blob-write mode" and the `actively changing path` warning). A FIFO or device swapped in is handled the same way; `O_NONBLOCK` keeps the open from hanging on a FIFO.
+- The directory-stub marker and file-stub records are read through the same fds. A symlink named `.omemfs-stub` is not a marker.
+- The file is opened once and both its metadata and its content come from that handle (this was already true of `store_file_snapshot`); only the *open* changed, from a path to `(directory fd, name)`.
+- Path-scoped `push` keeps the `fsguard::is_real_dir` pre-check (it gives a precise `SymlinkEscape` error for the common static case), but it is no longer what the guarantee rests on: the scan root and a scoped single file are opened by fd, a root swapped between the check and the open is a live-path race (`unstable`), and the "nothing there, so delete" decision uses a guarded `lstat` (`fsguard::lstat_path`) rather than `symlink_metadata` on the joined path, which a swapped ancestor could have made report `NotFound` and turned into a pushed deletion.
+
+Still path-based, deliberately: reads whose result is never uploaded as working-tree content (`ls`/`pull` hash-only reads of a single scoped file; `.omemfs-filter` file contents).
+
+Every recursive working-tree walk that is not the scan must agree with the scan about what a directory is: a directory symlink is a link, never a directory to descend into. `.omemfs-filter` discovery, the stub enumeration (`stub::list`/`list_under`, which `push` and `pull` run through stub reconcile after advancing `clone_root`), and `pack`'s stubbed-path collection therefore classify entries without following symlinks (`DirEntry::file_type`, not `Path::is_dir`). Following them let a self-referencing link such as `ln -s . a/l1` make the walk visit exponentially many paths (`a/l1/l2/l3/...`), so `push` finished uploading and then never returned.
+
+A consequence for `expand` with no explicit path: a stubbed directory that has since been replaced by a symlink is no longer enumerated as a stub, so a bare `expand` (or `expand <that directory>`) reports "Nothing to expand." and exits 0, writing nothing. Naming a path *below* the link (`expand sub/child.txt`) still goes through the guarded write and is refused with `SymlinkEscape`. In both cases nothing is ever written through the link.
 
 Enumerating call sites is deliberately avoided as a *substitute* for the guarantee above — the guarantee comes from `fsguard` being the only available primitive for working-tree mutation and boundary-sensitive reads, not from an exhaustive list. The list above documents where each of the read/delete decisions is anchored, for reviewers checking this specific boundary; it is not a claim that no other call site matters. See `src/fsguard.rs`'s module doc comment for the primitive's exact contract (error policy, temp-file naming, and the `GuardedDir` API).
 
