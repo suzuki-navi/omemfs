@@ -637,7 +637,16 @@ This replaces an earlier lexical guard (`fsmeta::reject_symlink_escape`, since r
 
 Deletion and metadata mutation (chmod / mtime) go through the same primitive as content writes — `fsguard::remove_file_tolerant` and `GuardedDir::set_mode`/`set_mtime` — for the same reason: a lexically-planned delete or a path-based `chmod`/`utimes` follows a symlink exactly like a naive write would.
 
-Enumerating call sites is deliberately avoided here — the guarantee comes from `fsguard` being the only available primitive for working-tree mutation, not from an exhaustive list. See `src/fsguard.rs`'s module doc comment for the primitive's exact contract (error policy, temp-file naming, and the `GuardedDir` API).
+The boundary covers *deciding* whether to delete, not just the delete call itself. A plain `Path::is_dir()`/`Path::exists()` follows a symlink exactly like a naive write would, so any code that branches on "is this a directory I should recurse into and clear out" must ask that question through `fsguard` too, not through `std::fs`/`Path` directly — otherwise the write-side guarantee above is trivially bypassed by a caller that only ever *reads* through the symlink to decide what to delete, then deletes through a separately-resolved (and by then possibly raced) path. `fsguard::is_real_dir` (lstat-based, symlink-refusing at every component) answers that question; `fsguard::remove_dir_all` performs the matching guarded recursive delete, refusing if any component — including one discovered partway through the recursion — turns out to be a symlink.
+
+The following call sites are all inside this boundary; each is either walking through `fsguard::GuardedDir`/`fsguard::remove_file_tolerant`/`fsguard::remove_dir_all`, or (scoped `push`) deciding whether to walk at all with `fsguard::is_real_dir` before reading any content into an upload:
+
+- `omemfs stub`'s directory-stub deletion (`src/commands/stub.rs`): after writing the `.omemfs-stub` marker (see `design/08_stub_system.md`, "omemfs stub"), the directory's other contents are removed with `fsguard::remove_dir_all`, and the directory-vs-file decision at the top of `stub run()` uses `fsguard::is_real_dir` rather than `Path::is_dir()`.
+- `omemfs restore`'s conflict-helper cleanup (`src/commands/restore.rs`, `remove_conflict_helpers`): removes the three conflict helper files and the metadata sidecar via `fsguard::remove_file_tolerant`, tolerating a helper that is already gone, instead of a bare `fs::remove_file` that both follows a symlinked ancestor and silently swallows every error.
+- `omemfs conflict clean`'s helper-file and metadata-sidecar deletion (`src/commands/conflict.rs`, `run_clean`): removes each collected helper path, and each base path's `.omemfs-conflict-meta` sidecar, via `fsguard::remove_file_tolerant`.
+- Path-scoped `push` (`src/commands/push.rs`, `push_scoped`): before scanning or reading a scoped path's content for upload, every path component from `work_dir` down to (and including) the scoped path itself is verified to be symlink-free via `fsguard::is_real_dir`/`fsguard`'s component walk, so a symlinked ancestor of the scoped path can never be traversed to read — and upload — content from outside `work_dir`.
+
+Enumerating call sites is deliberately avoided as a *substitute* for the guarantee above — the guarantee comes from `fsguard` being the only available primitive for working-tree mutation and boundary-sensitive reads, not from an exhaustive list. The list above documents where each of the read/delete decisions is anchored, for reviewers checking this specific boundary; it is not a claim that no other call site matters. See `src/fsguard.rs`'s module doc comment for the primitive's exact contract (error policy, temp-file naming, and the `GuardedDir` API).
 
 ---
 
@@ -701,7 +710,7 @@ Path-scoped operations apply only to the specified path (file or directory subtr
 
 ### Path-scoped push
 
-1. Scan `<path>` in the working tree and build a new subtree.
+1. Scan `<path>` in the working tree and build a new subtree. Before reading any content, every path component from `work_dir` down to (and including) `<path>` is verified to be symlink-free (see "Write safety: the working-tree write boundary" above) — a symlinked ancestor is refused rather than followed, so a scoped push can never read (and upload) content that actually lives outside `work_dir` by walking through a symlink planted along `<path>`.
 2. Read the index root and extract the current remote root hash; record the raw index root bytes for the CAS check.
 2b. Per-path divergence check (the scoped analogue of step 4b above): for each pushed `<path>`, compare the remote's subtree at `<path>` — as observed in the snapshot read in step 2 — against `clone_root`'s subtree at the same `<path>`. If any pushed path's subtree differs, fail immediately with the same "remote has been updated since last sync" error, scoped to that path, without uploading any objects or touching the index root. Remote changes **outside** every pushed `<path>` must **not** block the push — they are preserved by the splice logic below, which only ever touches the pushed paths and leaves the rest of the remote root tree untouched.
 

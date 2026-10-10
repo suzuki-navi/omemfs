@@ -192,3 +192,51 @@ EOF
     # root dist/ is not excluded by sub/.omemfs-filter
     [ -f verify/dist/out.bin ]
 }
+
+# ---------------------------------------------------------------------------
+# Regression: `.omemfs-filter` must round-trip through push/pull/clone/ls
+# without ever being rejected as a reserved tree-entry name.
+#
+# `.omemfs-filter` is a *tracked* file (see the "clone: creates .omemfs-filter"
+# tests above and design/09_reserved_names.md), so `omemfs clone --new`'s
+# default filter file at the repository root ends up as an ordinary entry in
+# every root tree object. `Tree::deserialise`'s reserved-name check
+# (design/09 "Reserved names in remote tree entries") must special-case this
+# one name, or every command that reads a tree containing it -- i.e. nearly
+# every command on nearly every repository -- fails with
+# `Error::InvalidObject: tree entry name must not be in the reserved
+# .omemfs- namespace`. This was exactly the regression fixed alongside the
+# reserved-name checks added by this branch: the checks initially rejected
+# `.omemfs-` names uniformly, with no `.omemfs-filter` exception, which broke
+# push/pull/clone/ls across the board (see the revert commit
+# "Revert Phase 2 reserved-name rejection: breaks .omemfs-filter, a
+# legitimately tracked file"). Kept here as an explicit, minimal,
+# `.omemfs-filter`-focused regression test in addition to the (numerous, but
+# incidental) existing bats coverage that already exercises the same tree
+# round-trip indirectly.
+# ---------------------------------------------------------------------------
+
+@test "push+ls+pull+clone: default .omemfs-filter round-trips through every tree-reading command" {
+    # setup_repo's `clone --new` already wrote the default .omemfs-filter;
+    # push it as part of an ordinary tree so it appears in the root tree
+    # object read back by every command below.
+    echo "hello world" > file.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    # `ls` reads the clone-root tree, which contains the .omemfs-filter entry.
+    run "$OMEMFS" ls --full-hash file.txt
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"invalid object"* ]]
+    [[ "$output" == *"file.txt"* ]]
+
+    # `pull` reads the remote-root tree, same entry.
+    run "$OMEMFS" pull
+    [ "$status" -eq 0 ]
+
+    # `clone --existing` reads the remote-root tree from scratch.
+    run "$OMEMFS" clone --existing --url "$REMOTE_DIR" verify
+    [ "$status" -eq 0 ]
+    [ -f verify/.omemfs-filter ]
+    [ -f verify/file.txt ]
+}

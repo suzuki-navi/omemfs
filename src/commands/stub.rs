@@ -73,7 +73,14 @@ pub fn run(opts: StubOptions) -> Result<(), Error> {
         let rel = crate::repo::normalize_path(path, &repo.work_dir, &opts.current_dir)?;
         let abs = repo.work_dir.join(&rel);
 
-        if abs.is_dir() {
+        // fsguard::is_real_dir (design/03_sync_model.md, "Write safety: the
+        // working-tree write boundary") answers "is this a real, symlink-free
+        // directory below work_dir?" instead of `Path::is_dir()`, which
+        // follows symlinks: a directory target that has been swapped for a
+        // symlink pointing outside work_dir must be refused here, before any
+        // decision is made about deleting its "contents", not silently
+        // treated as either a directory or a plain file.
+        if crate::fsguard::is_real_dir(&repo.work_dir, &abs)? {
             // --- Directory stub ---
             // Check whether already stubbed (dir/.omemfs-stub exists).
             if stub::dir_exists(&repo.work_dir, &rel) {
@@ -276,9 +283,13 @@ pub fn run(opts: StubOptions) -> Result<(), Error> {
                 blob_count,
                 mtime,
             } => {
-                // Remove all contents of the directory.
-                remove_dir_contents(&abs)?;
-                // Write the directory stub inside the now-empty directory.
+                // design/08_stub_system.md, "omemfs stub": write the stub
+                // record BEFORE deleting anything, so an interruption
+                // partway through the delete below leaves the directory in
+                // the well-understood "partial expansion" state (stub
+                // marker + some leftover real files) rather than risking
+                // losing both the content and the stub record if the
+                // process died before the stub write landed.
                 stub::write_dir_stub(
                     &repo.work_dir,
                     &rel,
@@ -291,6 +302,21 @@ pub fn run(opts: StubOptions) -> Result<(), Error> {
                         mode: None,
                     },
                 )?;
+                // Now remove every other entry, leaving only the just-written
+                // `.omemfs-stub` marker behind. Routed through
+                // `fsguard::remove_dir_all` (design/03_sync_model.md, "Write
+                // safety: the working-tree write boundary"): a symlink
+                // discovered anywhere under `abs` -- including `abs` itself
+                // having been swapped for one between the `is_real_dir`
+                // check above and here -- is refused rather than followed.
+                // `stub::DIR_STUB_NAME` is passed as `keep` so the marker
+                // just written above is not itself swept up by this same
+                // "delete everything in this directory" call.
+                crate::fsguard::remove_dir_all(
+                    &repo.work_dir,
+                    &abs,
+                    &[stub::DIR_STUB_NAME],
+                )?;
             }
         }
     }
@@ -302,17 +328,3 @@ pub fn run(opts: StubOptions) -> Result<(), Error> {
     Ok(())
 }
 
-/// Remove every child of `dir`, leaving `dir` itself intact.
-fn remove_dir_contents(dir: &std::path::Path) -> Result<(), Error> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let p = entry.path();
-        let ft = entry.file_type()?;
-        if ft.is_dir() {
-            fs::remove_dir_all(&p)?;
-        } else {
-            fs::remove_file(&p)?;
-        }
-    }
-    Ok(())
-}

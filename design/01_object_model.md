@@ -134,7 +134,29 @@ Executable file example:
 2. **Entries sorted by name**: alphabetical order, ensuring identical directory content always hashes to the same value.
 3. **mtime propagation**: a tree's `mtime` is the maximum mtime of its entries, excluding `null` values. An empty tree has `mtime: null`.
 4. **size propagation**: a tree's `size` is the sum of its entries' sizes. An empty tree has `size: 0`.
-5. **Entry name validation**: `name` must be non-empty, must not be exactly `.` or `..`, and must not contain `/` or a NUL byte. `Tree::deserialise` (`src/object.rs`) enforces this on every entry of every tree it parses and returns `Error::InvalidObject` otherwise, rather than silently accepting a name that could act as a path-traversal vector once a caller joins it onto a base directory (e.g. `base_dir.join(entry.name())`). Because deserialisation is the one point every tree-reading command goes through — `pull`, `expand`, `clone`, `restore`, `ls`, `stats`, `pack`, `cat`, and the shared helpers in `tree_ops.rs` all call `Tree::deserialise` rather than parsing tree JSON themselves — this single check protects all of them without any command-specific validation. This project targets Linux (see `CLAUDE.md`); the rule intentionally covers only the universally unsafe characters and does not attempt to enforce Windows' broader reserved-character or reserved-name set.
+5. **Entry name validation**: `name` must be non-empty, must not be exactly `.` or `..`, must not contain `/` or a NUL byte, and must not fall in the reserved `.omemfs` / `.omemfs-*` namespace (see below). `Tree::deserialise` (`src/object.rs`) enforces this on every entry of every tree it parses and returns `Error::InvalidObject` otherwise, rather than silently accepting a name that could act as a path-traversal vector once a caller joins it onto a base directory (e.g. `base_dir.join(entry.name())`). Because deserialisation is the one point every tree-reading command goes through — `pull`, `expand`, `clone`, `restore`, `ls`, `stats`, `pack`, `cat`, and the shared helpers in `tree_ops.rs` all call `Tree::deserialise` rather than parsing tree JSON themselves — this single check protects all of them without any command-specific validation. This project targets Linux (see `CLAUDE.md`); the rule intentionally covers only the universally unsafe characters and does not attempt to enforce Windows' broader reserved-character or reserved-name set.
+
+   **Reserved-name rejection**: an entry named exactly `.omemfs`, or matching
+   the reserved `.omemfs-` namespace (containing the substring `.omemfs-`,
+   in either the standalone/dir-interior form `.omemfs-<kind>` or the
+   file-adjacent form `<name>.omemfs-<kind>`), is rejected the same way as
+   the other invalid-name cases above — **except** for the exact standalone
+   name `.omemfs-filter`, which is accepted. `.omemfs-filter` is a tracked
+   configuration file (design/09_reserved_names.md, "`.omemfs-filter` —
+   filter configuration"): `scan_and_store` includes it in every tree it
+   builds, so a well-formed tree routinely contains a `.omemfs-filter` entry,
+   unlike `.omemfs-stub`/`.omemfs-conflict-*`, which `scan_and_store` always
+   excludes and which therefore never legitimately appear in a tree. The
+   general rejection protects `pull`/`clone`/`restore`/`expand` from a remote
+   tree that names an entry `.omemfs` (which would overwrite the
+   repository's own metadata directory once materialised) or names an entry
+   as a fake stub marker / conflict helper (which would be misinterpreted by
+   a later local scan); `.omemfs-filter` carries neither risk, since its
+   *contents* are already ordinary tracked (and therefore
+   remote-controlled) data. See `design/09_reserved_names.md`, "Reserved
+   names in remote tree entries (untrusted input)" and "The `.omemfs-filter`
+   exception", for the full rationale and how this differs from the local
+   working-tree scan's own (separate) handling of the same name patterns.
 
    `\` (backslash) is deliberately **allowed** and is not a path separator on Linux — it is an ordinary byte that can legally appear anywhere in a filename (e.g. `a\bslash.txt`, `we\ird\name`). It is stored and restored verbatim, exactly like any other non-separator byte. Correspondingly, **no path-string normalisation anywhere in the codebase may rewrite `\` into `/`**: doing so would silently turn a single legitimate entry name into a multi-component path and write/read the wrong location. Earlier revisions of several path-handling helpers called `.replace('\\', "/")` on relative-path strings as an apparent (and, on this Linux-only target, dead) attempt at Windows separator normalisation; those calls have been removed for this reason.
 

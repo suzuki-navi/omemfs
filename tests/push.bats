@@ -336,6 +336,53 @@ EOF
     [ "$status" -eq 0 ]
 }
 
+@test "push: scoped push refuses to read through a directory symlink scoped path, and does not upload its content" {
+    # Regression test / reproduction of the symlink-escape incident this
+    # fsguard boundary closes: before design/03_sync_model.md's
+    # "Path-scoped push" step 1 guard, `push_scoped` decided whether to scan
+    # a scoped path as a directory with a bare `abs_path.is_dir()`, which
+    # follows symlinks. Pushing a scoped path that is itself a symlink
+    # pointing at a directory OUTSIDE work_dir would scan and upload that
+    # outside content as if it were part of the repository.
+    local outside
+    outside="$(mktemp -d)"
+    echo "secret" > "$outside/secret.txt"
+    ln -s "$outside" escape
+
+    run "$OMEMFS" push escape
+    [ "$status" -ne 0 ]
+
+    # Nothing was pushed: the remote must not have advanced past the initial
+    # (empty) clone, and the symlink target must remain untouched.
+    [ -f "$outside/secret.txt" ]
+    [ "$(cat "$outside/secret.txt")" = "secret" ]
+
+    rm escape
+    rm -rf "$outside"
+}
+
+@test "push: scoped push refuses to read through a symlinked ancestor of a scoped file path" {
+    # Same guard, but exercised via a symlinked ANCESTOR directory rather
+    # than the scoped path itself being the symlink -- the "reads (and
+    # uploads) content that actually lives outside work_dir by walking
+    # through a symlink planted along <path>" case named explicitly in
+    # design/03_sync_model.md, "Path-scoped push".
+    local outside
+    outside="$(mktemp -d)"
+    mkdir -p "$outside/sub"
+    echo "secret" > "$outside/sub/secret.txt"
+    ln -s "$outside/sub" sub
+
+    run "$OMEMFS" push sub/secret.txt
+    [ "$status" -ne 0 ]
+
+    [ -f "$outside/sub/secret.txt" ]
+    [ "$(cat "$outside/sub/secret.txt")" = "secret" ]
+
+    rm sub
+    rm -rf "$outside"
+}
+
 @test "push: scoped push of .omemfs is rejected" {
     echo "hello" > file.txt
     run "$OMEMFS" push

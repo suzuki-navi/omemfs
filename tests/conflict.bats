@@ -402,6 +402,33 @@ make_conflict() {
     rm -rf "$outside"
 }
 
+@test "conflict clean: a symlinked ancestor of a file-scoped path is refused, never followed to delete outside content" {
+    # Regression test: `run_clean`'s per-helper delete used to be a bare
+    # `std::fs::remove_file`, which follows symlinks. When the scope names a
+    # FILE below a symlinked directory (e.g. "sub/file.txt" where "sub" is a
+    # symlink), `collect_helper_files`'s file-scope branch checks existence
+    # with `Path::is_file()` (which also follows symlinks), so it can
+    # collect a helper path that resolves outside work_dir even though
+    # nothing under work_dir's own "sub" is a real directory. The delete
+    # itself must still refuse to follow "sub" (design/03_sync_model.md,
+    # "Write safety: the working-tree write boundary").
+    local outside
+    outside="$(mktemp -d)"
+    echo "outside conflict" > "$outside/file.txt.omemfs-conflict-local"
+    ln -s "$outside" sub
+
+    run "$OMEMFS" conflict clean sub/file.txt
+    [ "$status" -ne 0 ]
+
+    # The symlink itself, and everything behind it, must be untouched.
+    [ -L sub ]
+    [ -f "$outside/file.txt.omemfs-conflict-local" ]
+    [ "$(cat "$outside/file.txt.omemfs-conflict-local")" = "outside conflict" ]
+
+    rm sub
+    rm -rf "$outside"
+}
+
 @test "conflict clean: a scope that is itself a directory symlink finds nothing to clean" {
     # `resolve_scope_paths` used to reject a symlinked scope explicitly (a
     # lexical, TOCTOU-prone check removed alongside the fsguard rewrite --

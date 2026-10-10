@@ -1210,8 +1210,17 @@ pub fn is_conflict_helper(name: &str) -> bool {
 /// Returns true if `name` belongs to the reserved `.omemfs-` namespace, in
 /// either the standalone/dir-interior form (`.omemfs-<kind>`) or the
 /// file-adjacent form (`<name>.omemfs-<kind>`). See design/09_reserved_names.md.
+///
+/// Re-exports `object::is_reserved_name`, the single definition of this
+/// predicate. It lives in `object.rs` (not here) so that
+/// `Tree::deserialise`'s entry-name validation can use it too, without
+/// `object.rs` (a low-level module) depending on `scan.rs` (a higher-level
+/// module that already depends on `object.rs`) -- see design/09
+/// "Reserved names in remote tree entries (untrusted input)". Kept as a
+/// public function here, rather than switched to a re-export at every call
+/// site, so every existing caller of `scan::is_reserved_name` is unchanged.
 pub fn is_reserved_name(name: &str) -> bool {
-    name.contains(".omemfs-")
+    crate::object::is_reserved_name(name)
 }
 
 /// Returns true if `name` is a reserved name that this version recognises:

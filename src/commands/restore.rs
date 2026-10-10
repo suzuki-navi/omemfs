@@ -1197,7 +1197,7 @@ fn apply_action(
             write_blob(work_dir, &abs, &hash, &mtime, &mode, local, stub_root, &rel)?;
             print_action(false, "restore", &rel);
             counts.restored += 1;
-            remove_conflict_helpers(&abs);
+            remove_conflict_helpers(work_dir, &abs)?;
         }
         Action::RestoreBlobModeOnly { rel, mode } => {
             let abs = work_dir.join(&rel);
@@ -1225,11 +1225,11 @@ fn apply_action(
             dir.set_mode(&leaf, &mode)?;
             print_action(false, "restore", &rel);
             counts.restored += 1;
-            remove_conflict_helpers(&abs);
+            remove_conflict_helpers(work_dir, &abs)?;
         }
         Action::CleanupOnly { rel } => {
             let abs = work_dir.join(&rel);
-            remove_conflict_helpers(&abs);
+            remove_conflict_helpers(work_dir, &abs)?;
         }
         Action::RestoreSymlink { rel, target, mtime } => {
             let abs = work_dir.join(&rel);
@@ -1237,7 +1237,7 @@ fn apply_action(
             stub::remove_dir_stub(stub_root, &rel).ok();
             crate::fsmeta::write_symlink_atomic(work_dir, &abs, &target)?;
             crate::fsmeta::restore_symlink_mtime(&abs, &mtime);
-            remove_conflict_helpers(&abs);
+            remove_conflict_helpers(work_dir, &abs)?;
             print_action(false, "restore", &rel);
             counts.restored += 1;
         }
@@ -1303,7 +1303,7 @@ fn apply_action(
                 print_action(false, "delete", &rel);
                 counts.deleted += 1;
             }
-            remove_conflict_helpers(&abs);
+            remove_conflict_helpers(work_dir, &abs)?;
         }
         Action::DeleteFile { rel } => {
             let abs = work_dir.join(&rel);
@@ -1710,13 +1710,25 @@ fn print_action(dry_run: bool, kind: &str, path: &str) {
 /// `Action::DeleteConflictArtifact`), and even then it used to be
 /// misreported as a `deleted:` line as if it were user content. Iterating
 /// `CONFLICT_ARTIFACT_SUFFIXES` here fixes the single-path case directly.
-fn remove_conflict_helpers(base_path: &std::path::Path) {
+///
+/// design/03_sync_model.md, "Write safety: the working-tree write boundary":
+/// deleting a helper file is a working-tree mutation like any other, so it
+/// must go through `fsguard::remove_file_tolerant` (which also verifies
+/// every component from `work_dir` down is symlink-free) rather than a bare
+/// `fs::remove_file`, which would both follow a symlinked ancestor and
+/// silently swallow every error (including ones worth surfacing). Unlike the
+/// old bare `fs::remove_file` (whose result was always discarded), a
+/// `SymlinkEscape` or other genuine I/O error here now propagates to the
+/// caller instead of being swallowed.
+fn remove_conflict_helpers(
+    work_dir: &std::path::Path,
+    base_path: &std::path::Path,
+) -> Result<(), Error> {
     for suffix in crate::commands::conflict::CONFLICT_ARTIFACT_SUFFIXES {
         let p = helper_path(base_path, suffix);
-        if p.exists() {
-            let _ = fs::remove_file(&p);
-        }
+        crate::fsguard::remove_file_tolerant(work_dir, &p)?;
     }
+    Ok(())
 }
 
 /// Returns true if any conflict helper file (or the metadata sidecar) exists

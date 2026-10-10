@@ -276,9 +276,14 @@ pub fn run_clean(opts: ConflictCleanOptions) -> Result<(), Error> {
         if opts.dry_run {
             out.writeln(&format!("  would delete: {}", helper_path))?;
         } else {
-            if let Err(e) = std::fs::remove_file(&abs) {
-                return Err(Error::Io(e));
-            }
+            // design/03_sync_model.md, "Write safety: the working-tree write
+            // boundary": a helper-file delete is a working-tree mutation
+            // like any other, so it must go through
+            // `fsguard::remove_file_tolerant` rather than a bare
+            // `std::fs::remove_file`, which would follow a symlinked
+            // ancestor of `helper_path` and could delete content outside
+            // `work_dir`.
+            crate::fsguard::remove_file_tolerant(&opts.work_dir, &abs)?;
             out.writeln(&format!("  deleted: {}", helper_path))?;
         }
         // Count unique base paths.
@@ -293,9 +298,7 @@ pub fn run_clean(opts: ConflictCleanOptions) -> Result<(), Error> {
             let meta_sidecar = opts
                 .work_dir
                 .join(format!("{}{}", base, CONFLICT_META_SUFFIX));
-            if meta_sidecar.exists() {
-                std::fs::remove_file(&meta_sidecar).map_err(Error::Io)?;
-            }
+            crate::fsguard::remove_file_tolerant(&opts.work_dir, &meta_sidecar)?;
         }
     }
 

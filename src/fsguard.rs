@@ -522,6 +522,141 @@ impl GuardedDir {
         }
         Ok(())
     }
+
+    /// Duplicate this directory's fd for handoff to `fdopendir` -- `fdopendir`
+    /// takes ownership of (and eventually `closedir`s) the fd it is given, but
+    /// `self.fd` must remain usable by this `GuardedDir` afterwards, so a
+    /// dup'd fd is handed over instead of the original.
+    fn dup_fd(&self) -> io::Result<OwnedFd> {
+        // SAFETY: `self.fd` is a valid open fd for the duration of this call.
+        // F_DUPFD_CLOEXEC duplicates it as a new, independent, close-on-exec
+        // fd; the two fds share the same underlying open file description
+        // (and thus directory position), but that is fine here because the
+        // dup is immediately handed to `fdopendir`, whose own read position
+        // is used exclusively by the walk below and never interleaved with
+        // reads via `self.fd`.
+        let new_fd = unsafe { libc::fcntl(self.fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        if new_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `new_fd` was just returned by a successful `fcntl` call
+        // above and is not owned by anything else yet.
+        Ok(unsafe { OwnedFd::from_raw_fd(new_fd) })
+    }
+
+    /// List this directory's entries (name + `d_type`), skipping `.`/`..`.
+    /// `d_type` may be `DT_UNKNOWN` on some filesystems; callers that need a
+    /// reliable type must fall back to `lstat_mode`.
+    fn list_entries(&self) -> Result<Vec<(String, u8)>, Error> {
+        let dup = self.dup_fd().map_err(Error::Io)?;
+        // SAFETY: `fdopendir` takes ownership of `dup`'s raw fd on success;
+        // `dup` is a valid, freshly-duplicated directory fd. `into_raw_fd`
+        // hands off ownership so it is not also closed by `OwnedFd`'s drop.
+        let dirp = unsafe { libc::fdopendir(std::os::fd::IntoRawFd::into_raw_fd(dup)) };
+        if dirp.is_null() {
+            return Err(Error::Io(io::Error::last_os_error()));
+        }
+        let mut out = Vec::new();
+        let result: Result<(), Error> = (|| {
+            loop {
+                // readdir() does not clear errno on end-of-directory, so
+                // errno must be reset first to distinguish "no more
+                // entries" (NULL, errno unchanged) from a genuine error
+                // (NULL, errno set) per readdir(3).
+                // SAFETY: `__errno_location` returns a valid pointer to the
+                // calling thread's errno.
+                unsafe {
+                    *libc::__errno_location() = 0;
+                }
+                // SAFETY: `dirp` was successfully opened above and is not
+                // used concurrently from any other thread.
+                let entry = unsafe { libc::readdir(dirp) };
+                if entry.is_null() {
+                    let e = io::Error::last_os_error();
+                    if e.raw_os_error() == Some(0) {
+                        break; // end of directory
+                    }
+                    return Err(Error::Io(e));
+                }
+                // SAFETY: `entry` is a valid, non-null pointer returned by
+                // `readdir` above, whose lifetime is at least until the next
+                // `readdir`/`closedir` call on `dirp`.
+                let d_type = unsafe { (*entry).d_type };
+                // SAFETY: `d_name` is a NUL-terminated array within `*entry`,
+                // valid for the duration of this call.
+                let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }
+                    .to_string_lossy()
+                    .into_owned();
+                if name == "." || name == ".." {
+                    continue;
+                }
+                out.push((name, d_type));
+            }
+            Ok(())
+        })();
+        // SAFETY: `dirp` was successfully opened above and is closed exactly
+        // once here, regardless of whether the loop above succeeded.
+        unsafe {
+            libc::closedir(dirp);
+        }
+        result?;
+        Ok(out)
+    }
+
+    /// Recursively remove every entry in this directory (files, symlinks,
+    /// and subdirectories with their own contents) EXCEPT those named in
+    /// `keep`, leaving this directory itself in place. An entry whose name
+    /// is in `keep` is left completely untouched -- neither removed nor
+    /// descended into, regardless of whether it is a file, directory, or
+    /// symlink -- so a caller can protect a marker file it just wrote (e.g.
+    /// `omemfs stub`'s `.omemfs-stub`) from being swept up by this same
+    /// call. Any symlink encountered -- at the top level or at any depth of
+    /// the recursion -- aborts with `Error::SymlinkEscape` before it is ever
+    /// removed or traversed; entries already processed before the symlink
+    /// was found remain removed (this is a best-effort cleanup, not a
+    /// transaction), but nothing beyond the symlink is touched, and the
+    /// symlink entry itself is left in place.
+    fn remove_contents_all(&self, keep: &[&str]) -> Result<(), Error> {
+        for (name, d_type) in self.list_entries()? {
+            if keep.contains(&name.as_str()) {
+                continue;
+            }
+
+            // DT_UNKNOWN can occur on some filesystems (notably some FUSE
+            // and network filesystems); fall back to an authoritative
+            // lstat in that case rather than guessing.
+            let is_symlink = if d_type == libc::DT_UNKNOWN {
+                (self.lstat_mode(&name)? & libc::S_IFMT as u32) == libc::S_IFLNK as u32
+            } else {
+                d_type == libc::DT_LNK
+            };
+            if is_symlink {
+                return Err(Error::SymlinkEscape(self.abs(&name).display().to_string()));
+            }
+
+            let is_dir = if d_type == libc::DT_UNKNOWN {
+                (self.lstat_mode(&name)? & libc::S_IFMT as u32) == libc::S_IFDIR as u32
+            } else {
+                d_type == libc::DT_DIR
+            };
+
+            if is_dir {
+                // descend() with create=false opens the child with
+                // O_NOFOLLOW, giving a second, race-free confirmation that
+                // it is still a real directory (not a symlink swapped in
+                // between list_entries() and here) before recursing. A
+                // `keep`-listed entry never reaches this point (skipped
+                // above), so nothing in `keep` is ever descended into
+                // either, even if it happens to be a directory.
+                let child = descend(self, &name, false)?;
+                child.remove_contents_all(&[])?;
+                self.rmdir(&name)?;
+            } else {
+                self.unlinkat(&name)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -579,6 +714,93 @@ pub fn remove_file_tolerant(work_dir: &Path, abs_path: &Path) -> Result<(), Erro
         Err(Error::Io(e)) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
+}
+
+/// Answers "is `abs_path` a real, existing, symlink-free directory below
+/// `work_dir`?" -- the guarded replacement for `Path::is_dir()` wherever a
+/// caller uses the answer to decide whether to recurse into and clear out a
+/// directory (design/03_sync_model.md, "Write safety: the working-tree write
+/// boundary": "The boundary covers *deciding* whether to delete, not just
+/// the delete call itself").
+///
+/// Every component from `work_dir` down to (and including) `abs_path` itself
+/// is verified to be symlink-free, exactly like `resolve_dir`/`descend`. The
+/// three possible outcomes are:
+/// - `Ok(true)`: `abs_path` exists and is a real directory.
+/// - `Ok(false)`: `abs_path` (or an ancestor strictly below `work_dir`) does
+///   not exist, or `abs_path` exists but is not a directory (e.g. a plain
+///   file). This is deliberately not an error: a caller such as `omemfs
+///   stub` needs to tell "nothing to stub-as-a-directory here" apart from
+///   "something is trying to escape the boundary", and only the latter is a
+///   `SymlinkEscape`.
+/// - `Err(Error::SymlinkEscape(_))`: some component strictly below `work_dir`
+///   -- an intermediate directory, or `abs_path` itself -- is a symlink.
+///
+/// `work_dir` itself (`abs_path == work_dir`) is exempt from the symlink
+/// check, same as everywhere else in this module, and is always reported as
+/// a real directory.
+pub fn is_real_dir(work_dir: &Path, abs_path: &Path) -> Result<bool, Error> {
+    let rel = to_rel_string(work_dir, abs_path)?;
+    if rel.is_empty() {
+        // abs_path == work_dir: exempt from the symlink check (work_dir and
+        // its ancestors may legitimately be a symlink/mount point), and
+        // open_root already requires it to be a directory to succeed.
+        return Ok(true);
+    }
+    let (dir_rel, leaf) = match rel.rfind('/') {
+        Some(idx) => (&rel[..idx], &rel[idx + 1..]),
+        None => ("", rel.as_str()),
+    };
+    validate_component(leaf)?;
+    let parent = match resolve_dir(work_dir, dir_rel, false) {
+        Ok(d) => d,
+        // A missing ancestor directory means abs_path cannot exist either --
+        // "nothing to delete here", not an error.
+        Err(Error::Io(e)) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    // Deliberately use `lstat_mode` (AT_SYMLINK_NOFOLLOW) rather than
+    // `descend`: `descend`'s ENOTDIR-is-symlink-like conflation is correct
+    // for a write that needs *some* directory to continue into, but here a
+    // plain file at `leaf` is a legitimate `Ok(false)`, not a `SymlinkEscape`
+    // -- only an actual symlink at `leaf` is.
+    match parent.lstat_mode(leaf) {
+        Ok(mode) => {
+            let file_type = mode & libc::S_IFMT as u32;
+            if file_type == libc::S_IFLNK as u32 {
+                Err(Error::SymlinkEscape(parent.abs(leaf).display().to_string()))
+            } else {
+                Ok(file_type == libc::S_IFDIR as u32)
+            }
+        }
+        Err(Error::Io(e)) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Recursively delete every entry inside `abs_dir` EXCEPT those named in
+/// `keep`, leaving `abs_dir` itself in place (the `omemfs stub`
+/// directory-stub use case only ever wants the directory emptied, never
+/// removed -- the `.omemfs-stub` marker is written into it *before* this is
+/// called, and must be named in `keep` so this call does not delete the very
+/// marker it is meant to leave behind). An entry named in `keep` is left
+/// completely untouched at the top level of `abs_dir` -- neither removed nor
+/// descended into. Every component from `work_dir` down to (and including)
+/// `abs_dir`, and every symlink discovered while recursing through its
+/// contents, is refused with `Error::SymlinkEscape`: unlike
+/// `remove_file_tolerant`, this is not "tolerant" of anything it finds --
+/// finding a symlink at all, anywhere under `abs_dir`, aborts the whole
+/// operation and leaves that symlink (and everything else) untouched.
+///
+/// A missing `abs_dir` is an `Error::Io` (`NotFound`), matching
+/// `std::fs::remove_dir_all`'s own behaviour: every current call site only
+/// calls this right after `is_real_dir` has confirmed the directory exists,
+/// so a NotFound here would signal a genuine race worth surfacing rather
+/// than a "nothing to do" case to swallow silently.
+pub fn remove_dir_all(work_dir: &Path, abs_dir: &Path, keep: &[&str]) -> Result<(), Error> {
+    let rel = to_rel_string(work_dir, abs_dir)?;
+    let dir = resolve_dir(work_dir, &rel, false)?;
+    dir.remove_contents_all(keep)
 }
 
 // ---------------------------------------------------------------------------
@@ -915,5 +1137,226 @@ mod tests {
         dir.create_dir("sub").unwrap();
         dir.create_dir("sub").unwrap(); // EEXIST tolerated
         assert!(work_dir.path().join("sub").is_dir());
+    }
+
+    // -----------------------------------------------------------------------
+    // is_real_dir
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_real_dir_true_for_existing_real_directory() {
+        let work_dir = TempDir::new().unwrap();
+        fs::create_dir_all(work_dir.path().join("a/b")).unwrap();
+        assert!(is_real_dir(work_dir.path(), &work_dir.path().join("a/b")).unwrap());
+    }
+
+    #[test]
+    fn is_real_dir_true_for_work_dir_itself() {
+        // work_dir itself is exempt from the symlink check by design (see
+        // the module doc comment) -- it is always reported as a real dir.
+        let work_dir = TempDir::new().unwrap();
+        assert!(is_real_dir(work_dir.path(), work_dir.path()).unwrap());
+    }
+
+    #[test]
+    fn is_real_dir_false_for_missing_path() {
+        let work_dir = TempDir::new().unwrap();
+        assert!(!is_real_dir(work_dir.path(), &work_dir.path().join("nope")).unwrap());
+    }
+
+    #[test]
+    fn is_real_dir_false_for_missing_path_with_missing_ancestor() {
+        // Not just the leaf missing -- an ancestor directory missing too.
+        let work_dir = TempDir::new().unwrap();
+        assert!(!is_real_dir(work_dir.path(), &work_dir.path().join("a/b/c")).unwrap());
+    }
+
+    #[test]
+    fn is_real_dir_false_for_a_plain_file() {
+        // A regular file (not a symlink) at the target path is "not a real
+        // dir" but is deliberately NOT an error -- callers such as `omemfs
+        // stub` need to distinguish "there is nothing to stub-as-a-directory
+        // here" from "something is actively trying to escape the boundary".
+        let work_dir = TempDir::new().unwrap();
+        let abs = work_dir.path().join("file.txt");
+        fs::write(&abs, b"x").unwrap();
+        assert!(!is_real_dir(work_dir.path(), &abs).unwrap());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn is_real_dir_rejects_a_symlink_leaf_even_if_it_points_to_a_real_directory() {
+        let work_dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let abs = work_dir.path().join("link");
+        std::os::unix::fs::symlink(outside.path(), &abs).unwrap();
+
+        let err = is_real_dir(work_dir.path(), &abs).unwrap_err();
+        assert!(matches!(err, Error::SymlinkEscape(_)), "got {err:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn is_real_dir_rejects_symlinked_intermediate_component() {
+        let work_dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), work_dir.path().join("sub")).unwrap();
+
+        let err = is_real_dir(work_dir.path(), &work_dir.path().join("sub/child")).unwrap_err();
+        assert!(matches!(err, Error::SymlinkEscape(_)), "got {err:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // remove_dir_all
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn remove_dir_all_removes_nested_contents_leaving_dir_itself() {
+        let work_dir = TempDir::new().unwrap();
+        let target = work_dir.path().join("target");
+        fs::create_dir_all(target.join("sub/deeper")).unwrap();
+        fs::write(target.join("top.txt"), b"a").unwrap();
+        fs::write(target.join("sub/mid.txt"), b"b").unwrap();
+        fs::write(target.join("sub/deeper/leaf.txt"), b"c").unwrap();
+
+        remove_dir_all(work_dir.path(), &target, &[]).unwrap();
+
+        assert!(target.is_dir(), "the target directory itself must remain");
+        assert_eq!(
+            fs::read_dir(&target).unwrap().count(),
+            0,
+            "the target directory must be empty"
+        );
+    }
+
+    #[test]
+    fn remove_dir_all_on_an_already_empty_directory_is_a_noop() {
+        let work_dir = TempDir::new().unwrap();
+        let target = work_dir.path().join("empty");
+        fs::create_dir_all(&target).unwrap();
+        remove_dir_all(work_dir.path(), &target, &[]).unwrap();
+        assert!(target.is_dir());
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
+    }
+
+    /// This is the regression this whole `keep` parameter exists to guard
+    /// against: a caller that writes a marker file into a directory and then
+    /// wants to clear out everything else must be able to name that marker
+    /// in `keep` and have it survive -- the marker must neither be unlinked
+    /// nor descended into (were it to be, say, a directory).
+    #[test]
+    fn remove_dir_all_leaves_kept_entries_untouched() {
+        let work_dir = TempDir::new().unwrap();
+        let target = work_dir.path().join("target");
+        fs::create_dir_all(target.join("sub")).unwrap();
+        fs::write(target.join("marker.txt"), b"keep-me").unwrap();
+        fs::write(target.join("top.txt"), b"a").unwrap();
+        fs::write(target.join("sub/mid.txt"), b"b").unwrap();
+
+        remove_dir_all(work_dir.path(), &target, &["marker.txt"]).unwrap();
+
+        assert_eq!(
+            fs::read(target.join("marker.txt")).unwrap(),
+            b"keep-me",
+            "the kept entry's content must be untouched"
+        );
+        assert!(!target.join("top.txt").exists());
+        assert!(!target.join("sub").exists());
+        assert_eq!(
+            fs::read_dir(&target).unwrap().count(),
+            1,
+            "only the kept entry must remain"
+        );
+    }
+
+    /// A `keep`-listed name that happens to be a directory must not be
+    /// descended into either -- it is skipped outright, exactly like a
+    /// kept plain file.
+    #[test]
+    fn remove_dir_all_does_not_descend_into_a_kept_directory() {
+        let work_dir = TempDir::new().unwrap();
+        let target = work_dir.path().join("target");
+        fs::create_dir_all(target.join("keep_dir")).unwrap();
+        fs::write(target.join("keep_dir/inner.txt"), b"still here").unwrap();
+        fs::write(target.join("drop.txt"), b"gone").unwrap();
+
+        remove_dir_all(work_dir.path(), &target, &["keep_dir"]).unwrap();
+
+        assert!(!target.join("drop.txt").exists());
+        assert_eq!(
+            fs::read(target.join("keep_dir/inner.txt")).unwrap(),
+            b"still here",
+            "a kept directory's contents must survive untouched"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn remove_dir_all_rejects_when_target_itself_is_a_symlink() {
+        let work_dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::write(outside.path().join("victim.txt"), b"secret").unwrap();
+        let abs = work_dir.path().join("link");
+        std::os::unix::fs::symlink(outside.path(), &abs).unwrap();
+
+        let err = remove_dir_all(work_dir.path(), &abs, &[]).unwrap_err();
+        assert!(matches!(err, Error::SymlinkEscape(_)), "got {err:?}");
+        assert!(
+            outside.path().join("victim.txt").exists(),
+            "content behind the symlink must never be touched"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn remove_dir_all_rejects_a_symlink_found_while_recursing() {
+        let work_dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::write(outside.path().join("victim.txt"), b"secret").unwrap();
+
+        let target = work_dir.path().join("target");
+        fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(outside.path(), target.join("escape")).unwrap();
+
+        let err = remove_dir_all(work_dir.path(), &target, &[]).unwrap_err();
+        assert!(matches!(err, Error::SymlinkEscape(_)), "got {err:?}");
+        assert!(
+            outside.path().join("victim.txt").exists(),
+            "content behind the symlink must never be touched"
+        );
+        // The symlink entry itself must also survive -- remove_dir_all must
+        // refuse to unlink it, not just refuse to follow it.
+        assert!(
+            target.join("escape").symlink_metadata().is_ok(),
+            "the symlink entry itself must not be removed either"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn remove_dir_all_rejects_symlinked_intermediate_component() {
+        let work_dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), work_dir.path().join("sub")).unwrap();
+
+        let err = remove_dir_all(work_dir.path(), &work_dir.path().join("sub/child"), &[])
+            .unwrap_err();
+        assert!(matches!(err, Error::SymlinkEscape(_)), "got {err:?}");
+        assert!(fs::read_dir(outside.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn remove_dir_all_errors_on_a_missing_directory() {
+        // Design decision: unlike `remove_file_tolerant`, `remove_dir_all` is
+        // NOT tolerant of a missing target -- it matches `std::fs::
+        // remove_dir_all`'s own behaviour (a NotFound `io::Error`), because
+        // every current call site (`omemfs stub`) only calls this
+        // immediately after confirming via `is_real_dir` that the directory
+        // exists, so a NotFound here signals a genuine race/bug worth
+        // surfacing rather than a "nothing to do" case to swallow silently.
+        let work_dir = TempDir::new().unwrap();
+        let err =
+            remove_dir_all(work_dir.path(), &work_dir.path().join("nope"), &[]).unwrap_err();
+        assert!(matches!(err, Error::Io(_)), "got {err:?}");
     }
 }

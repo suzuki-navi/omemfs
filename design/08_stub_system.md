@@ -214,12 +214,36 @@ nothing is changed.
 **Behaviour**:
 
 1. Verify preconditions for all targets.
-2. For each target:
+2. For each target, **write the stub record before deleting anything**:
    a. Read the `clone_root` entry to obtain `hash`, `size`, `mtime`, `mode`.
-   b. Write the stub file (`<name>.omemfs-stub` or `<dir>/.omemfs-stub`).
-   c. Delete the original file (or all files inside the directory, then the
-      directory contents, leaving the stub in place).
+   b. Write the stub file first: `<name>.omemfs-stub` for a file target, or
+      `.omemfs-stub` inside the directory for a directory target. This makes
+      the stub record durable while the original content is still fully
+      present on disk.
+   c. Only then delete the original content: for a file target, delete
+      `<name>` itself; for a directory target, delete every other entry
+      already inside the directory (recursively), leaving only the
+      just-written `.omemfs-stub` marker behind.
+
+   This ordering is deliberate: if step (c) fails partway (a permission
+   error, a symlink refused by `fsguard`, the process being killed), the
+   directory is left with the `.omemfs-stub` marker coexisting with whatever
+   real files step (c) had not yet removed. That is exactly the "Partial
+   expansion" state described above — a state `push`'s scan/merge logic
+   already understands and handles correctly — rather than a state where
+   both the original content and the stub record are gone. Writing the stub
+   record *after* deleting (the reverse order) would instead risk losing
+   both the data and the stub record if the process died in between: the
+   directory would be empty with no stub, silently discarding the target's
+   logical content until a user manually intervenes.
 3. `clone_root` is not modified. The next `push` will see the stub as unchanged.
+
+Deletion in step (c) goes through the same `fsguard`-guarded boundary as any
+other working-tree mutation (`design/03_sync_model.md`, "Write safety: the
+working-tree write boundary") — including the directory-type check ahead of
+it, so a directory target that has been swapped for a symlink pointing
+outside `work_dir` is refused rather than having its "contents" deleted
+through the symlink.
 
 ### `omemfs expand`
 

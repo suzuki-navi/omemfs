@@ -282,6 +282,37 @@ pub fn blob_hash(content: &[u8]) -> Hash {
     Hash::compute(&data)
 }
 
+/// Returns true if `name` is exactly the metadata-directory name `.omemfs`
+/// (no hyphen). See design/09_reserved_names.md, "`.omemfs` exclusion scope".
+pub fn is_metadata_dir_name(name: &str) -> bool {
+    name == ".omemfs"
+}
+
+/// Returns true if `name` belongs to the reserved `.omemfs-` namespace, in
+/// either the standalone/dir-interior form (`.omemfs-<kind>`) or the
+/// file-adjacent form (`<name>.omemfs-<kind>`). See design/09_reserved_names.md.
+///
+/// This is the single definition of the reserved-name substring predicate,
+/// shared by two different call sites for two different purposes:
+/// - `src/scan.rs` uses it (via its own re-export) to decide which local
+///   working-tree names to *exclude* from a scan before a tree is ever
+///   built.
+/// - `validate_entry_name` below uses it to *reject* a tree that somehow
+///   contains one of these names as an entry anyway -- see "Reserved names
+///   in remote tree entries (untrusted input)" in design/09_reserved_names.md
+///   for why a remote tree entry gets no forward-compatibility exception
+///   here, unlike the local-scan side.
+///
+/// Defined in `object.rs` (not `scan.rs`) so that `validate_entry_name` can
+/// call it without introducing a dependency from `object.rs` (a low-level
+/// module with no knowledge of commands/scanning) onto `scan.rs` (a
+/// higher-level module that already depends on `object.rs`); `scan.rs`
+/// re-exports it under its existing public name to keep every existing
+/// caller of `scan::is_reserved_name` unchanged.
+pub fn is_reserved_name(name: &str) -> bool {
+    name.contains(".omemfs-")
+}
+
 /// Validate a single tree-entry name before it is ever joined onto a
 /// filesystem path (e.g. `base_dir.join(entry.name())` in `pull`/`tree_ops`).
 ///
@@ -292,6 +323,47 @@ pub fn blob_hash(content: &[u8]) -> Hash {
 ///   structure itself; a single entry name must never smuggle in a path
 ///   separator, absolute or relative)
 /// - any name containing a NUL byte (not a valid filesystem name component)
+/// - the reserved metadata-directory name `.omemfs`, or any name in the
+///   reserved `.omemfs-` namespace (see [`is_metadata_dir_name`] and
+///   [`is_reserved_name`]) -- a tree read from the remote is untrusted
+///   input, and accepting either would let a hostile or corrupted tree
+///   overwrite the local metadata directory or be materialised as a fake
+///   stub marker / conflict helper once written into the working tree. See
+///   design/09_reserved_names.md, "Reserved names in remote tree entries
+///   (untrusted input)".
+///
+/// **Exception**: the exact standalone name `.omemfs-filter` is accepted
+/// even though it matches the `.omemfs-` namespace predicate above.
+/// `.omemfs-filter` is a *tracked* configuration file (design/09
+/// "`.omemfs-filter` -- filter configuration"): `scan_and_store` includes it
+/// in every tree it builds (and `omemfs clone --new` writes a default one
+/// at the repository root), so a well-formed tree routinely -- not just
+/// hypothetically -- contains a `.omemfs-filter` entry. This is the exact
+/// opposite of `.omemfs-stub` / `.omemfs-conflict-*`, which
+/// `scan_and_store` always excludes and which therefore never legitimately
+/// appear in a tree at all. Rejecting `.omemfs-filter` here would make
+/// every `push`/`pull`/`clone`/`ls` on a repository with a filter file --
+/// i.e. nearly every repository -- fail with `Error::InvalidObject`
+/// (regression fixed by this exception; see design/09_reserved_names.md,
+/// "The `.omemfs-filter` exception", for the full rationale, including why
+/// this carve-out does not weaken the security rationale for rejecting
+/// every other name in the namespace).
+///
+/// This exception is applied here, in `validate_entry_name`, rather than by
+/// changing [`is_reserved_name`] itself: `is_reserved_name` is also
+/// re-exported by `src/scan.rs` and used there (together with
+/// `is_known_reserved_name`, which already special-cases `.omemfs-filter`
+/// as tracked rather than excluded) to decide which local names are
+/// candidates for the "unknown reserved name" forward-compatibility
+/// warning during a working-tree scan. Special-casing `.omemfs-filter`
+/// inside `is_reserved_name` itself would make `is_unknown_reserved_name`
+/// stop recognising a file-adjacent look-alike like `x.omemfs-filter` (not
+/// a real filter file under this design, since `.omemfs-filter` is always
+/// standalone/dir-interior -- see design/09) as belonging to the reserved
+/// namespace at all, silently changing scan-side behaviour that has nothing
+/// to do with this remote-tree trust boundary. Keeping the exception local
+/// to `validate_entry_name` limits its effect to exactly the problem being
+/// fixed: what `Tree::deserialise` accepts as a tree-entry name.
 ///
 /// `\` (backslash) is deliberately **allowed**: this project targets Linux
 /// (see `CLAUDE.md`), where `\` is not a path separator but an ordinary,
@@ -320,6 +392,20 @@ fn validate_entry_name(name: &str) -> Result<(), Error> {
     if name.contains('\0') {
         return Err(Error::InvalidObject(format!(
             "tree entry name must not contain a NUL byte: {name:?}"
+        )));
+    }
+    if is_metadata_dir_name(name) {
+        return Err(Error::InvalidObject(format!(
+            "tree entry name must not be the reserved metadata directory name: {name:?}"
+        )));
+    }
+    // `.omemfs-filter` is a tracked file, not an excluded reserved marker --
+    // see the "Exception" doc comment above -- so it is carved out of the
+    // reserved-namespace rejection below rather than being treated as
+    // untrusted-remote-tree evidence like every other `.omemfs-` name.
+    if name != ".omemfs-filter" && is_reserved_name(name) {
+        return Err(Error::InvalidObject(format!(
+            "tree entry name must not be in the reserved .omemfs- namespace: {name:?}"
         )));
     }
     Ok(())
@@ -584,5 +670,102 @@ mod tests {
         );
         let result = Tree::deserialise(json.as_bytes());
         assert!(matches!(result, Err(Error::InvalidObject(_))));
+    }
+
+    // -------------------------------------------------------------------
+    // Reserved-name rejection in remote tree entries (design/09
+    // "Reserved names in remote tree entries (untrusted input)",
+    // design/01 "Invariants" #5).
+    //
+    // A tree read from the remote is untrusted input: nothing guarantees
+    // its entry names were produced by a real `scan_and_store` (which
+    // already excludes these names -- see design/09 "Scan exclusions").
+    // `Tree::deserialise` must reject any entry whose name falls in the
+    // reserved `.omemfs` / `.omemfs-*` namespace, so that materialising a
+    // hand-crafted or corrupted tree can never overwrite the metadata
+    // directory or be misread as a stub marker / conflict helper.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn deserialise_rejects_metadata_directory_entry_name() {
+        assert_rejected(".omemfs");
+    }
+
+    #[test]
+    fn deserialise_rejects_stub_marker_entry_name() {
+        assert_rejected("report.pdf.omemfs-stub");
+    }
+
+    #[test]
+    fn deserialise_rejects_conflict_helper_entry_name() {
+        assert_rejected("main.rs.omemfs-conflict-remote");
+    }
+
+    #[test]
+    fn deserialise_accepts_filter_file_entry_name() {
+        // `.omemfs-filter` is a tracked configuration file (design/09
+        // "`.omemfs-filter` -- filter configuration"): `scan_and_store`
+        // includes it in every tree it builds, so a well-formed tree
+        // routinely contains this entry (e.g. the default filter file
+        // `omemfs clone --new` writes at the repository root). Unlike
+        // `.omemfs-stub`/`.omemfs-conflict-*`, which `scan_and_store` always
+        // excludes and which must never appear in a tree, `.omemfs-filter`
+        // must be accepted here or every push/pull/clone/ls on essentially
+        // any repository would fail (see design/09 "The `.omemfs-filter`
+        // exception").
+        let data = tree_json_with_entry_name(".omemfs-filter");
+        assert!(Tree::deserialise(&data).is_ok());
+    }
+
+    #[test]
+    fn deserialise_rejects_directory_interior_stub_entry_name() {
+        assert_rejected(".omemfs-stub");
+    }
+
+    #[test]
+    fn deserialise_rejects_unknown_reserved_entry_name() {
+        // Even a name that is not a *known* reserved kind (forward
+        // compatibility on the local-scan side) is rejected here: a remote
+        // tree entry never gets the "unknown reserved name, skip and warn"
+        // treatment that the local scan gives it (design/09).
+        assert_rejected(".omemfs-some-future-kind");
+    }
+
+    #[test]
+    fn deserialise_accepts_ordinary_name_not_matching_reserved_pattern_regression() {
+        // Existing ordinary names must keep working: no regression from
+        // adding the reserved-name check.
+        let data = tree_json_with_entry_name("normal-file.txt");
+        assert!(Tree::deserialise(&data).is_ok());
+    }
+
+    #[test]
+    fn deserialise_accepts_name_containing_omemfs_without_hyphen() {
+        // "omemfs" (no leading dot, no hyphen) is an ordinary substring and
+        // must not be rejected -- only the exact ".omemfs" name and the
+        // ".omemfs-" substring pattern are reserved.
+        let data = tree_json_with_entry_name("my-omemfs-notes.txt");
+        assert!(Tree::deserialise(&data).is_ok());
+    }
+
+    #[test]
+    fn deserialise_rejects_name_containing_omemfs_dash_substring_anywhere() {
+        // Follows the same substring predicate as `scan::is_reserved_name`
+        // (`name.contains(".omemfs-")`) for consistency with the local-scan
+        // side, even though this makes a name that merely *contains* the
+        // pattern -- not a genuine reserved kind -- collateral damage. This
+        // is a deliberate consistency trade-off (design/09), not an
+        // oversight: see the "Reserved names in remote tree entries" section.
+        assert_rejected("weird.omemfs-lookalike.txt");
+    }
+
+    #[test]
+    fn validate_entry_name_rejects_metadata_directory_name() {
+        assert!(validate_entry_name(".omemfs").is_err());
+    }
+
+    #[test]
+    fn validate_entry_name_rejects_reserved_namespace() {
+        assert!(validate_entry_name("file.txt.omemfs-stub").is_err());
     }
 }

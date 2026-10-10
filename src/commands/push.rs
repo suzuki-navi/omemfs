@@ -276,6 +276,20 @@ fn push_scoped(
         let components: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
         let abs_path = repo.work_dir.join(rel);
 
+        // design/03_sync_model.md, "Path-scoped push" step 1: before scanning
+        // or reading any content for this path, verify every component from
+        // work_dir down to (and including) the scoped path itself is
+        // symlink-free. `is_real_dir` returns `Err(SymlinkEscape)` for a
+        // symlinked ancestor OR a symlink at the leaf itself, `Ok(_)`
+        // (true/false, neither an error) for a real directory, a plain
+        // file, or a missing path -- exactly the set of outcomes that are
+        // safe to keep processing below (a plain file goes on to the file
+        // scan branch, a missing path to the delete branch, a real
+        // directory to the directory scan branch). This closes the escape a
+        // symlinked ancestor of `<path>` would otherwise allow: reading (and
+        // uploading) content that actually lives outside `work_dir`.
+        crate::fsguard::is_real_dir(&repo.work_dir, &abs_path)?;
+
         // If the path is itself a stub, splice its recorded entry — never treat
         // the missing materialised content as a deletion (design/08).
         if let Some(stub_entry) = resolve_scoped_stub(&repo.work_dir, rel) {

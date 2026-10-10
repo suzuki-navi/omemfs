@@ -260,6 +260,37 @@ teardown() {
     [ ! -f link.txt.omemfs-conflict-remote ]
 }
 
+@test "restore: refuses to delete a conflict helper through a symlinked ancestor, and does not touch content outside work_dir" {
+    # Regression test: `remove_conflict_helpers` used to delete each helper
+    # with a bare `fs::remove_file`, which follows a symlink. If the base
+    # path's parent directory has been swapped for a symlink pointing
+    # outside work_dir, the helper "path" the command computes
+    # (work_dir/sub/nested.txt.omemfs-conflict-*) actually resolves outside
+    # work_dir, and the old code would delete whatever sits there instead of
+    # refusing. `sub` is a real directory in clone_root (created in setup()),
+    # so `plan_tree`'s Blob branch for "sub/nested.txt" reaches
+    # `plan_restore_blob_action`, which reports the path as CleanupOnly
+    # (content already matches) but still calls `remove_conflict_helpers`.
+    rm -rf sub
+    local outside
+    outside="$(mktemp -d)"
+    mkdir -p "$outside/sub"
+    echo "world" > "$outside/sub/nested.txt"
+    echo "victim" > "$outside/sub/nested.txt.omemfs-conflict-local"
+    ln -s "$outside/sub" sub
+
+    run "$OMEMFS" restore sub/nested.txt
+    [ "$status" -ne 0 ]
+
+    # The symlink itself, and everything behind it, must be untouched.
+    [ -L sub ]
+    [ -f "$outside/sub/nested.txt.omemfs-conflict-local" ]
+    [ "$(cat "$outside/sub/nested.txt.omemfs-conflict-local")" = "victim" ]
+
+    rm sub
+    rm -rf "$outside"
+}
+
 # ---------------------------------------------------------------------------
 # Does not touch clone_root
 # ---------------------------------------------------------------------------

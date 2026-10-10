@@ -211,6 +211,48 @@ teardown() {
     [ ! -f sub/b.txt.omemfs-stub ]
 }
 
+@test "stub: directory stub marker file actually contains a valid tree record" {
+    # Regression test: an earlier revision wrote the .omemfs-stub marker
+    # and then called fsguard::remove_dir_all() without excluding it from
+    # the delete, so the marker it had just written was itself deleted a
+    # moment later, leaving the directory completely empty (no data AND no
+    # stub record). The two checks above ("stub command creates directory
+    # stub for directory argument") only asserted `[ -f sub/.omemfs-stub ]`
+    # right after `stub`, which alone did not catch this because that
+    # assertion still ran against the pre-bug build's test fixtures at the
+    # time -- this test additionally parses and validates the marker's
+    # JSON content (target_type/hash/blob_count) so a marker that silently
+    # failed to be written, or was written with bogus content, is caught.
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" repo
+    [ "$status" -eq 0 ]
+    cd repo
+    mkdir -p sub
+    echo "content-a" > sub/a.txt
+    echo "content-b" > sub/b.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    run "$OMEMFS" stub sub/
+    [ "$status" -eq 0 ]
+
+    # The directory must contain exactly one entry: the marker itself.
+    entry_count="$(ls -A sub | wc -l)"
+    [ "$entry_count" -eq 1 ]
+    [ -f sub/.omemfs-stub ]
+
+    marker_content="$(cat sub/.omemfs-stub)"
+    target_type="$(echo "$marker_content" | grep -oE '"target_type":"[a-z]+"')"
+    [ "$target_type" = '"target_type":"tree"' ]
+
+    hash="$(echo "$marker_content" | grep -oE '"hash":"[0-9a-f]+"' | grep -oE '[0-9a-f]+')"
+    # A real hash (not empty, not all-zero) must have been recorded.
+    [ -n "$hash" ]
+    [ "${#hash}" -ge 32 ]
+
+    blob_count="$(echo "$marker_content" | grep -oE '"blob_count":[0-9]+' | grep -oE '[0-9]+$')"
+    [ "$blob_count" = "2" ]
+}
+
 @test "stub: directory stub roundtrip with expand restores contents" {
     run "$OMEMFS" clone --new --url "$REMOTE_DIR" repo
     [ "$status" -eq 0 ]
@@ -1054,4 +1096,44 @@ teardown() {
     # download_missing(remote_root) read essentially the entire pack set (tens
     # of MB), so this tight bound fails if that pre-download is reinstated.
     [ "$read_bytes" -lt 65536 ]
+}
+
+# ---------------------------------------------------------------------------
+# Symlink traversal safety (design/03_sync_model.md, "Write safety: the
+# working-tree write boundary"; design/08_stub_system.md "omemfs stub")
+# ---------------------------------------------------------------------------
+
+@test "stub: refuses to stub a directory target that has been swapped for a symlink, and does not touch its target" {
+    # Regression test: `omemfs stub`'s directory-vs-file decision must use
+    # fsguard::is_real_dir (lstat-based, symlink-refusing) instead of
+    # Path::is_dir() (which follows symlinks). Without the guard, stubbing a
+    # directory whose path has been replaced by a symlink pointing outside
+    # work_dir would recurse into and delete the symlink's target contents.
+    run "$OMEMFS" clone --new --url "$REMOTE_DIR" repo
+    [ "$status" -eq 0 ]
+    cd repo
+    mkdir -p sub
+    echo "a" > sub/a.txt
+    echo "b" > sub/b.txt
+    run "$OMEMFS" push
+    [ "$status" -eq 0 ]
+
+    # Swap the pushed directory for a symlink pointing at content OUTSIDE
+    # work_dir that must never be touched.
+    local outside
+    outside="$(mktemp -d)"
+    mkdir -p "$outside/victim_dir"
+    echo "secret" > "$outside/victim_dir/secret.txt"
+    rm -rf sub
+    ln -s "$outside/victim_dir" sub
+
+    run "$OMEMFS" stub sub
+    [ "$status" -ne 0 ]
+
+    # The symlink itself, and everything behind it, must be untouched.
+    [ -L sub ]
+    [ -f "$outside/victim_dir/secret.txt" ]
+    [ "$(cat "$outside/victim_dir/secret.txt")" = "secret" ]
+
+    rm -rf "$outside"
 }
